@@ -3,7 +3,7 @@ import Foundation
 import FoundationNetworking
 #endif
 
-public struct RealtimeAPI: Sendable {
+@MainActor public struct RealtimeAPI: Sendable {
 	public enum Error: Swift.Error {
 		case invalidMessage
 	}
@@ -12,7 +12,7 @@ public struct RealtimeAPI: Sendable {
 		case connected, connecting, disconnected
 	}
 
-	public var events: AsyncThrowingStream<ServerEvent, Swift.Error> {
+	public var events: AsyncThrowingStream<WebRTCInboundEvent, Swift.Error> {
 		connector.events
 	}
 

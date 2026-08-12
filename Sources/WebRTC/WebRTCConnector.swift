@@ -1,35 +1,57 @@
 import Core
 import AVFAudio
 import Foundation
-@preconcurrency import LiveKitWebRTC
+import LiveKitWebRTC
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
 
-@Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
+@MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
+	@MainActor package struct TerminalObserver {
+		let cancelSignaling: () -> Void
+		let closeData: () -> Void
+		let closePeer: () -> Void
+		let disableAudio: () -> Void
+
+		package init(cancelSignaling: @escaping () -> Void, closeData: @escaping () -> Void, closePeer: @escaping () -> Void, disableAudio: @escaping () -> Void) {
+			self.cancelSignaling = cancelSignaling
+			self.closeData = closeData
+			self.closePeer = closePeer
+			self.disableAudio = disableAudio
+		}
+
+		static let none = Self(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {})
+	}
+
 	public enum WebRTCError: Error {
-		case invalidEphemeralKey
 		case missingAudioPermission
 		case failedToCreateDataChannel
 		case failedToCreatePeerConnection
-		case badServerResponse(URLResponse)
 		case failedToCreateSDPOffer(Swift.Error)
 		case failedToSetLocalDescription(Swift.Error)
 		case failedToSetRemoteDescription(Swift.Error)
 	}
 
-	public let events: AsyncThrowingStream<ServerEvent, Error>
-	@MainActor public private(set) var status = RealtimeAPI.Status.disconnected
+	public let events: AsyncThrowingStream<WebRTCInboundEvent, Error>
+	public private(set) var status = RealtimeAPI.Status.disconnected
+	@_spi(AirbridgeQualification) public let qualificationEvents: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>
 
 	public var isMuted: Bool {
 		!audioTrack.isEnabled
 	}
 
-	package let audioTrack: LKRTCAudioTrack
+	private let audioTrack: LKRTCAudioTrack
 	private let dataChannel: LKRTCDataChannel
 	private let connection: LKRTCPeerConnection
 
-	private let stream: AsyncThrowingStream<ServerEvent, Error>.Continuation
+	private let stream: AsyncThrowingStream<WebRTCInboundEvent, Error>.Continuation
+	private let qualificationStream: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>.Continuation
+	private let signalingClient: WebRTCSignalingClient
+	private let inboundEventDecoder = WebRTCInboundEventDecoder()
+	private let lifecycle = WebRTCLifecycle()
+	private let generation: Int
+	private let terminalObserver: TerminalObserver
+	private var preReadyInboundEvents: [WebRTCInboundEvent] = []
 
 	private static let factory: LKRTCPeerConnectionFactory = {
 		LKRTCInitializeSSL()
@@ -43,17 +65,15 @@ import FoundationNetworking
 		return encoder
 	}()
 
-	private let decoder: JSONDecoder = {
-		let decoder = JSONDecoder()
-		decoder.keyDecodingStrategy = .convertFromSnakeCase
-		return decoder
-	}()
-
-	private init(connection: LKRTCPeerConnection, audioTrack: LKRTCAudioTrack, dataChannel: LKRTCDataChannel) {
+	private init(connection: LKRTCPeerConnection, audioTrack: LKRTCAudioTrack, dataChannel: LKRTCDataChannel, signalingClient: WebRTCSignalingClient, terminalObserver: TerminalObserver) {
 		self.connection = connection
 		self.audioTrack = audioTrack
 		self.dataChannel = dataChannel
-		(events, stream) = AsyncThrowingStream.makeStream(of: ServerEvent.self)
+		self.signalingClient = signalingClient
+		self.terminalObserver = terminalObserver
+		generation = lifecycle.begin()
+		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self)
+		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorQualificationEvent.self)
 
 		super.init()
 
@@ -61,43 +81,96 @@ import FoundationNetworking
 		dataChannel.delegate = self
 	}
 
-	deinit {
-		disconnect()
-	}
-
-	package func connect(using request: URLRequest) async throws {
+	package func connect(using signaling: WebRTCSignalingRequest) async throws {
 		guard connection.connectionState == .new else { return }
 
+		do {
+			let localSDP = try await makeOffer()
+			let remoteSDP = try await fetchRemoteSDP(using: signaling, localSdp: localSDP)
+			try await apply(answer: remoteSDP)
+		} catch {
+			disconnect()
+			throw error
+		}
+	}
+
+	@_spi(AirbridgeQualification) public func makeOffer() async throws -> String {
+		guard connection.connectionState == .new else { throw WebRTCTransportFailure.cancelled }
 		guard AVAudioApplication.shared.recordPermission == .granted else {
+			disconnect()
 			throw WebRTCError.missingAudioPermission
 		}
+		let sdp: LKRTCSessionDescription
+		do {
+			sdp = try await connection.offer(for: LKRTCMediaConstraints(mandatoryConstraints: ["levelControl": "true"], optionalConstraints: nil))
+		} catch {
+			throw WebRTCError.failedToCreateSDPOffer(error)
+		}
+		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
 
-		try await performHandshake(using: request)
+		do { try await connection.setLocalDescription(sdp) }
+		catch { throw WebRTCError.failedToSetLocalDescription(error) }
+		guard lifecycle.isCurrent(generation), let localSDP = connection.localDescription?.sdp else {
+			throw WebRTCTransportFailure.cancelled
+		}
+		return localSDP
+	}
+
+	@_spi(AirbridgeQualification) public func apply(answer: String) async throws {
+		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+		do { try await connection.setRemoteDescription(LKRTCSessionDescription(type: .answer, sdp: answer)) }
+		catch { throw WebRTCError.failedToSetRemoteDescription(error) }
+		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
 		Self.configureAudioSession()
 	}
 
+	package func installSignalingTask(_ task: Task<String, Error>) -> Bool {
+		lifecycle.installSignalingTask(task, for: generation)
+	}
+
 	public func send(event: ClientEvent) throws {
+		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
 		try dataChannel.sendData(LKRTCDataBuffer(data: encoder.encode(event), isBinary: false))
 	}
 
 	public func disconnect() {
+		finish()
+	}
+
+	private func finish(_ error: (any Error)? = nil) {
+		guard lifecycle.markTerminal(generation) else { return }
+		status = .disconnected
+		terminalObserver.cancelSignaling()
+		lifecycle.cancelSignalingTask()
+		dataChannel.close()
+		terminalObserver.closeData()
 		connection.close()
-		stream.finish()
+		terminalObserver.closePeer()
+		audioTrack.isEnabled = false
+		terminalObserver.disableAudio()
+		Self.deactivateAudioSession()
+		preReadyInboundEvents.removeAll()
+		if error == nil {
+			qualificationStream.yield(.terminal)
+		}
+		qualificationStream.finish(throwing: error)
+		stream.finish(throwing: error)
 	}
 
 	public func toggleMute() {
+		guard lifecycle.isCurrent(generation) else { return }
 		audioTrack.isEnabled.toggle()
 	}
 }
 
 extension WebRTCConnector {
-	public static func create(connectingTo request: URLRequest) async throws -> WebRTCConnector {
-		let connector = try create()
-		try await connector.connect(using: request)
+	public static func create(connectingTo signaling: WebRTCSignalingRequest, session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) async throws -> WebRTCConnector {
+		let connector = try create(session: session)
+		try await connector.connect(using: signaling)
 		return connector
 	}
 
-	package static func create() throws -> WebRTCConnector {
+	package static func create(session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession(), terminalObserver: TerminalObserver = .none) throws -> WebRTCConnector {
 		guard let connection = factory.peerConnection(
 			with: LKRTCConfiguration(),
 			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
@@ -110,7 +183,7 @@ extension WebRTCConnector {
 			throw WebRTCError.failedToCreateDataChannel
 		}
 
-		return self.init(connection: connection, audioTrack: audioTrack, dataChannel: dataChannel)
+		return self.init(connection: connection, audioTrack: audioTrack, dataChannel: dataChannel, signalingClient: WebRTCSignalingClient(session: session), terminalObserver: terminalObserver)
 	}
 }
 
@@ -140,73 +213,120 @@ private extension WebRTCConnector {
 			#endif
 			try audioSession.setMode(.videoChat)
 			try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-		} catch {
-			print("Failed to configure AVAudioSession: \(error)")
-		}
+		} catch {}
 		#endif
 	}
 
-	func performHandshake(using request: URLRequest) async throws {
-		let sdp = try await Result { try await connection.offer(for: LKRTCMediaConstraints(mandatoryConstraints: ["levelControl": "true"], optionalConstraints: nil)) }
-			.mapError(WebRTCError.failedToCreateSDPOffer)
-			.get()
-
-		do { try await connection.setLocalDescription(sdp) }
-		catch { throw WebRTCError.failedToSetLocalDescription(error) }
-
-		let remoteSdp = try await fetchRemoteSDP(using: request, localSdp: connection.localDescription!.sdp)
-
-		do { try await connection.setRemoteDescription(LKRTCSessionDescription(type: .answer, sdp: remoteSdp)) }
-		catch { throw WebRTCError.failedToSetRemoteDescription(error) }
+	static func deactivateAudioSession() {
+		#if !os(macOS)
+		try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+		#endif
 	}
 
-	private func fetchRemoteSDP(using request: URLRequest, localSdp: String) async throws -> String {
-		var request = request
-		request.httpBody = localSdp.data(using: .utf8)
-		request.setValue("application/sdp", forHTTPHeaderField: "Content-Type")
-
-		let (data, response) = try await URLSession.shared.data(for: request)
-
-		guard let response = response as? HTTPURLResponse, response.statusCode == 201, let remoteSdp = String(data: data, encoding: .utf8) else {
-			if (response as? HTTPURLResponse)?.statusCode == 401 { throw WebRTCError.invalidEphemeralKey }
-			throw WebRTCError.badServerResponse(response)
+	private func fetchRemoteSDP(using signaling: WebRTCSignalingRequest, localSdp: String) async throws -> String {
+		let task = Task { [signalingClient] in
+			try await signalingClient.answer(for: signaling.makeRequest(localSDP: localSdp)).sdp
 		}
-
-		return remoteSdp
+		guard installSignalingTask(task) else {
+			task.cancel()
+			throw WebRTCTransportFailure.cancelled
+		}
+		defer { lifecycle.clearSignalingTask(for: generation) }
+		return try await withTaskCancellationHandler {
+			let sdp = try await task.value
+			guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+			return sdp
+		} onCancel: {
+			task.cancel()
+		}
 	}
 }
 
+// LiveKit's delegate protocols predate actor annotations. The imported callbacks enter
+// nonisolated and capture only scalar/Data values; each explicitly hops to MainActor.
 extension WebRTCConnector: LKRTCPeerConnectionDelegate {
-	public func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {}
-	public func peerConnection(_: LKRTCPeerConnection, didAdd _: LKRTCMediaStream) {}
-	public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
-	public func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
-	public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCSignalingState) {}
-	public func peerConnection(_: LKRTCPeerConnection, didGenerate _: LKRTCIceCandidate) {}
-	public func peerConnection(_: LKRTCPeerConnection, didRemove _: [LKRTCIceCandidate]) {}
-	public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCIceGatheringState) {}
+	nonisolated public func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didAdd _: LKRTCMediaStream) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCSignalingState) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didGenerate _: LKRTCIceCandidate) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove _: [LKRTCIceCandidate]) {}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCIceGatheringState) {}
 
-	public func peerConnection(_: LKRTCPeerConnection, didChange newState: LKRTCIceConnectionState) {
-		print("ICE Connection State changed to: \(newState)")
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didChange newState: LKRTCIceConnectionState) {
+		let terminal = newState == .closed || newState == .disconnected
+		Task { @MainActor [weak self, terminal] in self?.receivePeerState(terminal: terminal) }
+	}
+
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didChange newState: LKRTCPeerConnectionState) {
+		let terminal = newState == .failed || newState == .closed || newState == .disconnected
+		Task { @MainActor [weak self, terminal] in self?.receivePeerState(terminal: terminal) }
 	}
 }
 
 extension WebRTCConnector: LKRTCDataChannelDelegate {
-	public func dataChannel(_: LKRTCDataChannel, didReceiveMessageWith buffer: LKRTCDataBuffer) {
-		do { try stream.yield(decoder.decode(ServerEvent.self, from: buffer.data)) }
-		catch {
-			print("Failed to decode server event: \(String(data: buffer.data, encoding: .utf8) ?? "<invalid utf8>")")
-			stream.finish(throwing: error)
+	nonisolated public func dataChannel(_: LKRTCDataChannel, didReceiveMessageWith buffer: LKRTCDataBuffer) {
+		let data = buffer.data
+		Task { @MainActor [weak self, data] in self?.receiveInbound(data) }
+	}
+
+	nonisolated public func dataChannelDidChangeState(_ dataChannel: LKRTCDataChannel) {
+		let isOpen = dataChannel.readyState == .open
+		let isTerminal = dataChannel.readyState == .closing || dataChannel.readyState == .closed
+		Task { @MainActor [weak self, isOpen, isTerminal] in self?.receiveDataChannelState(isOpen: isOpen, isTerminal: isTerminal) }
+	}
+}
+
+extension WebRTCConnector {
+	private func receivePeerState(terminal: Bool) {
+		guard lifecycle.isCurrent(generation) else { return }
+		if terminal { finish() }
+	}
+
+	package func receiveInbound(_ data: Data) {
+		guard lifecycle.isCurrent(generation) else { return }
+		do {
+			let inboundEvent = try inboundEventDecoder.decode(data)
+			if inboundEvent == .providerError {
+				finish(WebRTCTransportFailure.providerError)
+				return
+			}
+			guard lifecycle.isCurrent(generation) else { return }
+			guard status == .connected else {
+				guard preReadyInboundEvents.isEmpty else {
+					finish(WebRTCTransportFailure.malformedEvent)
+					return
+				}
+				preReadyInboundEvents = [inboundEvent]
+				return
+			}
+			yieldInbound(inboundEvent)
+		}
+		catch let failure as WebRTCTransportFailure {
+			finish(failure)
+		} catch {
+			finish(WebRTCTransportFailure.malformedEvent)
 		}
 	}
 
-	public func dataChannelDidChangeState(_ dataChannel: LKRTCDataChannel) {
-		Task { @MainActor [state = dataChannel.readyState] in
-			switch state {
-				case .open: status = .connected
-				case .closing, .closed: status = .disconnected
-				default: break
-			}
+	private func receiveDataChannelState(isOpen: Bool, isTerminal: Bool) {
+		guard lifecycle.isCurrent(generation) else { return }
+		if isOpen {
+			guard lifecycle.isCurrent(generation) else { return }
+			guard status != .connected else { return }
+			status = .connected
+			qualificationStream.yield(.connected)
+			let bufferedEvents = preReadyInboundEvents
+			preReadyInboundEvents.removeAll()
+			bufferedEvents.forEach(yieldInbound)
+		} else if isTerminal {
+			finish()
 		}
+	}
+
+	private func yieldInbound(_ event: WebRTCInboundEvent) {
+		qualificationStream.yield(.inbound(event))
+		stream.yield(event)
 	}
 }
