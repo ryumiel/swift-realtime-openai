@@ -238,24 +238,64 @@ final class WebRTCQualificationTests: XCTestCase {
 			let productionEvents = connector.events
 			let qualificationEvents = connector.qualificationEvents
 			connector.receiveInbound(payload)
-			let productionFailure = await terminalCategory(from: productionEvents)
-			let qualificationFailure = await terminalCategory(from: qualificationEvents)
-			XCTAssertTrue(productionFailure == expected)
-			XCTAssertTrue(qualificationFailure == expected)
+			let productionResult = await Self.terminalObservation(from: productionEvents, within: .milliseconds(100))
+			let qualificationResult = await Self.terminalObservation(from: qualificationEvents, within: .milliseconds(100))
+			XCTAssertEqual(productionResult, .expectedFailure(expected))
+			XCTAssertEqual(qualificationResult, .expectedFailure(expected))
 		}
 	}
 
-	@MainActor private func terminalCategory<Element: Sendable>(
-		from stream: AsyncThrowingStream<Element, Error>
-	) async -> WebRTCTransportFailure? {
-		var iterator = stream.makeAsyncIterator()
-		do {
-			_ = try await iterator.next()
-			return nil
-		} catch {
-			return error as? WebRTCTransportFailure
+	func testTerminalObservationTimesOutAndCancelsPendingRead() async {
+		let probe = TerminalReadProbe()
+		let stream = AsyncThrowingStream<Int, Error> { continuation in
+			continuation.onTermination = { _ in probe.recordCancellation() }
+		}
+
+		let result = await Self.terminalObservation(from: stream, within: .milliseconds(25))
+
+		XCTAssertEqual(result, .timeout)
+		XCTAssertTrue(probe.wasCancelled)
+	}
+
+	private enum TerminalObservation: Equatable, Sendable {
+		case expectedFailure(WebRTCTransportFailure)
+		case unexpected
+		case timeout
+	}
+
+	private static func terminalObservation<Element: Sendable>(
+		from stream: AsyncThrowingStream<Element, Error>, within bound: Duration
+	) async -> TerminalObservation {
+		await withTaskGroup(of: TerminalObservation.self) { group in
+			group.addTask {
+				var iterator = stream.makeAsyncIterator()
+				do {
+					_ = try await iterator.next()
+					return .unexpected
+				} catch let failure as WebRTCTransportFailure {
+					return .expectedFailure(failure)
+				} catch {
+					return .unexpected
+				}
+			}
+			group.addTask {
+				try? await Task.sleep(for: bound)
+				return .timeout
+			}
+			guard let first = await group.next() else { return .unexpected }
+			group.cancelAll()
+			return first
 		}
 	}
+
+	private final class TerminalReadProbe: @unchecked Sendable {
+		private let lock = NSLock()
+		private var didCancel = false
+
+		func recordCancellation() { lock.withLock { didCancel = true } }
+		var wasCancelled: Bool { lock.withLock { didCancel } }
+	}
+
 }
 
 private struct StubSession: WebRTCSignalingSession {
