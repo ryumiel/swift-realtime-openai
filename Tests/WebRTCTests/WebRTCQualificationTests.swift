@@ -140,10 +140,10 @@ final class WebRTCQualificationTests: XCTestCase {
 
     func testEventIngressAcceptsOnlyTranscriptTerminalAndProviderErrorEvents() throws {
         let decoder = WebRTCInboundEventDecoder()
-        XCTAssertTrue(
-            try decoder.decode(Data(#"{"type":"response.output_audio_transcript.done","transcript":"spoken"}"#.utf8))
-                == .assistantTranscript("spoken")
-        )
+        let transcript = try decoder.decode(Data(#"{"type":"response.output_audio_transcript.done","transcript":"x"}"#.utf8))
+        guard case .assistantTranscript = transcript else {
+            return XCTFail("Expected transcript event kind")
+        }
         XCTAssertTrue(
             try decoder.decode(Data(#"{"type":"response.done"}"#.utf8))
                 == .responseFinished
@@ -181,12 +181,34 @@ final class WebRTCQualificationTests: XCTestCase {
 			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
 		).makePeer()
 		XCTAssertTrue(productionPeer is WebRTCConnector)
-		var productionLifecycle = productionPeer.qualificationEvents.makeAsyncIterator()
+		let productionLifecycle = productionPeer.qualificationEvents
+		let lifecycleReady = expectation(description: "terminal reader ready")
+		let lifecycleProbe = TestTaskCompletionProbe()
+		let lifecycleReader = Task { @MainActor in
+			var iterator = productionLifecycle.makeAsyncIterator()
+			lifecycleReady.fulfill()
+			defer { lifecycleProbe.markComplete() }
+			do {
+				let terminal = try await iterator.next()
+				let end = try await iterator.next()
+				guard case .terminal = terminal else { return false }
+				return end == nil
+			} catch {
+				return false
+			}
+		}
+		await fulfillment(of: [lifecycleReady], timeout: 1)
 		productionPeer.disconnect()
-		let terminal = try await productionLifecycle.next()
-		let end = try await productionLifecycle.next()
-		XCTAssertEqual(terminal, .terminal)
-		XCTAssertNil(end)
+		let lifecycleWait = await XCTWaiter.fulfillment(of: [lifecycleProbe.expectation()], timeout: 1)
+		guard lifecycleWait == .completed else {
+			lifecycleReader.cancel()
+			if await XCTWaiter.fulfillment(of: [lifecycleProbe.expectation()], timeout: 1) == .completed {
+				_ = await lifecycleReader.value
+			}
+			return XCTFail("Terminal reader did not complete within bound")
+		}
+		let lifecycleSucceeded = await lifecycleReader.value
+		XCTAssertTrue(lifecycleSucceeded)
 		let connector = try WebRTCConnector.create(
 			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
 			terminalObserver: probe.observer
@@ -224,7 +246,7 @@ final class WebRTCQualificationTests: XCTestCase {
 	}
 
 	@MainActor
-	func testProductionIngressPreservesDecodedFailureCategory() async throws {
+	func testQualificationIngressPreservesDecodedFailureCategory() async throws {
 		let cases: [(Data, WebRTCTransportFailure)] = [
 			(Data(#"{"type":"error"}"#.utf8), .providerError),
 			(Data(#"{"type":"response.function_call_arguments.done"}"#.utf8), .unsupportedEvent),
@@ -232,68 +254,706 @@ final class WebRTCQualificationTests: XCTestCase {
 			(Data(#"{"type":"response.done""#.utf8), .malformedEvent),
 		]
 		for (payload, expected) in cases {
-			let connector = try WebRTCConnector.create(
-				session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
+			let drained = expectation(description: "ingress drained")
+			let probe = ConnectorTerminalProbe(drainExpectation: drained)
+			let connector = try WebRTCConnector.createQualification(
+				session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+				terminalObserver: probe.observer
 			)
-			let productionEvents = connector.events
 			let qualificationEvents = connector.qualificationEvents
 			connector.receiveInbound(payload)
-			let productionResult = await Self.terminalObservation(from: productionEvents, within: .milliseconds(100))
-			let qualificationResult = await Self.terminalObservation(from: qualificationEvents, within: .milliseconds(100))
-			XCTAssertEqual(productionResult, .expectedFailure(expected))
+			if expected == .eventTooLarge {
+				drained.fulfill()
+			}
+			guard await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed else {
+				return XCTFail("Ingress did not retire within bound")
+			}
+			let qualificationResult = await Self.firstResult(from: qualificationEvents)
 			XCTAssertEqual(qualificationResult, .expectedFailure(expected))
+			await connector.closeAndSettle()
 		}
 	}
 
-	func testTerminalObservationTimesOutAndCancelsPendingRead() async {
-		let probe = TerminalReadProbe()
-		let stream = AsyncThrowingStream<Int, Error> { continuation in
-			continuation.onTermination = { _ in probe.recordCancellation() }
+	@MainActor
+	func testQualificationIngressUsesOneBoundedMailboxAndDoesNotPopulateOrdinaryEvents() async throws {
+		let drained = expectation(description: "pre-reader inbound drained")
+		let probe = ConnectorTerminalProbe(drainExpectation: drained)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		let qualification = connector.qualificationEvents
+		connector.scheduleOpenTransitionForQualification()
+		let openDeadline = ContinuousClock.now + .seconds(1)
+		while connector.status != .connected, ContinuousClock.now < openDeadline {
+			await Task.yield()
+		}
+		guard connector.status == .connected else {
+			await connector.closeAndSettle()
+			return XCTFail("Pre-reader open did not complete within bound")
+		}
+		connector.receiveInbound(Data(#"{"type":"response.output_audio_transcript.done","transcript":"bounded"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed else {
+			await connector.closeAndSettle()
+			return XCTFail("Pre-reader inbound did not retire within bound")
 		}
 
-		let result = await Self.terminalObservation(from: stream, within: .milliseconds(25))
+		let ordered = await Self.connectedThenInbound(from: qualification)
+		XCTAssertTrue(ordered)
 
-		XCTAssertEqual(result, .timeout)
-		XCTAssertTrue(probe.wasCancelled)
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
+	func testIngressOverflowFailsTheExactQualificationSessionAndSettles() async throws {
+		let peer = try WebRTCConnectorQualificationPeerFactory(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
+		).makePeer()
+		let connector = try XCTUnwrap(peer as? WebRTCConnector)
+		let qualification = connector.qualificationEvents
+
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+
+		let result = await Self.firstResult(from: qualification)
+		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
+	func testQualificationEventCapacityOverflowFailsTheExactSession() async throws {
+		let firstInboundDrained = expectation(description: "first pre-reader inbound drained")
+		firstInboundDrained.assertForOverFulfill = false
+		let acceptedOutputsRetired = expectation(description: "pre-reader outputs retired")
+		acceptedOutputsRetired.expectedFulfillmentCount = 2
+		let settled = expectation(description: "qualification overflow settled")
+		let probe = ConnectorTerminalProbe(
+			drainExpectation: firstInboundDrained,
+			retirementExpectation: acceptedOutputsRetired,
+			settledExpectation: settled
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		connector.scheduleOpenTransitionForQualification()
+		let openDeadline = ContinuousClock.now + .seconds(1)
+		while connector.status != .connected, ContinuousClock.now < openDeadline {
+			await Task.yield()
+		}
+		guard connector.status == .connected else {
+			await connector.closeAndSettle()
+			return XCTFail("Pre-reader open did not complete within bound")
+		}
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [firstInboundDrained], timeout: 1) == .completed else {
+			await connector.closeAndSettle()
+			return XCTFail("First pre-reader inbound did not retire within bound")
+		}
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+
+		guard await XCTWaiter.fulfillment(of: [acceptedOutputsRetired, settled], timeout: 1) == .completed else {
+			await connector.closeAndSettle()
+			return XCTFail("Qualification overflow did not settle within bound")
+		}
+		let result = await Self.twoEventsThenFailure(from: connector.qualificationEvents)
+		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
+	func testIngressRejectsOversizedBytesBeforeMailboxCustody() async throws {
+		let peer = try WebRTCConnectorQualificationPeerFactory(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
+		).makePeer()
+		let connector = try XCTUnwrap(peer as? WebRTCConnector)
+
+		connector.receiveInbound(Data(repeating: 0, count: WebRTCTransportLimits.maximumPayloadBytes + 1))
+		let result = await Self.firstResult(from: connector.qualificationEvents)
+		XCTAssertEqual(result, .expectedFailure(.eventTooLarge))
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
+	func testOrdinaryConnectorRetainsItsPublicEventDelivery() async throws {
+		let connector = try WebRTCConnector.create(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
+		)
+		let events = connector.events
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		let readerReady = expectation(description: "ordinary reader ready")
+		let readerProbe = TestTaskCompletionProbe()
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			readerReady.fulfill()
+			defer { readerProbe.markComplete() }
+			do {
+				guard case .assistantTranscript = try await iterator.next() else { return false }
+				return true
+			} catch { return false }
+		}
+		await fulfillment(of: [readerReady], timeout: 1)
+		connector.receiveInbound(Data(#"{"type":"response.output_audio_transcript.done","transcript":"x"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed else {
+			reader.cancel()
+			if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+				_ = await reader.value
+			}
+			return XCTFail("Ordinary reader did not complete within bound")
+		}
+		let readSucceeded = await reader.value
+		XCTAssertTrue(readSucceeded)
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
+	func testQualificationCloseAndSettleReleasesQueuedContentWithoutDiagnostics() async throws {
+		let drained = expectation(description: "qualification ingress drained")
+		let retention = WeakRetentionBox()
+		let probe = ConnectorTerminalProbe(
+			makePreReadyRetentionToken: {
+				let token = RetentionToken()
+				retention.token = token
+				return token
+			},
+			drainExpectation: drained
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		let events = connector.qualificationEvents
+		connector.receiveInbound(Data(#"{"type":"response.output_audio_transcript.done","transcript":"x"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed else {
+			return XCTFail("Queued ingress did not retire within bound")
+		}
+		XCTAssertNotNil(retention.token)
+		await connector.closeAndSettle()
+		XCTAssertNil(retention.token)
+		let finished = await Self.finishedResult(from: events)
+		XCTAssertTrue(finished)
+		XCTAssertEqual(connector.status, .disconnected)
+	}
+
+	@MainActor
+	func testOrdinaryAbsentConsumerFailsWithoutRetainingEvent() async throws {
+		let drained = expectation(description: "ingress drained")
+		let probe = ConnectorTerminalProbe(drainExpectation: drained)
+		let connector = try WebRTCConnector.create(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed else {
+			return XCTFail("Ordinary ingress did not retire within bound")
+		}
+		await connector.closeAndSettle()
+		let result = await Self.firstResult(from: connector.events)
+		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
+	}
+
+	@MainActor
+	func testQualificationCloseAndSettleDrainsEmptyPartialAndFullCustody() async throws {
+		for occupancy in 0...2 {
+			let drained = occupancy == 2 ? expectation(description: "content-free custody drained") : nil
+			let probe = ConnectorTerminalProbe(drainExpectation: drained)
+			let connector = try WebRTCConnector.createQualification(
+				session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+				terminalObserver: probe.observer
+			)
+			let events = connector.qualificationEvents
+			if occupancy >= 1 {
+				connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+			}
+			if occupancy == 2 {
+				connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+				guard let drained,
+					await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed
+				else {
+					await connector.closeAndSettle()
+					return XCTFail("Full custody did not retire accepted ingress")
+				}
+			}
+
+			await connector.closeAndSettle()
+			let finished = await Self.finishedResult(from: events)
+			XCTAssertTrue(finished)
+			XCTAssertEqual(connector.status, .disconnected)
+		}
+	}
+
+	@MainActor
+	func testAcceptedIngressDrainsBeforeLaterTerminalSettlement() async throws {
+		let drainGate = StickySuspensionGate()
+		let drainEntered = expectation(description: "accepted ingress entered drain")
+		let settled = expectation(description: "terminal settled")
+		let probe = ConnectorTerminalProbe(
+			beforeDrainInbound: {
+				drainEntered.fulfill()
+				await drainGate.wait()
+			},
+			settledExpectation: settled
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		let events = connector.qualificationEvents
+		let readerReady = expectation(description: "ordered reader ready")
+		let connectedObserved = expectation(description: "ordered connected observed")
+		let readerProbe = TestTaskCompletionProbe()
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			readerReady.fulfill()
+			defer { readerProbe.markComplete() }
+			do {
+				guard case .connected = try await iterator.next() else { return false }
+				connectedObserved.fulfill()
+				guard case .inbound(.responseFinished) = try await iterator.next() else { return false }
+				return true
+			} catch { return false }
+		}
+		await fulfillment(of: [readerReady], timeout: 1)
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		await fulfillment(of: [connectedObserved], timeout: 1)
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		await fulfillment(of: [drainEntered], timeout: 1)
+
+		let closeStarted = expectation(description: "close started")
+		let closeTaskProbe = TestTaskCompletionProbe()
+		let closeProbe = CompletionFlag()
+		let closeTask = Task { @MainActor in
+			defer { closeTaskProbe.markComplete() }
+			closeStarted.fulfill()
+			await connector.closeAndSettle()
+			await closeProbe.markComplete()
+		}
+		await fulfillment(of: [closeStarted], timeout: 1)
+		let closeCompletedEarly = await closeProbe.currentValue()
+		XCTAssertFalse(closeCompletedEarly)
+
+		await drainGate.release()
+		let waits = await XCTWaiter.fulfillment(
+			of: [readerProbe.expectation(), closeTaskProbe.expectation(), settled],
+			timeout: 1
+		)
+		guard waits == .completed else {
+			reader.cancel()
+			closeTask.cancel()
+			await drainGate.release()
+			let cleanup = await XCTWaiter.fulfillment(
+				of: [readerProbe.expectation(), closeTaskProbe.expectation()],
+				timeout: 1
+			)
+			if cleanup == .completed {
+				_ = await reader.value
+				_ = await closeTask.value
+			}
+			return XCTFail("Ordered drain cleanup did not complete within bound")
+		}
+		let readSucceeded = await reader.value
+		XCTAssertTrue(readSucceeded)
+		await closeTask.value
+	}
+
+	@MainActor
+	func testFirstAcceptedIngressFailureSuppressesLaterAcceptedDeliveryAndFailure() async throws {
+		let laterPayloads = [
+			Data(#"{"type":"response.done"}"#.utf8),
+			Data(#"{"type":"response.function_call_arguments.done"}"#.utf8),
+		]
+		for laterPayload in laterPayloads {
+			let drainGate = StickySuspensionGate()
+			let firstDrainEntered = expectation(description: "first accepted ingress entered")
+			let acceptedIngressRetired = expectation(description: "accepted ingress retired")
+			acceptedIngressRetired.expectedFulfillmentCount = 2
+			let probe = ConnectorTerminalProbe(beforeDrainInbound: {
+				firstDrainEntered.fulfill()
+				await drainGate.wait()
+			}, retirementExpectation: acceptedIngressRetired)
+			let connector = try WebRTCConnector.createQualification(
+				session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+				terminalObserver: probe.observer
+			)
+			let events = connector.qualificationEvents
+			let readerProbe = TestTaskCompletionProbe()
+			let reader = Task { @MainActor in
+				defer { readerProbe.markComplete() }
+				return await Self.firstResult(from: events)
+			}
+
+			connector.receiveInbound(Data(#"{"type":"error"}"#.utf8))
+			guard await XCTWaiter.fulfillment(of: [firstDrainEntered], timeout: 1) == .completed else {
+				await drainGate.release()
+				reader.cancel()
+				if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+					_ = await reader.value
+				}
+				return XCTFail("First accepted ingress did not enter within bound")
+			}
+			connector.receiveInbound(laterPayload)
+			await drainGate.release()
+			guard await XCTWaiter.fulfillment(of: [acceptedIngressRetired], timeout: 1) == .completed else {
+				reader.cancel()
+				if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+					_ = await reader.value
+				}
+				return XCTFail("Accepted ingress did not retire within bound")
+			}
+			await connector.closeAndSettle()
+
+			guard await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed else {
+				reader.cancel()
+				if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+					_ = await reader.value
+				}
+				return XCTFail("First-failure reader did not settle")
+			}
+			let result = await reader.value
+			XCTAssertEqual(result, .expectedFailure(.providerError))
+		}
+	}
+
+	@MainActor
+	func testScheduledOpenTransitionDeliversEarlierAcceptedIngressBeforeLaterClose() async throws {
+		let openGate = StickySuspensionGate()
+		let openEntered = expectation(description: "open transition entered")
+		let inboundDrained = expectation(description: "pre-ready ingress drained")
+		let probe = ConnectorTerminalProbe(
+			beforeOpenTransition: {
+				openEntered.fulfill()
+				await openGate.wait()
+			},
+			drainExpectation: inboundDrained
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		let events = connector.qualificationEvents
+		let readerReady = expectation(description: "delegate-order reader ready")
+		let readerProbe = TestTaskCompletionProbe()
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			readerReady.fulfill()
+			defer { readerProbe.markComplete() }
+			do {
+				guard case .connected = try await iterator.next() else { return false }
+				guard case .inbound(.responseFinished) = try await iterator.next() else { return false }
+				return true
+			} catch { return false }
+		}
+		await fulfillment(of: [readerReady], timeout: 1)
+
+		connector.scheduleOpenTransitionForQualification()
+		await fulfillment(of: [openEntered], timeout: 1)
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		await fulfillment(of: [inboundDrained], timeout: 1)
+
+		let closeTaskProbe = TestTaskCompletionProbe()
+		let closeProbe = CompletionFlag()
+		let close = Task { @MainActor in
+			defer { closeTaskProbe.markComplete() }
+			await connector.closeAndSettle()
+			await closeProbe.markComplete()
+		}
+		let closeCompletedEarly = await closeProbe.currentValue()
+		XCTAssertFalse(closeCompletedEarly)
+		await openGate.release()
+
+		let waits = await XCTWaiter.fulfillment(
+			of: [readerProbe.expectation(), closeTaskProbe.expectation()],
+			timeout: 1
+		)
+		guard waits == .completed else {
+			reader.cancel()
+			close.cancel()
+			await openGate.release()
+			if await XCTWaiter.fulfillment(
+				of: [readerProbe.expectation(), closeTaskProbe.expectation()],
+				timeout: 1
+			) == .completed {
+				_ = await reader.value
+				await close.value
+			}
+			return XCTFail("Delegate-order cleanup did not complete")
+		}
+		let readSucceeded = await reader.value
+		XCTAssertTrue(readSucceeded)
+		await close.value
+	}
+
+	@MainActor
+	func testEarlierAcceptedFailureSuppressesOneBoundedPendingOpenTransition() async throws {
+		let openGate = StickySuspensionGate()
+		let openEntered = expectation(description: "single pending open entered")
+		openEntered.assertForOverFulfill = true
+		let ingressRetired = expectation(description: "failing ingress retired")
+		let probe = ConnectorTerminalProbe(
+			beforeOpenTransition: {
+				openEntered.fulfill()
+				await openGate.wait()
+			},
+			retirementExpectation: ingressRetired
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		let events = connector.qualificationEvents
+		let readerProbe = TestTaskCompletionProbe()
+		let reader = Task { @MainActor in
+			defer { readerProbe.markComplete() }
+			return await Self.firstResult(from: events)
+		}
+
+		connector.scheduleOpenTransitionForQualification()
+		connector.scheduleOpenTransitionForQualification()
+		guard await XCTWaiter.fulfillment(of: [openEntered], timeout: 1) == .completed else {
+			await openGate.release()
+			reader.cancel()
+			if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+				_ = await reader.value
+			}
+			return XCTFail("Pending open transition did not enter")
+		}
+		connector.receiveInbound(Data(#"{"type":"error"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [ingressRetired], timeout: 1) == .completed else {
+			await openGate.release()
+			reader.cancel()
+			if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+				_ = await reader.value
+			}
+			return XCTFail("Failing ingress did not retire")
+		}
+		await openGate.release()
+		await connector.closeAndSettle()
+		guard await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed else {
+			reader.cancel()
+			if await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed {
+				_ = await reader.value
+			}
+			return XCTFail("Suppressed-open reader did not settle")
+		}
+		let result = await reader.value
+		XCTAssertEqual(result, .expectedFailure(.providerError))
+	}
+
+	@MainActor
+	func testAcceptedOpenDeliveryFailureOverridesLaterNormalTerminal() async throws {
+		let openGate = StickySuspensionGate()
+		let openEntered = expectation(description: "accepted open entered")
+		let laterDrainGate = StickySuspensionGate()
+		let laterDrainEntered = expectation(description: "later accepted ingress entered")
+		let firstDrainCompleted = expectation(description: "pre-ready ingress drained")
+		firstDrainCompleted.assertForOverFulfill = false
+		let settled = expectation(description: "accepted output failure settled")
+		var drainInvocation = 0
+		let probe = ConnectorTerminalProbe(
+			beforeDrainInbound: {
+				drainInvocation += 1
+				if drainInvocation == 2 {
+					laterDrainEntered.fulfill()
+					await laterDrainGate.wait()
+				}
+			},
+			beforeOpenTransition: {
+				openEntered.fulfill()
+				await openGate.wait()
+			},
+			drainExpectation: firstDrainCompleted,
+			settledExpectation: settled
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		let events = connector.qualificationEvents
+
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [firstDrainCompleted], timeout: 1) == .completed else {
+			return XCTFail("Pre-ready ingress did not drain")
+		}
+		connector.scheduleOpenTransitionForQualification()
+		guard await XCTWaiter.fulfillment(of: [openEntered], timeout: 1) == .completed else {
+			await openGate.release()
+			return XCTFail("Accepted open transition did not enter")
+		}
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		guard await XCTWaiter.fulfillment(of: [laterDrainEntered], timeout: 1) == .completed else {
+			await openGate.release()
+			await laterDrainGate.release()
+			return XCTFail("Later accepted ingress did not enter")
+		}
+		await openGate.release()
+		let openDeadline = ContinuousClock.now + .seconds(1)
+		while connector.status != .connected, ContinuousClock.now < openDeadline {
+			await Task.yield()
+		}
+		guard connector.status == .connected else {
+			await laterDrainGate.release()
+			return XCTFail("Accepted open did not complete within bound")
+		}
+		await laterDrainGate.release()
+		guard await XCTWaiter.fulfillment(of: [settled], timeout: 1) == .completed else {
+			await connector.closeAndSettle()
+			return XCTFail("Accepted output failure did not settle")
+		}
+		let result = await Self.twoEventsThenFailure(from: events)
+		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
+	func testTerminalSettlementRetainsConnectorUntilCleanupThenReleasesIt() async throws {
+		let settled = expectation(description: "retained terminal settled")
+		let probe = ConnectorTerminalProbe(settledExpectation: settled)
+		var connector: WebRTCConnector? = try WebRTCConnector.create(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		weak let releasedConnector = connector
+		let events = try XCTUnwrap(connector).events
+		try XCTUnwrap(connector).disconnect()
+		connector = nil
+
+		await fulfillment(of: [settled], timeout: 1)
+		let result = await Self.finishedResult(from: events)
+		XCTAssertTrue(result)
+		XCTAssertEqual(probe.signalingCancels, 1)
+		XCTAssertEqual(probe.dataCloses, 1)
+		XCTAssertEqual(probe.peerCloses, 1)
+		XCTAssertEqual(probe.audioDisables, 1)
+		XCTAssertNil(releasedConnector)
+	}
+
+	@MainActor
+	func testFirstIngressFailureWinsAndCloseJoinsOneTerminalTransition() async throws {
+		let probe = ConnectorTerminalProbe()
+		let connector = try WebRTCConnector.create(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		connector.receiveInbound(Data(repeating: 0, count: WebRTCTransportLimits.maximumPayloadBytes + 1))
+		connector.disconnect()
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		await connector.closeAndSettle()
+
+		let result = await Self.firstResult(from: connector.events)
+		XCTAssertEqual(result, .expectedFailure(.eventTooLarge))
+		XCTAssertEqual(probe.signalingCancels, 1)
+		XCTAssertEqual(probe.dataCloses, 1)
+		XCTAssertEqual(probe.peerCloses, 1)
+		XCTAssertEqual(probe.audioDisables, 1)
+	}
+
+	@MainActor
+	func testQualificationPeerDefaultCloseAndSettlePreservesExistingConformers() async {
+		let peer = QualificationPeerWithoutExplicitSettlement()
+		await peer.closeAndSettle()
+		XCTAssertTrue(peer.didDisconnect)
 	}
 
 	private enum TerminalObservation: Equatable, Sendable {
 		case expectedFailure(WebRTCTransportFailure)
 		case unexpected
-		case timeout
 	}
 
-	private static func terminalObservation<Element: Sendable>(
-		from stream: AsyncThrowingStream<Element, Error>, within bound: Duration
+	@MainActor private static func firstResult<Element: Sendable>(
+		from stream: AsyncThrowingStream<Element, Error>
 	) async -> TerminalObservation {
-		await withTaskGroup(of: TerminalObservation.self) { group in
-			group.addTask {
-				var iterator = stream.makeAsyncIterator()
-				do {
-					_ = try await iterator.next()
-					return .unexpected
-				} catch let failure as WebRTCTransportFailure {
-					return .expectedFailure(failure)
-				} catch {
-					return .unexpected
-				}
+		await boundedObservation(timeoutValue: .unexpected) {
+			var iterator = stream.makeAsyncIterator()
+			do {
+				_ = try await iterator.next()
+				return .unexpected
+			} catch let failure as WebRTCTransportFailure {
+				return .expectedFailure(failure)
+			} catch {
+				return .unexpected
 			}
-			group.addTask {
-				try? await Task.sleep(for: bound)
-				return .timeout
-			}
-			guard let first = await group.next() else { return .unexpected }
-			group.cancelAll()
-			return first
 		}
 	}
 
-	private final class TerminalReadProbe: @unchecked Sendable {
-		private let lock = NSLock()
-		private var didCancel = false
+	@MainActor private static func oneEventThenFailure<Element: Sendable>(
+		from stream: AsyncThrowingStream<Element, Error>
+	) async -> TerminalObservation {
+		await boundedObservation(timeoutValue: .unexpected) {
+			var iterator = stream.makeAsyncIterator()
+			do {
+				guard try await iterator.next() != nil else { return .unexpected }
+				_ = try await iterator.next()
+				return .unexpected
+			} catch let failure as WebRTCTransportFailure {
+				return .expectedFailure(failure)
+			} catch {
+				return .unexpected
+			}
+		}
+	}
 
-		func recordCancellation() { lock.withLock { didCancel = true } }
-		var wasCancelled: Bool { lock.withLock { didCancel } }
+	@MainActor private static func twoEventsThenFailure<Element: Sendable>(
+		from stream: AsyncThrowingStream<Element, Error>
+	) async -> TerminalObservation {
+		await boundedObservation(timeoutValue: .unexpected) {
+			var iterator = stream.makeAsyncIterator()
+			do {
+				guard try await iterator.next() != nil else { return .unexpected }
+				guard try await iterator.next() != nil else { return .unexpected }
+				_ = try await iterator.next()
+				return .unexpected
+			} catch let failure as WebRTCTransportFailure {
+				return .expectedFailure(failure)
+			} catch {
+				return .unexpected
+			}
+		}
+	}
+
+	@MainActor private static func connectedThenInbound(
+		from stream: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>
+	) async -> Bool {
+		await boundedObservation(timeoutValue: false) {
+			var iterator = stream.makeAsyncIterator()
+			do {
+				guard case .connected = try await iterator.next() else { return false }
+				guard case .inbound = try await iterator.next() else { return false }
+				return true
+			} catch {
+				return false
+			}
+		}
+	}
+
+	@MainActor private static func finishedResult<Element: Sendable>(
+		from stream: AsyncThrowingStream<Element, Error>
+	) async -> Bool {
+		await boundedObservation(timeoutValue: false) {
+			var iterator = stream.makeAsyncIterator()
+			do { return try await iterator.next() == nil }
+			catch { return false }
+		}
+	}
+
+	@MainActor private static func boundedObservation<Result: Sendable>(
+		timeoutValue: Result,
+		_ operation: @escaping @MainActor @Sendable () async -> Result
+	) async -> Result {
+		let completion = TestTaskCompletionProbe()
+		let task = Task { @MainActor in
+			defer { completion.markComplete() }
+			return await operation()
+		}
+		guard await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 1) == .completed else {
+			task.cancel()
+			if await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 1) == .completed {
+				_ = await task.value
+			}
+			XCTFail("Bounded observation did not complete")
+			return timeoutValue
+		}
+		return await task.value
 	}
 
 }
@@ -332,20 +992,117 @@ private struct ThrowingSession: WebRTCSignalingSession {
     func send(event _: ClientEvent) async throws {}
 }
 
+@MainActor private final class QualificationPeerWithoutExplicitSettlement: WebRTCConnectorQualificationPeer {
+	let qualificationEvents: AsyncThrowingStream<WebRTCConnectorQualificationEvent, any Error> = AsyncThrowingStream { $0.finish() }
+	private(set) var didDisconnect = false
+
+	func makeOffer() async throws -> String { throw WebRTCTransportFailure.cancelled }
+	func apply(answer _: String) async throws { throw WebRTCTransportFailure.cancelled }
+	func send(event _: ClientEvent) async throws { throw WebRTCTransportFailure.cancelled }
+	func disconnect() { didDisconnect = true }
+}
+
 @MainActor private final class ConnectorTerminalProbe {
+	private let beforeDrainInbound: () async -> Void
+	private let beforeOpenTransition: () async -> Void
+	private let makePreReadyRetentionToken: () -> AnyObject?
+	private let drainExpectation: XCTestExpectation?
+	private let retirementExpectation: XCTestExpectation?
+	private let settledExpectation: XCTestExpectation?
 	private(set) var signalingCancels = 0
 	private(set) var dataCloses = 0
 	private(set) var peerCloses = 0
 	private(set) var audioDisables = 0
+
+	init(
+		beforeDrainInbound: @escaping () async -> Void = {},
+		beforeOpenTransition: @escaping () async -> Void = {},
+		makePreReadyRetentionToken: @escaping () -> AnyObject? = { nil },
+		drainExpectation: XCTestExpectation? = nil,
+		retirementExpectation: XCTestExpectation? = nil,
+		settledExpectation: XCTestExpectation? = nil
+	) {
+		self.beforeDrainInbound = beforeDrainInbound
+		self.beforeOpenTransition = beforeOpenTransition
+		self.makePreReadyRetentionToken = makePreReadyRetentionToken
+		self.drainExpectation = drainExpectation
+		self.retirementExpectation = retirementExpectation
+		self.settledExpectation = settledExpectation
+	}
 
 	var observer: WebRTCConnector.TerminalObserver {
 		.init(
 			cancelSignaling: { self.signalingCancels += 1 },
 			closeData: { self.dataCloses += 1 },
 			closePeer: { self.peerCloses += 1 },
-			disableAudio: { self.audioDisables += 1 }
+			disableAudio: { self.audioDisables += 1 },
+			beforeDrainInbound: beforeDrainInbound,
+			beforeOpenTransition: beforeOpenTransition,
+			makePreReadyRetentionToken: makePreReadyRetentionToken,
+			didDrainInbound: { self.drainExpectation?.fulfill() },
+			didRetireAcceptedIngress: { self.retirementExpectation?.fulfill() },
+			didSettle: { self.settledExpectation?.fulfill() }
 		)
 	}
+}
+
+private final class RetentionToken {}
+
+private final class WeakRetentionBox: @unchecked Sendable {
+	weak var token: RetentionToken?
+}
+
+@MainActor private final class TestTaskCompletionProbe {
+	private var complete = false
+	private var waiters: [XCTestExpectation] = []
+
+	func expectation() -> XCTestExpectation {
+		let expectation = XCTestExpectation(description: "content-free task completion")
+		if complete {
+			expectation.fulfill()
+		} else {
+			waiters.append(expectation)
+		}
+		return expectation
+	}
+
+	func markComplete() {
+		guard !complete else { return }
+		complete = true
+		let installed = waiters
+		waiters.removeAll()
+		installed.forEach { $0.fulfill() }
+	}
+}
+
+private actor StickySuspensionGate {
+	private var released = false
+	private var waiter: CheckedContinuation<Void, Never>?
+
+	func wait() async {
+		if released { return }
+		await withCheckedContinuation { continuation in
+			if released {
+				continuation.resume()
+			} else {
+				precondition(waiter == nil)
+				waiter = continuation
+			}
+		}
+	}
+
+	func release() {
+		released = true
+		let installed = waiter
+		waiter = nil
+		installed?.resume()
+	}
+}
+
+private actor CompletionFlag {
+	private(set) var isComplete = false
+	func markComplete() { isComplete = true }
+	func currentValue() -> Bool { isComplete }
 }
 
 private actor LoopbackHTTPServer {

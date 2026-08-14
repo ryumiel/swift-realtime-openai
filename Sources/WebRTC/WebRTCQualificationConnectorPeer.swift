@@ -16,13 +16,20 @@ import Foundation
 	func apply(answer: String) async throws
 	func send(event: ClientEvent) async throws
 	func disconnect()
+	func closeAndSettle() async
+}
+
+@_spi(AirbridgeQualification) @MainActor public extension WebRTCConnectorQualificationPeer {
+	func closeAndSettle() async {
+		disconnect()
+	}
 }
 
 @_spi(AirbridgeQualification) @MainActor public struct WebRTCConnectorQualificationPeerFactory: Sendable {
 	private let makePeerClosure: @MainActor @Sendable () throws -> any WebRTCConnectorQualificationPeer
 
 	public init(session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) {
-		makePeerClosure = { try WebRTCConnector.create(session: session) }
+		makePeerClosure = { try WebRTCConnector.createQualification(session: session) }
 	}
 
 	public init(makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorQualificationPeer) {

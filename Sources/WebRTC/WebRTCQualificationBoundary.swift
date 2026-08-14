@@ -19,6 +19,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	case responseTooLarge
 	case malformedResponse
 	case eventTooLarge
+	case ingressOverloaded
 	case providerError
 	case malformedEvent
 	case unsupportedEvent
