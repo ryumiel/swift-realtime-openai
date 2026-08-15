@@ -1797,7 +1797,6 @@ final class WebRTCQualificationTests: XCTestCase {
 			terminalObserver: probe.observer
 		)
 		let events = connector.qualificationEvents
-		var iterator = events.makeAsyncIterator()
 		let closeGate = StickySuspensionGate()
 		let closeProbe = TestTaskCompletionProbe()
 		let closeTask = Task { @MainActor in
@@ -1806,8 +1805,8 @@ final class WebRTCQualificationTests: XCTestCase {
 			await connector.closeAndSettle()
 		}
 		let readerProbe = TestTaskCompletionProbe()
-		let reader: Task<TerminalObservation, Never> = Task { @MainActor in
-			defer { readerProbe.markComplete() }
+		let reader: Task<TerminalObservation, Never> = Task { [events, readerStartGate] in
+			var iterator = events.makeAsyncIterator()
 			await readerStartGate.wait()
 			do {
 				guard case .connected = try await iterator.next() else { return .unexpected }
@@ -1819,6 +1818,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			} catch {
 				return .unexpected
 			}
+		}
+		let readerCompletion = Task { @MainActor in
+			defer { readerProbe.markComplete() }
+			_ = await reader.value
 		}
 		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
 		connector.scheduleOpenTransitionForQualification()
@@ -1832,11 +1835,12 @@ final class WebRTCQualificationTests: XCTestCase {
 		await drainGate.release()
 		let terminalSettled = await XCTWaiter.fulfillment(of: [settled], timeout: 1) == .completed
 		await readerStartGate.release()
-		await closeGate.release()
 		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
+		await closeGate.release()
 		var closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 		if !readerCompleted {
 			reader.cancel()
+			readerCompletion.cancel()
 			closeTask.cancel()
 			await openGate.release()
 			await drainGate.release()
@@ -1847,6 +1851,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		}
 		if !closeCompleted {
 			reader.cancel()
+			readerCompletion.cancel()
 			closeTask.cancel()
 			await openGate.release()
 			await drainGate.release()
@@ -1858,6 +1863,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		let result: TerminalObservation?
 		if readerCompleted {
 			result = await reader.value
+			await readerCompletion.value
 		} else {
 			result = nil
 		}
