@@ -1774,11 +1774,16 @@ final class WebRTCQualificationTests: XCTestCase {
 		let readerStartGate = StickySuspensionGate()
 		let openEntered = expectation(description: "accepted open entered")
 		let firstRawMailboxRetired = expectation(description: "first raw mailbox retired")
-		firstRawMailboxRetired.assertForOverFulfill = false
 		let drainEntered = expectation(description: "accepted open later drain entered")
 		let settled = expectation(description: "accepted open precedence settled")
+		let connectedObserved = expectation(description: "accepted open connected observed")
 		var drainCount = 0
-		let probe = ConnectorTerminalProbe(
+		var acceptedIngressRetirements = 0
+		let terminalObserver = WebRTCConnector.TerminalObserver(
+			cancelSignaling: {},
+			closeData: {},
+			closePeer: {},
+			disableAudio: {},
 			beforeDrainInbound: {
 				drainCount += 1
 				if drainCount == 2 {
@@ -1790,12 +1795,17 @@ final class WebRTCQualificationTests: XCTestCase {
 				openEntered.fulfill()
 				await openGate.wait()
 			},
-			retirementExpectation: firstRawMailboxRetired,
-			settledExpectation: settled
+			didRetireAcceptedIngress: {
+				acceptedIngressRetirements += 1
+				if acceptedIngressRetirements == 1 {
+					firstRawMailboxRetired.fulfill()
+				}
+			},
+			didSettle: { settled.fulfill() }
 		)
 		let connector = try WebRTCConnector.createQualification(
 			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
-			terminalObserver: probe.observer
+			terminalObserver: terminalObserver
 		)
 		let events = connector.qualificationEvents
 		let closeGate = StickySuspensionGate()
@@ -1812,6 +1822,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			await readerStartGate.wait()
 			do {
 				guard case .connected = try await iterator.next() else { return .unexpected }
+				connectedObserved.fulfill()
 				guard case .inbound(.responseFinished) = try await iterator.next() else { return .unexpected }
 				_ = try await iterator.next()
 				return .unexpected
@@ -1828,7 +1839,6 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
 		let laterDrainControlled = await XCTWaiter.fulfillment(of: [drainEntered], timeout: 1) == .completed
 
-		let beforeCleanup = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 0.05)
 		await openGate.release()
 		let openDeadline = ContinuousClock.now + .seconds(1)
 		while connector.status != .connected, ContinuousClock.now < openDeadline {
@@ -1838,42 +1848,35 @@ final class WebRTCQualificationTests: XCTestCase {
 		await drainGate.release()
 		let terminalSettled = await XCTWaiter.fulfillment(of: [settled], timeout: 1) == .completed
 		await readerStartGate.release()
-		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
+		let orderedConnected = await XCTWaiter.fulfillment(of: [connectedObserved], timeout: 1) == .completed
 		await closeGate.release()
-		var closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
-		if !readerCompleted {
-			reader.cancel()
-			closeTask.cancel()
-			await openGate.release()
-			await drainGate.release()
-			await readerStartGate.release()
-			await closeGate.release()
-			readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
-			closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
+		var readerCompleted = false
+		var closeCompleted = false
+		while !readerCompleted || !closeCompleted {
+			if !readerCompleted {
+				readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
+			}
+			if !closeCompleted {
+				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
+			}
+			if !readerCompleted || !closeCompleted {
+				if !readerCompleted { reader.cancel() }
+				if !closeCompleted { closeTask.cancel() }
+				await openGate.release()
+				await drainGate.release()
+				await readerStartGate.release()
+				await closeGate.release()
+			}
 		}
-		if !closeCompleted {
-			reader.cancel()
-			closeTask.cancel()
-			await openGate.release()
-			await drainGate.release()
-			await readerStartGate.release()
-			await closeGate.release()
-			readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
-			closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
-		}
-		let result: TerminalObservation?
-		if readerCompleted {
-			result = await reader.value
-		} else {
-			result = nil
-		}
-		if closeCompleted { await closeTask.value }
-		XCTAssertEqual(beforeCleanup, .timedOut)
+		let result = await reader.value
+		await closeTask.value
 		XCTAssertTrue(acceptedOpenEntered)
 		XCTAssertTrue(firstRetiredBeforeSecondInbound)
 		XCTAssertTrue(laterDrainControlled)
 		XCTAssertTrue(acceptedOpen)
 		XCTAssertTrue(terminalSettled)
+		XCTAssertTrue(orderedConnected)
+		XCTAssertEqual(acceptedIngressRetirements, 2)
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
 		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
