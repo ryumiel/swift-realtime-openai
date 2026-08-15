@@ -1828,8 +1828,8 @@ final class WebRTCQualificationTests: XCTestCase {
 		let readerProbe = TestTaskCompletionProbe()
 		let reader: Task<TerminalObservation, Never> = Task { @MainActor in
 			defer { readerProbe.markComplete() }
-			var iterator = events.makeAsyncIterator()
 			await readerStartGate.wait()
+			var iterator = events.makeAsyncIterator()
 			do {
 				guard case .connected = try await iterator.next() else { return .unexpected }
 				connectedObserved.fulfill()
