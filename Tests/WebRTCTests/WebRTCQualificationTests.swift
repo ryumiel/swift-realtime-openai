@@ -1825,6 +1825,11 @@ final class WebRTCQualificationTests: XCTestCase {
 
 		let beforeCleanup = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 0.05)
 		await openGate.release()
+		let openDeadline = ContinuousClock.now + .seconds(1)
+		while connector.status != .connected, ContinuousClock.now < openDeadline {
+			await Task.yield()
+		}
+		let acceptedOpenObserved = connector.status == .connected
 		await drainGate.release()
 		await fulfillment(of: [settled], timeout: 1)
 		await readerStartGate.release()
@@ -1843,6 +1848,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		let result: TerminalObservation? = completion ? await reader.value : nil
 		if completion { await closeTask.value }
 		XCTAssertEqual(beforeCleanup, .timedOut)
+		XCTAssertTrue(acceptedOpenObserved)
 		XCTAssertEqual(precedence, .completed)
 		XCTAssertTrue(completion)
 		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
