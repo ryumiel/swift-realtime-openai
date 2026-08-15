@@ -364,6 +364,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			terminalObserver: probe.observer
 		)
 		let qualification = connector.qualificationEvents
+		let readerStartGate = StickySuspensionGate()
 		let closeGate = StickySuspensionGate()
 		let closeProbe = TestTaskCompletionProbe()
 		let closeTask = Task { @MainActor in
@@ -374,6 +375,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		let readerProbe = TestTaskCompletionProbe()
 		let reader: Task<Bool, Never> = Task { @MainActor in
 			defer { readerProbe.markComplete() }
+			await readerStartGate.wait()
 			var iterator = qualification.makeAsyncIterator()
 			do {
 				guard case .connected = try await iterator.next() else { return false }
@@ -391,12 +393,14 @@ final class WebRTCQualificationTests: XCTestCase {
 		let connected = connector.status == .connected
 		connector.receiveInbound(Data(#"{"type":"response.output_audio_transcript.done","transcript":"bounded"}"#.utf8))
 		let drainedCompleted = await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed
+		await readerStartGate.release()
 		await closeGate.release()
 		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
 		var closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 		if !readerCompleted || !closeCompleted {
 			if !readerCompleted { reader.cancel() }
 			if !closeCompleted { closeTask.cancel() }
+			await readerStartGate.release()
 			await closeGate.release()
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
@@ -1314,10 +1318,11 @@ final class WebRTCQualificationTests: XCTestCase {
 		let firstBound = await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 0.05)
 		let secondBound = await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 0.05)
 		await gate.release()
-		let settled = await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 1)
+		let settled = await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 1) == .completed
+		Self.requireCompleted(settled, task: "withhold observation")
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertEqual(secondBound, .timedOut)
-		XCTAssertEqual(settled, .completed)
+		XCTAssertTrue(settled)
 		await observer.value
 	}
 
