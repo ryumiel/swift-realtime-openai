@@ -219,11 +219,10 @@ final class WebRTCQualificationTests: XCTestCase {
 				disconnectCompleted = await XCTWaiter.fulfillment(of: [productionDisconnectProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(lifecycleCompleted, task: "connector lifecycle reader")
-		Self.requireCompleted(disconnectCompleted, task: "connector lifecycle disconnect")
-		let lifecycleSucceeded = await lifecycleReader.value
-		await productionDisconnect.value
-		XCTAssertTrue(lifecycleSucceeded)
+		await Self.finalizeOwnedTasks([
+			(lifecycleCompleted, "connector lifecycle reader", { await Self.assertTrueValue(await lifecycleReader.value) }),
+			(disconnectCompleted, "connector lifecycle disconnect", { await productionDisconnect.value })
+		])
 		XCTAssertTrue(disconnectCompleted)
 		let connector = try WebRTCConnector.create(
 			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
@@ -256,15 +255,13 @@ final class WebRTCQualificationTests: XCTestCase {
 				signalingCompleted = await XCTWaiter.fulfillment(of: [signalingProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(callbackCompleted, task: "connector callback")
-		Self.requireCompleted(signalingCompleted, task: "connector signaling")
-		await callback.value
-		do {
-			_ = try await signalingTask.value
-			XCTFail("Expected the connector-owned signaling task to be cancelled")
-		} catch {
-			XCTAssertTrue(error is CancellationError)
-		}
+		await Self.finalizeOwnedTasks([
+			(callbackCompleted, "connector callback", { await callback.value }),
+			(signalingCompleted, "connector signaling", {
+				do { _ = try await signalingTask.value; XCTFail("Expected the connector-owned signaling task to be cancelled") }
+				catch { XCTAssertTrue(error is CancellationError) }
+			})
+		])
 		XCTAssertTrue(callbackCompleted)
 		XCTAssertTrue(signalingCompleted)
 		XCTAssertEqual(connector.status, .disconnected)
@@ -283,9 +280,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			terminalReader.cancel()
 			terminalCompleted = await XCTWaiter.fulfillment(of: [terminalProbe.expectation()], timeout: 1) == .completed
 		}
-		Self.requireCompleted(terminalCompleted, task: "connector terminal reader")
-		let terminalEnded = await terminalReader.value
-		XCTAssertTrue(terminalEnded)
+		await Self.finalizeOwnedTasks([(terminalCompleted, "connector terminal reader", { await Self.assertTrueValue(await terminalReader.value) })])
 		XCTAssertTrue(terminalCompleted)
 	}
 
@@ -344,11 +339,10 @@ final class WebRTCQualificationTests: XCTestCase {
 					closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 				}
 			}
-			Self.requireCompleted(readerCompleted, task: "decoded failure reader")
-			Self.requireCompleted(closeCompleted, task: "decoded failure close")
-			let result = await reader.value
-			XCTAssertEqual(result, .expectedFailure(expected))
-			await closeTask.value
+			await Self.finalizeOwnedTasks([
+				(readerCompleted, "decoded failure reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(expected)) }),
+				(closeCompleted, "decoded failure close", { await closeTask.value })
+			])
 			XCTAssertTrue(drainedCompleted)
 			XCTAssertTrue(readerCompleted)
 			XCTAssertTrue(closeCompleted)
@@ -405,11 +399,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "bounded mailbox reader")
-		Self.requireCompleted(closeCompleted, task: "bounded mailbox close")
-		let ordered = await reader.value
-		XCTAssertTrue(ordered)
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "bounded mailbox reader", { await Self.assertTrueValue(await reader.value) }),
+			(closeCompleted, "bounded mailbox close", { await closeTask.value })
+		])
 		XCTAssertTrue(connected)
 		XCTAssertTrue(drainedCompleted)
 		XCTAssertTrue(readerCompleted)
@@ -457,11 +450,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "overflow reader")
-		Self.requireCompleted(closeCompleted, task: "overflow close")
-		let result = await reader.value
-		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "overflow reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.ingressOverloaded)) }),
+			(closeCompleted, "overflow close", { await closeTask.value })
+		])
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
 	}
@@ -530,11 +522,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "capacity overflow reader")
-		Self.requireCompleted(closeCompleted, task: "capacity overflow close")
-		let result = await reader.value
-		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "capacity overflow reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.ingressOverloaded)) }),
+			(closeCompleted, "capacity overflow close", { await closeTask.value })
+		])
 		XCTAssertTrue(connected)
 		XCTAssertTrue(firstDrained)
 		XCTAssertTrue(retired)
@@ -582,11 +573,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "oversized ingress reader")
-		Self.requireCompleted(closeCompleted, task: "oversized ingress close")
-		let result = await reader.value
-		XCTAssertEqual(result, .expectedFailure(.eventTooLarge))
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "oversized ingress reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.eventTooLarge)) }),
+			(closeCompleted, "oversized ingress close", { await closeTask.value })
+		])
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
 	}
@@ -628,11 +618,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "ordinary event reader")
-		Self.requireCompleted(closeCompleted, task: "ordinary event close")
-		let readSucceeded = await reader.value
-		XCTAssertTrue(readSucceeded)
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "ordinary event reader", { await Self.assertTrueValue(await reader.value) }),
+			(closeCompleted, "ordinary event close", { await closeTask.value })
+		])
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
 	}
@@ -685,11 +674,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
 		XCTAssertNil(retention.token)
-		Self.requireCompleted(observerCompleted, task: "retention observer")
-		Self.requireCompleted(closeCompleted, task: "retention close")
-		let finished = await observer.value
-		XCTAssertTrue(finished)
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(observerCompleted, "retention observer", { await Self.assertTrueValue(await observer.value) }),
+			(closeCompleted, "retention close", { await closeTask.value })
+		])
 		XCTAssertTrue(drainedCompleted)
 		XCTAssertTrue(observerCompleted)
 		XCTAssertTrue(closeCompleted)
@@ -741,11 +729,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "absent consumer reader")
-		Self.requireCompleted(closeCompleted, task: "absent consumer close")
-		let result = await reader.value
-		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "absent consumer reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.ingressOverloaded)) }),
+			(closeCompleted, "absent consumer close", { await closeTask.value })
+		])
 		XCTAssertTrue(drainedCompleted)
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
@@ -798,11 +785,10 @@ final class WebRTCQualificationTests: XCTestCase {
 				if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 				if !observerCompleted { observerCompleted = await XCTWaiter.fulfillment(of: [observerProbe.expectation()], timeout: 1) == .completed }
 			}
-			Self.requireCompleted(closeCompleted, task: "custody close")
-			Self.requireCompleted(observerCompleted, task: "custody observer")
-			await closeTask.value
-			let finished = await observer.value
-			XCTAssertTrue(finished)
+			await Self.finalizeOwnedTasks([
+				(closeCompleted, "custody close", { await closeTask.value }),
+				(observerCompleted, "custody observer", { await Self.assertTrueValue(await observer.value) })
+			])
 			XCTAssertTrue(drainedCompleted)
 			XCTAssertTrue(closeCompleted)
 			XCTAssertTrue(observerCompleted)
@@ -873,12 +859,11 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeTaskProbe.expectation()], timeout: 1) == .completed }
 			if !settledCompleted { settledCompleted = await XCTWaiter.fulfillment(of: [settled], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "accepted-ingress reader")
-		Self.requireCompleted(closeCompleted, task: "accepted-ingress close")
-		Self.requireCompleted(settledCompleted, task: "accepted-ingress settlement")
-		let readSucceeded = await reader.value
-		await closeTask.value
-		XCTAssertTrue(readSucceeded)
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "accepted-ingress reader", { await Self.assertTrueValue(await reader.value) }),
+			(closeCompleted, "accepted-ingress close", { await closeTask.value }),
+			(settledCompleted, "accepted-ingress settlement", {})
+		])
 	}
 
 	@MainActor
@@ -938,13 +923,12 @@ final class WebRTCQualificationTests: XCTestCase {
 				if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 				if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 			}
-			Self.requireCompleted(readerCompleted, task: "first accepted failure reader")
-			Self.requireCompleted(closeCompleted, task: "first accepted failure close")
 			XCTAssertEqual(entered, .completed)
 			XCTAssertEqual(retired, .completed)
-			let result = await reader.value
-			await closeTask.value
-			XCTAssertEqual(result, .expectedFailure(.providerError))
+			await Self.finalizeOwnedTasks([
+				(readerCompleted, "first accepted failure reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.providerError)) }),
+				(closeCompleted, "first accepted failure close", { await closeTask.value })
+			])
 		}
 	}
 
@@ -1007,11 +991,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeTaskProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "scheduled-open delivery reader")
-		Self.requireCompleted(closeCompleted, task: "scheduled-open delivery close")
-		let readSucceeded = await reader.value
-		await close.value
-		XCTAssertTrue(readSucceeded)
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "scheduled-open delivery reader", { await Self.assertTrueValue(await reader.value) }),
+			(closeCompleted, "scheduled-open delivery close", { await close.value })
+		])
 	}
 
 	@MainActor
@@ -1070,13 +1053,12 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "earlier accepted failure reader")
-		Self.requireCompleted(closeCompleted, task: "earlier accepted failure close")
 		XCTAssertEqual(open, .completed)
 		XCTAssertEqual(retired, .completed)
-		let result = await reader.value
-		await closeTask.value
-		XCTAssertEqual(result, .expectedFailure(.providerError))
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "earlier accepted failure reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.providerError)) }),
+			(closeCompleted, "earlier accepted failure close", { await closeTask.value })
+		])
 	}
 
 	@MainActor
@@ -1167,11 +1149,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "accepted-open delivery reader")
-		Self.requireCompleted(closeCompleted, task: "accepted-open delivery close")
-		let result = await reader.value
-		await closeTask.value
-		XCTAssertEqual(result, .expectedFailure(.ingressOverloaded))
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "accepted-open delivery reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.ingressOverloaded)) }),
+			(closeCompleted, "accepted-open delivery close", { await closeTask.value })
+		])
 	}
 
 	@MainActor
@@ -1202,8 +1183,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			disconnectTask.cancel()
 			disconnectCompleted = await XCTWaiter.fulfillment(of: [disconnectProbe.expectation()], timeout: 1) == .completed
 		}
-		Self.requireCompleted(disconnectCompleted, task: "retained connector disconnect")
-		await disconnectTask.value
+		await Self.finalizeOwnedTasks([(disconnectCompleted, "retained connector disconnect", { await disconnectTask.value })])
 		connector = nil
 
 		let settledCompleted = await XCTWaiter.fulfillment(of: [settled], timeout: 1) == .completed
@@ -1214,9 +1194,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			await readerStartGate.release()
 			readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
 		}
-		Self.requireCompleted(readerCompleted, task: "retained connector reader")
-		let result = await reader.value
-		XCTAssertTrue(result)
+		await Self.finalizeOwnedTasks([(readerCompleted, "retained connector reader", { await Self.assertTrueValue(await reader.value) })])
 		XCTAssertTrue(settledCompleted)
 		XCTAssertTrue(disconnectCompleted)
 		XCTAssertTrue(readerCompleted)
@@ -1281,13 +1259,11 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 			if !disconnectCompleted { disconnectCompleted = await XCTWaiter.fulfillment(of: [disconnectProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "first failure reader")
-		Self.requireCompleted(closeCompleted, task: "first failure close")
-		Self.requireCompleted(disconnectCompleted, task: "first failure disconnect")
-		let result = await reader.value
-		XCTAssertEqual(result, .expectedFailure(.eventTooLarge))
-		await closeTask.value
-		await disconnectTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "first failure reader", { await Self.assertEqualValue(await reader.value, .expectedFailure(.eventTooLarge)) }),
+			(closeCompleted, "first failure close", { await closeTask.value }),
+			(disconnectCompleted, "first failure disconnect", { await disconnectTask.value })
+		])
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
 		XCTAssertTrue(disconnectCompleted)
@@ -1319,11 +1295,10 @@ final class WebRTCQualificationTests: XCTestCase {
 		let secondBound = await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 0.05)
 		await gate.release()
 		let settled = await XCTWaiter.fulfillment(of: [completion.expectation()], timeout: 1) == .completed
-		Self.requireCompleted(settled, task: "withhold observation")
+		await Self.finalizeOwnedTasks([(settled, "withhold observation", { await observer.value })])
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertEqual(secondBound, .timedOut)
 		XCTAssertTrue(settled)
-		await observer.value
 	}
 
 	@MainActor func testTerminalLifecycleReaderTimeoutSettlesReaderIteratorAndConnectorControl() async throws {
@@ -1354,10 +1329,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "terminal lifecycle reader")
-		Self.requireCompleted(closeCompleted, task: "terminal lifecycle close")
-		_ = await reader.value
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "terminal lifecycle reader", { _ = await reader.value }),
+			(closeCompleted, "terminal lifecycle close", { await closeTask.value })
+		])
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
@@ -1416,12 +1391,14 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(retiredCompleted, task: "decoded failure retirement")
-		Self.requireCompleted(terminalSettled, task: "decoded failure settlement")
-		Self.requireCompleted(readerCompleted, task: "decoded failure reader")
-		Self.requireCompleted(closeCompleted, task: "decoded failure close")
-		let failure = await reader.value
-		await closeTask.value
+		var joinedFailure: TerminalObservation?
+		await Self.finalizeOwnedTasks([
+			(retiredCompleted, "decoded failure retirement", {}),
+			(terminalSettled, "decoded failure settlement", {}),
+			(readerCompleted, "decoded failure reader", { joinedFailure = await reader.value }),
+			(closeCompleted, "decoded failure close", { await closeTask.value })
+		])
+		let failure = try XCTUnwrap(joinedFailure)
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertTrue(retiredCompleted)
 		XCTAssertTrue(terminalSettled)
@@ -1461,10 +1438,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 			if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 		}
-		Self.requireCompleted(readerCompleted, task: "ordinary delivery reader")
-		Self.requireCompleted(closeCompleted, task: "ordinary delivery close")
-		_ = await reader.value
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "ordinary delivery reader", { _ = await reader.value }),
+			(closeCompleted, "ordinary delivery close", { await closeTask.value })
+		])
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
@@ -1487,8 +1464,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			await gate.release()
 			closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 		}
-		Self.requireCompleted(closeCompleted, task: "queued content close")
-		await closeTask.value
+		await Self.finalizeOwnedTasks([(closeCompleted, "queued content close", { await closeTask.value })])
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertTrue(closeCompleted)
 		XCTAssertEqual(terminalProbe.signalingCancels, 1)
@@ -1527,10 +1503,10 @@ final class WebRTCQualificationTests: XCTestCase {
 				if !readerCompleted { readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed }
 				if !closeCompleted { closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed }
 			}
-			Self.requireCompleted(readerCompleted, task: "custody loop reader")
-			Self.requireCompleted(closeCompleted, task: "custody loop close")
-			await reader.value
-			await closeTask.value
+			await Self.finalizeOwnedTasks([
+				(readerCompleted, "custody loop reader", { await reader.value }),
+				(closeCompleted, "custody loop close", { await closeTask.value })
+			])
 			allSettled = allSettled && firstBound == .timedOut
 		}
 		XCTAssertTrue(allSettled)
@@ -1587,10 +1563,12 @@ final class WebRTCQualificationTests: XCTestCase {
 				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(readerCompleted, task: "accepted-ingress reader")
-		Self.requireCompleted(closeCompleted, task: "accepted-ingress close")
-		let result = await reader.value
-		await closeTask.value
+		var joinedResult: Bool?
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "accepted-ingress reader", { joinedResult = await reader.value }),
+			(closeCompleted, "accepted-ingress close", { await closeTask.value })
+		])
+		let result = try XCTUnwrap(joinedResult)
 		XCTAssertEqual(beforeCleanup, .timedOut)
 		XCTAssertEqual(result, false)
 	}
@@ -1652,11 +1630,13 @@ final class WebRTCQualificationTests: XCTestCase {
 				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(retiredCompleted, task: "first-failure retirement")
-		Self.requireCompleted(readerCompleted, task: "first-failure reader")
-		Self.requireCompleted(closeCompleted, task: "first-failure close")
-		let result = await reader.value
-		await closeTask.value
+		var joinedResult: TerminalObservation?
+		await Self.finalizeOwnedTasks([
+			(retiredCompleted, "first-failure retirement", {}),
+			(readerCompleted, "first-failure reader", { joinedResult = await reader.value }),
+			(closeCompleted, "first-failure close", { await closeTask.value })
+		])
+		let result = try XCTUnwrap(joinedResult)
 		XCTAssertEqual(beforeCleanup, .timedOut)
 		XCTAssertEqual(result, .expectedFailure(.providerError))
 	}
@@ -1706,10 +1686,10 @@ final class WebRTCQualificationTests: XCTestCase {
 				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(readerCompleted, task: "scheduled-open reader")
-		Self.requireCompleted(closeCompleted, task: "scheduled-open close")
-		_ = await reader.value
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "scheduled-open reader", { _ = await reader.value }),
+			(closeCompleted, "scheduled-open close", { await closeTask.value })
+		])
 		XCTAssertEqual(beforeCleanup, .timedOut)
 	}
 
@@ -1769,10 +1749,12 @@ final class WebRTCQualificationTests: XCTestCase {
 				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(readerCompleted, task: "pending-open reader")
-		Self.requireCompleted(closeCompleted, task: "pending-open close")
-		let result = await reader.value
-		await closeTask.value
+		var joinedResult: TerminalObservation?
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "pending-open reader", { joinedResult = await reader.value }),
+			(closeCompleted, "pending-open close", { await closeTask.value })
+		])
+		let result = try XCTUnwrap(joinedResult)
 		XCTAssertEqual(beforeCleanup, .timedOut)
 		XCTAssertEqual(result, .expectedFailure(.providerError))
 	}
@@ -1877,10 +1859,12 @@ final class WebRTCQualificationTests: XCTestCase {
 				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(readerCompleted, task: "accepted-open reader")
-		Self.requireCompleted(closeCompleted, task: "accepted-open close")
-		let result = await reader.value
-		await closeTask.value
+		var joinedResult: TerminalObservation?
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "accepted-open reader", { joinedResult = await reader.value }),
+			(closeCompleted, "accepted-open close", { await closeTask.value })
+		])
+		let result = try XCTUnwrap(joinedResult)
 		XCTAssertEqual(beforeCleanup, .timedOut)
 		XCTAssertTrue(acceptedOpenEntered)
 		XCTAssertTrue(firstRetiredBeforeSecondInbound)
@@ -1931,9 +1915,8 @@ final class WebRTCQualificationTests: XCTestCase {
 			await closeGate.release()
 			closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 		}
-		Self.requireCompleted(closeCompleted, task: "retention close")
 		XCTAssertEqual(beforeCleanup, .timedOut)
-		await closeTask.value
+		await Self.finalizeOwnedTasks([(closeCompleted, "retention close", { await closeTask.value })])
 		XCTAssertNil(retention.token)
 	}
 
@@ -1976,10 +1959,10 @@ final class WebRTCQualificationTests: XCTestCase {
 				closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 			}
 		}
-		Self.requireCompleted(observerCompleted, task: "observation helper reader")
-		Self.requireCompleted(closeCompleted, task: "observation helper close")
-		_ = await observer.value
-		await closeTask.value
+		await Self.finalizeOwnedTasks([
+			(observerCompleted, "observation helper reader", { _ = await observer.value }),
+			(closeCompleted, "observation helper close", { await closeTask.value })
+		])
 		XCTAssertEqual(firstBound, .timedOut)
 		XCTAssertEqual(secondBound, .timedOut)
 	}
@@ -1989,11 +1972,31 @@ final class WebRTCQualificationTests: XCTestCase {
 		case unexpected
 	}
 
-	@MainActor private static func requireCompleted(_ completed: Bool, task: String) {
-		guard !completed else { return }
-		XCTFail("Content-free owned task did not settle: \(task)")
-		fatalError("Content-free owned task did not settle")
+	@MainActor private static func finalizeOwnedTasks(
+		_ inventory: [(completed: Bool, label: String, join: @MainActor () async -> Void)]
+	) async {
+		var incomplete: [String] = []
+		for task in inventory {
+			if task.completed {
+				await task.join()
+			} else {
+				incomplete.append(task.label)
+			}
+		}
+		guard incomplete.isEmpty else {
+			XCTFail("Content-free owned tasks did not settle: \(incomplete.joined(separator: ", "))")
+			fatalError("Content-free owned tasks did not settle")
+		}
 	}
+
+	@MainActor private static func assertTrueValue(_ value: Bool) async {
+		XCTAssertTrue(value)
+	}
+
+	@MainActor private static func assertEqualValue<Value: Equatable>(_ actual: Value, _ expected: Value) async {
+		XCTAssertEqual(actual, expected)
+	}
+
 
 }
 
