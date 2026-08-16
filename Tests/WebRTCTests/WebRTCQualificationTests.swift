@@ -152,7 +152,93 @@ final class WebRTCQualificationTests: XCTestCase {
         XCTAssertThrowsError(try decoder.decode(Data(#"{"type":"response.function_call_arguments.done"}"#.utf8))) { error in
             XCTAssertEqual(error as? WebRTCTransportFailure, .unsupportedEvent)
         }
+		XCTAssertThrowsError(try decoder.decode(Data(#"{"type":"session.created"}"#.utf8))) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .unsupportedEvent)
+		}
     }
+
+	func testConnectorIngressIgnoresOnlyKnownAudioLifecycleEvents() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		let eventTypes = [
+			"session.created",
+			"session.updated",
+			"input_audio_buffer.committed",
+			"input_audio_buffer.cleared",
+			"input_audio_buffer.speech_started",
+			"input_audio_buffer.speech_stopped",
+			"input_audio_buffer.timeout_triggered",
+			"conversation.item.added",
+			"conversation.item.done",
+			"conversation.item.input_audio_transcription.delta",
+			"conversation.item.input_audio_transcription.segment",
+			"response.created",
+			"response.output_item.added",
+			"response.output_item.done",
+			"response.content_part.added",
+			"response.content_part.done",
+			"response.output_audio_transcript.delta",
+			"response.output_audio.delta",
+			"response.output_audio.done",
+			"rate_limits.updated",
+		]
+
+		for eventType in eventTypes {
+			let payload = try XCTUnwrap(#"{"type":"\#(eventType)"}"#.data(using: .utf8))
+			XCTAssertNil(try decoder.decodeForConnector(payload), eventType)
+		}
+
+		for eventType in ["response.function_call_arguments.done", "response.mcp_call.completed", "unknown.event"] {
+			let payload = try XCTUnwrap(#"{"type":"\#(eventType)"}"#.data(using: .utf8))
+			XCTAssertThrowsError(try decoder.decodeForConnector(payload), eventType) { error in
+				XCTAssertEqual(error as? WebRTCTransportFailure, .unsupportedEvent)
+			}
+		}
+	}
+
+	@MainActor
+	func testConnectorContinuesAfterLocalAISessionCreatedHandshake() async throws {
+		let sessionCreatedDrainProbe = TestTaskCompletionProbe()
+		let terminalObserver = WebRTCConnector.TerminalObserver(
+			cancelSignaling: {},
+			closeData: {},
+			closePeer: {},
+			disableAudio: {},
+			didDrainInbound: { sessionCreatedDrainProbe.markComplete() }
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: terminalObserver
+		)
+		let events = connector.qualificationEvents
+		let readerProbe = TestTaskCompletionProbe()
+		let reader = Task { @MainActor in
+			defer { readerProbe.markComplete() }
+			var iterator = events.makeAsyncIterator()
+			do {
+				guard case .connected = try await iterator.next() else { return false }
+				guard case .inbound(.responseFinished) = try await iterator.next() else { return false }
+				return true
+			} catch {
+				return false
+			}
+		}
+
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+		await fulfillment(of: [sessionCreatedDrainProbe.expectation()], timeout: 1)
+		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+
+		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
+		if !readerCompleted {
+			reader.cancel()
+			readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
+		}
+		await connector.closeAndSettle()
+		await Self.finalizeOwnedTasks([
+			(readerCompleted, "LocalAI handshake reader", { await Self.assertTrueValue(await reader.value) })
+		])
+		XCTAssertTrue(readerCompleted)
+	}
 
     func testEventIngressRejectsOversizedPayloadBeforeDecoding() throws {
         XCTAssertThrowsError(try WebRTCInboundEventDecoder().decode(Data(repeating: 0, count: WebRTCTransportLimits.maximumPayloadBytes + 1))) { error in

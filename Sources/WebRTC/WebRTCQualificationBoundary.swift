@@ -197,6 +197,20 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	public init() {}
 
 	public func decode(_ data: Data) throws -> WebRTCInboundEvent {
+		guard let event = try decode(data, permitsKnownAudioLifecycleEvents: false) else {
+			throw WebRTCTransportFailure.unsupportedEvent
+		}
+		return event
+	}
+
+	package func decodeForConnector(_ data: Data) throws -> WebRTCInboundEvent? {
+		try decode(data, permitsKnownAudioLifecycleEvents: true)
+	}
+
+	private func decode(
+		_ data: Data,
+		permitsKnownAudioLifecycleEvents: Bool
+	) throws -> WebRTCInboundEvent? {
 		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
 			throw WebRTCTransportFailure.eventTooLarge
 		}
@@ -211,6 +225,8 @@ public struct WebRTCInboundEventDecoder: Sendable {
 					return .assistantTranscript(transcript)
 				case "response.done": return .responseFinished
 				case "error": return .providerError
+				case let type where permitsKnownAudioLifecycleEvents && Self.knownAudioLifecycleEventTypes.contains(type):
+					return nil
 				default: throw WebRTCTransportFailure.unsupportedEvent
 			}
 		} catch let failure as WebRTCTransportFailure {
@@ -219,6 +235,29 @@ public struct WebRTCInboundEventDecoder: Sendable {
 			throw WebRTCTransportFailure.malformedEvent
 		}
 	}
+
+	private static let knownAudioLifecycleEventTypes: Set<String> = [
+		"session.created",
+		"session.updated",
+		"input_audio_buffer.committed",
+		"input_audio_buffer.cleared",
+		"input_audio_buffer.speech_started",
+		"input_audio_buffer.speech_stopped",
+		"input_audio_buffer.timeout_triggered",
+		"conversation.item.added",
+		"conversation.item.done",
+		"conversation.item.input_audio_transcription.delta",
+		"conversation.item.input_audio_transcription.segment",
+		"response.created",
+		"response.output_item.added",
+		"response.output_item.done",
+		"response.content_part.added",
+		"response.content_part.done",
+		"response.output_audio_transcript.delta",
+		"response.output_audio.delta",
+		"response.output_audio.done",
+		"rate_limits.updated",
+	]
 
 	private struct Envelope: Decodable { let type: String; let transcript: String? }
 }
