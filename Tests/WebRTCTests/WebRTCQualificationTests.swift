@@ -469,15 +469,16 @@ final class WebRTCQualificationTests: XCTestCase {
 	func testBlockingDiagnosticSinkCannotDelayTerminalCleanup() async throws {
 		let slowSink = BlockingDiagnosticProbe()
 		let probe = ConnectorTerminalProbe()
-		let connector = try WebRTCConnector.createQualification(
+		var connector: WebRTCConnector? = try WebRTCConnector.createQualification(
 			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
 			terminalObserver: probe.observer,
 			diagnosticSink: { slowSink.record($0) }
 		)
+		weak let releasedConnector = connector
 		XCTAssertEqual(slowSink.didEnter.wait(timeout: .now() + 1), .success)
 
 		let started = ContinuousClock.now
-		await connector.closeAndSettle()
+		await connector?.closeAndSettle()
 		let elapsed = started.duration(to: .now)
 
 		XCTAssertLessThan(elapsed, .milliseconds(100))
@@ -485,7 +486,10 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(probe.dataCloses, 1)
 		XCTAssertEqual(probe.peerCloses, 1)
 		XCTAssertEqual(probe.audioDisables, 1)
+		connector = nil
+		XCTAssertNil(releasedConnector)
 		slowSink.release()
+		await fulfillment(of: [slowSink.expectation(forCount: 1)], timeout: 1)
 	}
 
 	@MainActor
@@ -508,9 +512,8 @@ final class WebRTCQualificationTests: XCTestCase {
 		}
 		await connector.closeAndSettle()
 		slowSink.release()
-		for _ in 0..<64 { await Task.yield() }
-
-		XCTAssertLessThanOrEqual(slowSink.values.count, 33)
+		await fulfillment(of: [slowSink.expectation(forCount: 33)], timeout: 1)
+		XCTAssertEqual(slowSink.values, [.peerCreated] + Array(repeating: .iceChecking, count: 32))
 	}
 
 	@MainActor
@@ -531,6 +534,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		concreteConnector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let eventsReceived = try await reader.value
 		await concreteConnector.closeAndSettle()
+		await fulfillment(of: [diagnostics.expectation(forCount: 8)], timeout: 1)
 
 		XCTAssertEqual(eventsReceived, [.connected, .inbound(.responseFinished)])
 		XCTAssertEqual(diagnostics.values, [
@@ -568,6 +572,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(probe.dataCloses, 1)
 		XCTAssertEqual(probe.peerCloses, 1)
 		XCTAssertEqual(probe.audioDisables, 1)
+		await fulfillment(of: [diagnostics.expectation(forCount: 10)], timeout: 1)
 		XCTAssertTrue(diagnostics.values.contains(.iceGatheringTimedOut))
 		connector = nil
 		XCTAssertNil(releasedConnector)
@@ -593,6 +598,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
 		}
 
+		await fulfillment(of: [diagnostics.expectation(forCount: 9)], timeout: 1)
 		XCTAssertFalse(diagnostics.values.contains(.iceGatheringComplete))
 		XCTAssertEqual(diagnostics.values.suffix(2), [.peerClosed, .teardownCompleted])
 	}
@@ -626,8 +632,8 @@ final class WebRTCQualificationTests: XCTestCase {
 		// Unified Plan supplies the receiver's authoritative audio track even
 		// when its legacy stream list is empty; this is observation only.
 		connector.peerConnection(callbackConnection, didAdd: receiver, streams: [])
-		for _ in 0..<16 { await Task.yield() }
 		await connector.closeAndSettle()
+		await fulfillment(of: [diagnostics.expectation(forCount: 13)], timeout: 1)
 
 		XCTAssertEqual(diagnostics.values, [
 			.peerCreated, .iceChecking, .iceConnected, .peerConnecting, .peerConnected,
@@ -670,12 +676,13 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.peerConnection(callbackConnection, didChange: LKRTCPeerConnectionState.connected)
 		connector.peerConnection(callbackConnection, didAdd: receiver, streams: [])
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
-		for _ in 0..<16 { await Task.yield() }
+		await fulfillment(of: [diagnostics.expectation(forCount: 1)], timeout: 1)
 		let lateSuccesses: Set<WebRTCConnectorDiagnosticMilestone> = [.iceConnected, .iceCompleted, .peerConnected, .dataChannelOpen, .remoteAudioTrackObserved]
 		XCTAssertTrue(lateSuccesses.isDisjoint(with: Set(diagnostics.values)))
 
 		await drainGate.release()
 		await connector.closeAndSettle()
+		await fulfillment(of: [diagnostics.expectation(forCount: 7)], timeout: 1)
 		XCTAssertEqual(diagnostics.values, [
 			.peerCreated, .teardownBegan, .dataChannelClosing, .dataChannelClosed,
 			.iceClosed, .peerClosed, .teardownCompleted,
@@ -2613,13 +2620,31 @@ private final class WeakRetentionBox: @unchecked Sendable {
 private final class DiagnosticProbe: @unchecked Sendable {
 	private let lock = NSLock()
 	private var recorded: [WebRTCConnectorDiagnosticMilestone] = []
+	private var countWaiters: [(count: Int, expectation: XCTestExpectation)] = []
 
 	func record(_ milestone: WebRTCConnectorDiagnosticMilestone) {
-		lock.withLock { recorded.append(milestone) }
+		let ready = lock.withLock { () -> [XCTestExpectation] in
+			recorded.append(milestone)
+			let ready = countWaiters.filter { $0.count <= recorded.count }.map(\.expectation)
+			countWaiters.removeAll { $0.count <= recorded.count }
+			return ready
+		}
+		ready.forEach { $0.fulfill() }
 	}
 
 	var values: [WebRTCConnectorDiagnosticMilestone] {
 		lock.withLock { recorded }
+	}
+
+	func expectation(forCount count: Int) -> XCTestExpectation {
+		let expectation = XCTestExpectation(description: "content-free diagnostic count \(count)")
+		let immediatelyReady = lock.withLock { () -> Bool in
+			guard recorded.count < count else { return true }
+			countWaiters.append((count, expectation))
+			return false
+		}
+		if immediatelyReady { expectation.fulfill() }
+		return expectation
 	}
 }
 
@@ -2629,6 +2654,7 @@ private final class BlockingDiagnosticProbe: @unchecked Sendable {
 	private let lock = NSLock()
 	private var isFirst = true
 	private var recorded: [WebRTCConnectorDiagnosticMilestone] = []
+	private var countWaiters: [(count: Int, expectation: XCTestExpectation)] = []
 
 	func record(_ milestone: WebRTCConnectorDiagnosticMilestone) {
 		let waits = lock.withLock { () -> Bool in
@@ -2640,7 +2666,13 @@ private final class BlockingDiagnosticProbe: @unchecked Sendable {
 			didEnter.signal()
 			releaseGate.wait()
 		}
-		lock.withLock { recorded.append(milestone) }
+		let ready = lock.withLock { () -> [XCTestExpectation] in
+			recorded.append(milestone)
+			let ready = countWaiters.filter { $0.count <= recorded.count }.map(\.expectation)
+			countWaiters.removeAll { $0.count <= recorded.count }
+			return ready
+		}
+		ready.forEach { $0.fulfill() }
 	}
 
 	func release() {
@@ -2649,6 +2681,17 @@ private final class BlockingDiagnosticProbe: @unchecked Sendable {
 
 	var values: [WebRTCConnectorDiagnosticMilestone] {
 		lock.withLock { recorded }
+	}
+
+	func expectation(forCount count: Int) -> XCTestExpectation {
+		let expectation = XCTestExpectation(description: "blocked content-free diagnostic count \(count)")
+		let immediatelyReady = lock.withLock { () -> Bool in
+			guard recorded.count < count else { return true }
+			countWaiters.append((count, expectation))
+			return false
+		}
+		if immediatelyReady { expectation.fulfill() }
+		return expectation
 	}
 }
 
