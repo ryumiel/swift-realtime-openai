@@ -383,6 +383,7 @@ import FoundationNetworking
 	nonisolated private let ingressStream: AsyncThrowingStream<Data, Error>.Continuation
 	private var ingressDrainTask: Task<Void, Never>?
 	nonisolated private let terminalGate = TerminalGate()
+	package static let inboundMailboxCapacity = 32
 	private struct PreReadyInboundEvent {
 		let event: WebRTCInboundEvent
 		let retentionToken: AnyObject?
@@ -420,7 +421,10 @@ import FoundationNetworking
 		generation = lifecycle.begin()
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self, bufferingPolicy: .bufferingOldest(0))
 		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorQualificationEvent.self, bufferingPolicy: .bufferingOldest(2))
-		(ingressEvents, ingressStream) = AsyncThrowingStream.makeStream(of: Data.self, bufferingPolicy: .bufferingOldest(1))
+		(ingressEvents, ingressStream) = AsyncThrowingStream.makeStream(
+			of: Data.self,
+			bufferingPolicy: .bufferingOldest(Self.inboundMailboxCapacity)
+		)
 
 		super.init()
 
