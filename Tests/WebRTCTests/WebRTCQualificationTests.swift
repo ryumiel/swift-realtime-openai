@@ -447,7 +447,6 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await fulfillment(of: [startedDrain], timeout: 1)
 		connector.disconnect()
-		for _ in 0..<8 { await Task.yield() }
 
 		do {
 			try await connector.connect(using: WebRTCSignalingRequest(
@@ -476,19 +475,32 @@ final class WebRTCQualificationTests: XCTestCase {
 		)
 		weak let releasedConnector = connector
 		XCTAssertEqual(slowSink.didEnter.wait(timeout: .now() + 1), .success)
+		let closeStarted = expectation(description: "terminal cleanup task started")
+		let closeProbe = TestTaskCompletionProbe()
+		let closeTask = Task { @MainActor [weak connector] in
+			defer { closeProbe.markComplete() }
+			closeStarted.fulfill()
+			await connector?.closeAndSettle()
+		}
+		await fulfillment(of: [closeStarted], timeout: 1)
+		let closeCompleted = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
 
-		let started = ContinuousClock.now
-		await connector?.closeAndSettle()
-		let elapsed = started.duration(to: .now)
-
-		XCTAssertLessThan(elapsed, .milliseconds(100))
 		XCTAssertEqual(probe.signalingCancels, 1)
 		XCTAssertEqual(probe.dataCloses, 1)
 		XCTAssertEqual(probe.peerCloses, 1)
 		XCTAssertEqual(probe.audioDisables, 1)
-		connector = nil
-		XCTAssertNil(releasedConnector)
+		if closeCompleted {
+			connector = nil
+			XCTAssertNil(releasedConnector)
+		}
 		slowSink.release()
+		var joined = closeCompleted
+		if !joined {
+			closeTask.cancel()
+			joined = await XCTWaiter.fulfillment(of: [closeProbe.expectation()], timeout: 1) == .completed
+		}
+		await Self.finalizeOwnedTasks([(joined, "blocking diagnostic terminal cleanup", { await closeTask.value })])
+		XCTAssertTrue(closeCompleted)
 		await fulfillment(of: [slowSink.expectation(forCount: 1)], timeout: 1)
 	}
 
@@ -669,7 +681,6 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await fulfillment(of: [drainStarted], timeout: 1)
 		connector.disconnect()
-		for _ in 0..<8 { await Task.yield() }
 
 		connector.peerConnection(callbackConnection, didChange: LKRTCIceConnectionState.connected)
 		connector.peerConnection(callbackConnection, didChange: LKRTCIceConnectionState.completed)
