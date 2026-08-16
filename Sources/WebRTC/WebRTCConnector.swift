@@ -8,6 +8,52 @@ import FoundationNetworking
 
 @MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
 	private enum DeliveryMode { case ordinary, qualification }
+	private final class DiagnosticGate: @unchecked Sendable {
+		private let lock = NSLock()
+		private var pending: [WebRTCConnectorDiagnosticMilestone] = []
+		private var isDraining = false
+		private var isClosed = false
+		private var closeWaiter: CheckedContinuation<Void, Never>?
+
+		func accept(_ milestone: WebRTCConnectorDiagnosticMilestone) -> Bool {
+			lock.withLock {
+				guard !isClosed else { return false }
+				pending.append(milestone)
+				guard !isDraining else { return false }
+				isDraining = true
+				return true
+			}
+		}
+
+		func nextOrFinish() -> WebRTCConnectorDiagnosticMilestone? {
+			var waiter: CheckedContinuation<Void, Never>?
+			let next = lock.withLock { () -> WebRTCConnectorDiagnosticMilestone? in
+				if !pending.isEmpty { return pending.removeFirst() }
+				isDraining = false
+				if isClosed {
+					waiter = closeWaiter
+					closeWaiter = nil
+				}
+				return nil
+			}
+			waiter?.resume()
+			return next
+		}
+
+		func closeAndDrain() async {
+			await withCheckedContinuation { continuation in
+				let immediatelySettled = lock.withLock { () -> Bool in
+					isClosed = true
+					guard isDraining else { return true }
+					precondition(closeWaiter == nil, "Diagnostic close waiter installed twice")
+					closeWaiter = continuation
+					return false
+				}
+				if immediatelySettled { continuation.resume() }
+			}
+		}
+	}
+
 	private final class TerminalGate: @unchecked Sendable {
 		private let lock = NSLock()
 		private enum State {
@@ -209,6 +255,7 @@ import FoundationNetworking
 		let beforeDrainInbound: () async -> Void
 		let beforeOpenTransition: () async -> Void
 		let makePreReadyRetentionToken: () -> AnyObject?
+		let waitForLocalICEGathering: (@MainActor () async throws -> Void)?
 		let didDrainInbound: () -> Void
 		let didRetireAcceptedIngress: () -> Void
 		let didSettle: () -> Void
@@ -221,6 +268,7 @@ import FoundationNetworking
 			beforeDrainInbound: @escaping () async -> Void = {},
 			beforeOpenTransition: @escaping () async -> Void = {},
 			makePreReadyRetentionToken: @escaping () -> AnyObject? = { nil },
+			waitForLocalICEGathering: (@MainActor () async throws -> Void)? = nil,
 			didDrainInbound: @escaping () -> Void = {},
 			didRetireAcceptedIngress: @escaping () -> Void = {},
 			didSettle: @escaping () -> Void = {}
@@ -232,6 +280,7 @@ import FoundationNetworking
 			self.beforeDrainInbound = beforeDrainInbound
 			self.beforeOpenTransition = beforeOpenTransition
 			self.makePreReadyRetentionToken = makePreReadyRetentionToken
+			self.waitForLocalICEGathering = waitForLocalICEGathering
 			self.didDrainInbound = didDrainInbound
 			self.didRetireAcceptedIngress = didRetireAcceptedIngress
 			self.didSettle = didSettle
@@ -270,6 +319,7 @@ import FoundationNetworking
 	private let terminalObserver: TerminalObserver
 	private let deliveryMode: DeliveryMode
 	private let diagnosticSink: @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void
+	nonisolated private let diagnosticGate = DiagnosticGate()
 	private let ingressEvents: AsyncThrowingStream<Data, Error>
 	nonisolated private let ingressStream: AsyncThrowingStream<Data, Error>.Continuation
 	private var ingressDrainTask: Task<Void, Never>?
@@ -317,7 +367,7 @@ import FoundationNetworking
 
 		connection.delegate = self
 		dataChannel.delegate = self
-		emitDiagnostic(.peerCreated)
+		enqueueDiagnostic(.peerCreated)
 		let ingressEvents = ingressEvents
 		ingressDrainTask = Task { [weak self, ingressEvents] in
 			do {
@@ -337,7 +387,7 @@ import FoundationNetworking
 			let remoteSDP = try await fetchRemoteSDP(using: signaling, localSdp: localSDP)
 			try await apply(answer: remoteSDP)
 		} catch {
-			disconnect()
+			await requestTerminal()?.value
 			throw error
 		}
 	}
@@ -354,20 +404,27 @@ import FoundationNetworking
 		} catch {
 			throw WebRTCError.failedToCreateSDPOffer(error)
 		}
-		emitDiagnostic(.offerCreated)
 		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+		enqueueDiagnostic(.offerCreated)
 
 		do { try await connection.setLocalDescription(sdp) }
 		catch { throw WebRTCError.failedToSetLocalDescription(error) }
-		emitDiagnostic(.localDescriptionInstalled)
+		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+		enqueueDiagnostic(.localDescriptionInstalled)
 		do {
-			try await Self.waitForLocalICEGathering(
-				isCurrent: { self.lifecycle.isCurrent(self.generation) },
-				isComplete: { self.connection.iceGatheringState == .complete }
-			)
-			emitDiagnostic(.iceGatheringComplete)
+			if let waitForLocalICEGathering = terminalObserver.waitForLocalICEGathering {
+				try await waitForLocalICEGathering()
+			} else {
+				try await Self.waitForLocalICEGathering(
+					isCurrent: { self.lifecycle.isCurrent(self.generation) },
+					isComplete: { self.connection.iceGatheringState == .complete }
+				)
+			}
+			guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+			enqueueDiagnostic(.iceGatheringComplete)
 		} catch let failure as WebRTCTransportFailure where failure == .iceGatheringTimedOut {
-			emitDiagnostic(.iceGatheringTimedOut)
+			guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+			enqueueDiagnostic(.iceGatheringTimedOut)
 			throw failure
 		}
 		guard lifecycle.isCurrent(generation), let localSDP = connection.localDescription?.sdp else {
@@ -380,8 +437,8 @@ import FoundationNetworking
 		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
 		do { try await connection.setRemoteDescription(LKRTCSessionDescription(type: .answer, sdp: answer)) }
 		catch { throw WebRTCError.failedToSetRemoteDescription(error) }
-		emitDiagnostic(.remoteDescriptionInstalled)
 		guard lifecycle.isCurrent(generation) else { throw WebRTCTransportFailure.cancelled }
+		enqueueDiagnostic(.remoteDescriptionInstalled)
 		Self.configureAudioSession()
 	}
 
@@ -418,7 +475,8 @@ import FoundationNetworking
 			terminalGate.markSettled()
 			return
 		}
-		emitDiagnostic(.teardownBegan)
+		await diagnosticGate.closeAndDrain()
+		diagnosticSink(.teardownBegan)
 		status = .disconnected
 		terminalObserver.cancelSignaling()
 		lifecycle.cancelSignalingTask()
@@ -449,7 +507,7 @@ import FoundationNetworking
 		stream.finish(throwing: failure)
 		await drain?.value
 		terminalGate.markSettled()
-		emitDiagnostic(.teardownCompleted)
+		diagnosticSink(.teardownCompleted)
 		terminalObserver.didSettle()
 	}
 
@@ -458,8 +516,24 @@ import FoundationNetworking
 		audioTrack.isEnabled.toggle()
 	}
 
-	private func emitDiagnostic(_ milestone: WebRTCConnectorDiagnosticMilestone) {
-		diagnosticSink(milestone)
+	private func enqueueDiagnostic(_ milestone: WebRTCConnectorDiagnosticMilestone) {
+		let gate = diagnosticGate
+		guard gate.accept(milestone) else { return }
+		scheduleDiagnosticDrain(gate)
+	}
+
+	nonisolated private func enqueueDiagnosticFromDelegate(_ milestone: WebRTCConnectorDiagnosticMilestone) {
+		let gate = diagnosticGate
+		guard gate.accept(milestone) else { return }
+		scheduleDiagnosticDrain(gate)
+	}
+
+	nonisolated private func scheduleDiagnosticDrain(_ gate: DiagnosticGate) {
+		Task { @MainActor [weak self, gate] in
+			while let milestone = gate.nextOrFinish() {
+				self?.diagnosticSink(milestone)
+			}
+		}
 	}
 }
 
@@ -481,8 +555,12 @@ extension WebRTCConnector {
 		try create(session: session, terminalObserver: .none, deliveryMode: .qualification, diagnosticSink: diagnosticSink)
 	}
 
-	package static func createQualification(session: any WebRTCSignalingSession, terminalObserver: TerminalObserver) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .qualification, diagnosticSink: { _ in })
+	package static func createQualification(
+		session: any WebRTCSignalingSession,
+		terminalObserver: TerminalObserver,
+		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void = { _ in }
+	) throws -> WebRTCConnector {
+		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .qualification, diagnosticSink: diagnosticSink)
 	}
 
 	private static func create(
@@ -596,14 +674,15 @@ private extension WebRTCConnector {
 	}
 }
 
-// LiveKit's delegate protocols predate actor annotations. The imported callbacks enter
-// nonisolated and capture only scalar/Data values; each explicitly hops to MainActor.
+// LiveKit's delegate protocols predate actor annotations. The imported callbacks derive
+// fixed content-free milestones only; the diagnostic gate serializes delivery on MainActor.
 extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 	nonisolated public func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didAdd stream: LKRTCMediaStream) {
-		// This reports only remote-stream audio-track presence, never rendered playback.
-		guard !stream.audioTracks.isEmpty else { return }
-		emitDiagnosticFromDelegate(.remoteAudioTrackObserved)
+		reportRemoteAudioTrackIfPresent(in: [stream])
+	}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didAdd _: LKRTCRtpReceiver, streams: [LKRTCMediaStream]) {
+		reportRemoteAudioTrackIfPresent(in: streams)
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
@@ -623,7 +702,7 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 		case .closed: milestone = .iceClosed
 		default: milestone = nil
 		}
-		if let milestone { emitDiagnosticFromDelegate(milestone) }
+		if let milestone { enqueueDiagnosticFromDelegate(milestone) }
 		let terminal = newState == .closed || newState == .disconnected
 		if terminal { _ = terminalGate.request(nil, connector: self) }
 	}
@@ -638,7 +717,7 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 		case .closed: milestone = .peerClosed
 		default: milestone = nil
 		}
-		if let milestone { emitDiagnosticFromDelegate(milestone) }
+		if let milestone { enqueueDiagnosticFromDelegate(milestone) }
 		let terminal = newState == .failed || newState == .closed || newState == .disconnected
 		if terminal { _ = terminalGate.request(nil, connector: self) }
 	}
@@ -660,7 +739,7 @@ extension WebRTCConnector: LKRTCDataChannelDelegate {
 		case .closed: milestone = .dataChannelClosed
 		@unknown default: milestone = nil
 		}
-		if let milestone { emitDiagnosticFromDelegate(milestone) }
+		if let milestone { enqueueDiagnosticFromDelegate(milestone) }
 		if isTerminal {
 			_ = terminalGate.request(nil, connector: self)
 		} else if isOpen {
@@ -670,10 +749,13 @@ extension WebRTCConnector: LKRTCDataChannelDelegate {
 }
 
 extension WebRTCConnector {
-	nonisolated private func emitDiagnosticFromDelegate(_ milestone: WebRTCConnectorDiagnosticMilestone) {
-		Task { @MainActor [weak self, milestone] in
-			self?.emitDiagnostic(milestone)
-		}
+	nonisolated private func reportRemoteAudioTrackIfPresent(in streams: [LKRTCMediaStream]) {
+		guard Self.remoteStreamsContainAudioTrack(streams) else { return }
+		enqueueDiagnosticFromDelegate(.remoteAudioTrackObserved)
+	}
+
+	nonisolated package static func remoteStreamsContainAudioTrack(_ streams: [LKRTCMediaStream]) -> Bool {
+		streams.contains { !$0.audioTracks.isEmpty }
 	}
 
 	@_spi(AirbridgeQualification) nonisolated public func scheduleOpenTransitionForQualification() {
@@ -752,7 +834,7 @@ extension WebRTCConnector {
 	) {
 		guard lifecycle.isCurrent(generation) else { return }
 		if isOpen {
-			if !fromAcceptedIngress { emitDiagnostic(.dataChannelOpen) }
+			if !fromAcceptedIngress { enqueueDiagnostic(.dataChannelOpen) }
 			guard lifecycle.isCurrent(generation) else { return }
 			guard status != .connected else { return }
 			status = .connected

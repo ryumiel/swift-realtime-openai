@@ -11,7 +11,7 @@ import Foundation
 }
 
 /// Fixed, content-free milestones intended only for Airbridge's local qualification.
-@_spi(AirbridgeQualification) public enum WebRTCConnectorDiagnosticMilestone: String, Sendable, Equatable {
+@_spi(AirbridgeQualification) public enum WebRTCConnectorDiagnosticMilestone: String, Sendable, Equatable, CaseIterable {
 	case peerCreated
 	case offerCreated
 	case localDescriptionInstalled
