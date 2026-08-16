@@ -963,8 +963,9 @@ final class WebRTCQualificationTests: XCTestCase {
 			}
 		}
 
-		connector.receiveInbound(Data(#"{"type":"response.output_audio_transcript.done","transcript":"x"}"#.utf8))
-		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
+		for _ in 0...WebRTCConnector.inboundMailboxCapacity {
+			connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+		}
 
 		await closeGate.release()
 		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
@@ -982,6 +983,29 @@ final class WebRTCQualificationTests: XCTestCase {
 		])
 		XCTAssertTrue(readerCompleted)
 		XCTAssertTrue(closeCompleted)
+	}
+
+	@MainActor
+	func testLocalAIResponseSizedIngressBurstDrainsWithoutClosing() async throws {
+		let burstCount = 17
+		let retired = expectation(description: "LocalAI-sized ingress burst retired")
+		retired.expectedFulfillmentCount = burstCount
+		let probe = ConnectorTerminalProbe(retirementExpectation: retired)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer
+		)
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+
+		for _ in 0..<burstCount {
+			connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+		}
+
+		let drained = await XCTWaiter.fulfillment(of: [retired], timeout: 1) == .completed
+		XCTAssertTrue(drained)
+		XCTAssertEqual(connector.status, .connected)
+		await connector.closeAndSettle()
+		XCTAssertEqual(connector.status, .disconnected)
 	}
 
 	@MainActor
