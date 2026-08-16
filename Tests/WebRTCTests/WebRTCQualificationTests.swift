@@ -192,6 +192,10 @@ final class WebRTCQualificationTests: XCTestCase {
 		for payload in audioLifecyclePayloads {
 			XCTAssertNil(try decoder.decodeForConnector(payload))
 		}
+		XCTAssertEqual(
+			try decoder.decodeForConnector(Data(#"{"type":"response.done","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}]}}"#.utf8)),
+			.responseFinished
+		)
 
 		for eventType in ["response.function_call_arguments.done", "response.mcp_call.completed", "unknown.event"] {
 			let payload = try XCTUnwrap(#"{"type":"\#(eventType)"}"#.data(using: .utf8))
@@ -207,6 +211,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			Data(#"{"type":"conversation.item.added"}"#.utf8),
 			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"user","content":[{"type":"input_text"}]}}"#.utf8),
 			Data(#"{"type":"response.created","response":{"output":[{"type":"function_call"}]}}"#.utf8),
+			Data(#"{"type":"response.done"}"#.utf8),
+			Data(#"{"type":"response.done","response":{"output":[{"type":"function_call"}]}}"#.utf8),
+			Data(#"{"type":"response.done","response":{"output":[{"type":"mcp_tool_call"}]}}"#.utf8),
+			Data(#"{"type":"response.done","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text"}]}]}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"function_call"}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"mcp_tool_call"}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text"}]}}"#.utf8),
@@ -251,7 +259,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
 		connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
 		await fulfillment(of: [sessionCreatedDrainProbe.expectation()], timeout: 1)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 
 		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
 		if !readerCompleted {
@@ -409,7 +417,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		let callbackProbe = TestTaskCompletionProbe()
 		let callback = Task { @MainActor in
 			defer { callbackProbe.markComplete() }
-			connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+			connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		}
 
 		connector.disconnect()
@@ -609,7 +617,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		}
 
 		connector.receiveInbound(Data(#"{"type":"response.output_audio_transcript.done","transcript":"x"}"#.utf8))
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 
 		await closeGate.release()
 		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
@@ -676,9 +684,9 @@ final class WebRTCQualificationTests: XCTestCase {
 			await Task.yield()
 		}
 		let connected = connector.status == .connected
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let firstDrained = await XCTWaiter.fulfillment(of: [firstInboundDrained], timeout: 1) == .completed
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let retired = await XCTWaiter.fulfillment(of: [acceptedOutputsRetired], timeout: 1) == .completed
 		let terminalSettled = await XCTWaiter.fulfillment(of: [settled], timeout: 1) == .completed
 		await readerStartGate.release()
@@ -887,7 +895,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			}
 		}
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let drainedCompleted = await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed
 		await readerStartGate.release()
 		await closeGate.release()
@@ -939,7 +947,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			}
 			var drainedCompleted = true
 			if occupancy == 2 {
-				connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+				connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 				if let drained {
 					drainedCompleted = await XCTWaiter.fulfillment(of: [drained], timeout: 1) == .completed
 				}
@@ -1010,7 +1018,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		await fulfillment(of: [readerReady], timeout: 1)
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
 		await fulfillment(of: [connectedObserved], timeout: 1)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await fulfillment(of: [drainEntered], timeout: 1)
 
 		let closeCompletedEarly = await closeProbe.currentValue()
@@ -1040,7 +1048,7 @@ final class WebRTCQualificationTests: XCTestCase {
 	@MainActor
 	func testFirstAcceptedIngressFailureSuppressesLaterAcceptedDeliveryAndFailure() async throws {
 		let laterPayloads = [
-			Data(#"{"type":"response.done"}"#.utf8),
+			Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8),
 			Data(#"{"type":"response.function_call_arguments.done"}"#.utf8),
 		]
 		for laterPayload in laterPayloads {
@@ -1145,7 +1153,7 @@ final class WebRTCQualificationTests: XCTestCase {
 
 		connector.scheduleOpenTransitionForQualification()
 		await fulfillment(of: [openEntered], timeout: 1)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await fulfillment(of: [inboundDrained], timeout: 1)
 
 		let closeCompletedEarly = await closeProbe.currentValue()
@@ -1287,11 +1295,11 @@ final class WebRTCQualificationTests: XCTestCase {
 			}
 		}
 
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let firstDrained = await XCTWaiter.fulfillment(of: [firstDrainCompleted], timeout: 1)
 		connector.scheduleOpenTransitionForQualification()
 		let entered = await XCTWaiter.fulfillment(of: [openEntered], timeout: 1)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let laterEntered = await XCTWaiter.fulfillment(of: [laterDrainEntered], timeout: 1)
 		await openGate.release()
 		let openDeadline = ContinuousClock.now + .seconds(1)
@@ -1414,7 +1422,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.receiveInbound(Data(repeating: 0, count: WebRTCTransportLimits.maximumPayloadBytes + 1))
 		await disconnectStartGate.release()
 		var disconnectCompleted = await XCTWaiter.fulfillment(of: [disconnectProbe.expectation()], timeout: 1) == .completed
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await readerStartGate.release()
 		var readerCompleted = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 1) == .completed
 		await closeGate.release()
@@ -1623,7 +1631,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		let entered = expectation(description: "queued drain entered")
 		let terminalProbe = ConnectorTerminalProbe(beforeDrainInbound: { entered.fulfill(); await gate.wait() })
 		let connector = try WebRTCConnector.createQualification(session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")), terminalObserver: terminalProbe.observer)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await fulfillment(of: [entered], timeout: 1)
 		let closeProbe = TestTaskCompletionProbe()
 		let closeTask = Task { @MainActor in defer { closeProbe.markComplete() }; await connector.closeAndSettle() }
@@ -1649,7 +1657,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		for occupancy in 0...2 {
 			let connector = try WebRTCConnector.createQualification(session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")))
 			if occupancy >= 1 { connector.receiveDataChannelState(isOpen: true, isTerminal: false) }
-			if occupancy == 2 { connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8)) }
+			if occupancy == 2 { connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8)) }
 			let readerProbe = TestTaskCompletionProbe()
 			let closeStartGate = StickySuspensionGate()
 			let reader = Task { @MainActor in
@@ -1714,7 +1722,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			}
 		}
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		await fulfillment(of: [drainEntered], timeout: 1)
 		let beforeCleanup = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 0.05)
 		reader.cancel()
@@ -1995,11 +2003,11 @@ final class WebRTCQualificationTests: XCTestCase {
 				return .unexpected
 			}
 		}
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		connector.scheduleOpenTransitionForQualification()
 		let acceptedOpenEntered = await XCTWaiter.fulfillment(of: [openEntered], timeout: 1) == .completed
 		let firstRetiredBeforeSecondInbound = await XCTWaiter.fulfillment(of: [firstRawMailboxRetired], timeout: 1) == .completed
-		connector.receiveInbound(Data(#"{"type":"response.done"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
 		let laterDrainControlled = await XCTWaiter.fulfillment(of: [drainEntered], timeout: 1) == .completed
 		let beforeCleanup = await XCTWaiter.fulfillment(of: [readerProbe.expectation()], timeout: 0.05)
 

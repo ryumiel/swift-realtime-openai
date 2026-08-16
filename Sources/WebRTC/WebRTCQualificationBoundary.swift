@@ -223,7 +223,13 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "response.output_audio_transcript.done":
 					guard let transcript = envelope.transcript, !transcript.isEmpty else { throw WebRTCTransportFailure.malformedEvent }
 					return .assistantTranscript(transcript)
-				case "response.done": return .responseFinished
+				case "response.done":
+					if permitsKnownAudioLifecycleEvents {
+						guard let response = envelope.response,
+							response.output?.allSatisfy(\.isOutputAudioMessage) != false
+						else { throw WebRTCTransportFailure.unsupportedEvent }
+					}
+					return .responseFinished
 				case "error": return .providerError
 				case let type where permitsKnownAudioLifecycleEvents && Self.knownSimpleAudioLifecycleEventTypes.contains(type):
 					return nil
