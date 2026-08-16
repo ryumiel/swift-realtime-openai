@@ -8,6 +8,13 @@ import FoundationNetworking
 
 @MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
 	private enum DeliveryMode { case ordinary, qualification }
+	/// Terminal states describe teardown progress and remain observable after a
+	/// winner is selected. Every other native category is connection progression
+	/// and must be admitted while the terminal gate is still open.
+	private enum NativeDiagnosticAdmission {
+		case progression
+		case terminal
+	}
 	/// A bounded best-effort boundary for content-free diagnostics. Its detached
 	/// worker is deliberately independent from connector settlement: a sink is
 	/// allowed to be slow, but it cannot retain the connector or delay cleanup.
@@ -570,7 +577,30 @@ import FoundationNetworking
 	}
 
 	nonisolated private func enqueueDiagnosticFromDelegate(_ milestone: WebRTCConnectorDiagnosticMilestone) {
-		diagnosticDispatcher.submitFromDelegate(milestone)
+		switch Self.nativeDiagnosticAdmission(for: milestone) {
+		case .terminal:
+			diagnosticDispatcher.submitFromDelegate(milestone)
+		case .progression:
+			_ = terminalGate.admitProgression { diagnosticDispatcher.submitFromDelegate(milestone) }
+		}
+	}
+
+	nonisolated private static func nativeDiagnosticAdmission(
+		for milestone: WebRTCConnectorDiagnosticMilestone
+	) -> NativeDiagnosticAdmission {
+		switch milestone {
+		case .iceDisconnected, .iceFailed, .iceClosed,
+			.peerDisconnected, .peerFailed, .peerClosed,
+			.dataChannelClosing, .dataChannelClosed,
+			.teardownBegan, .teardownCompleted:
+			return .terminal
+		case .peerCreated, .offerCreated, .localDescriptionInstalled,
+			.iceGatheringComplete, .iceGatheringTimedOut,
+			.remoteDescriptionInstalled, .iceChecking, .iceConnected, .iceCompleted,
+			.peerConnecting, .peerConnected,
+			.dataChannelConnecting, .dataChannelOpen, .remoteAudioTrackObserved:
+			return .progression
+		}
 	}
 
 	private func isCurrentAndAcceptingProgression() -> Bool {

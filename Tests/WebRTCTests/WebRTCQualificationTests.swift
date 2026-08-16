@@ -637,6 +637,52 @@ final class WebRTCQualificationTests: XCTestCase {
 	}
 
 	@MainActor
+	func testSelectedTerminalDropsLateNativeProgressionDiagnosticsButKeepsCloseOrder() async throws {
+		let drainGate = StickySuspensionGate()
+		let drainStarted = expectation(description: "terminal selection waits for accepted ingress")
+		let diagnostics = DiagnosticProbe()
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: ConnectorTerminalProbe(beforeDrainInbound: {
+				drainStarted.fulfill()
+				await drainGate.wait()
+			}).observer,
+			diagnosticSink: { diagnostics.record($0) }
+		)
+		let factory = LKRTCPeerConnectionFactory()
+		let callbackConnection = try XCTUnwrap(factory.peerConnection(
+			with: LKRTCConfiguration(),
+			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+			delegate: nil
+		))
+		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+		let audioTrack = factory.audioTrack(with: audioSource, trackId: "late_remote_audio")
+		_ = callbackConnection.add(audioTrack, streamIds: ["late_receiver"])
+		let receiver = try XCTUnwrap(callbackConnection.transceivers.first?.receiver)
+
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
+		await fulfillment(of: [drainStarted], timeout: 1)
+		connector.disconnect()
+		for _ in 0..<8 { await Task.yield() }
+
+		connector.peerConnection(callbackConnection, didChange: LKRTCIceConnectionState.connected)
+		connector.peerConnection(callbackConnection, didChange: LKRTCIceConnectionState.completed)
+		connector.peerConnection(callbackConnection, didChange: LKRTCPeerConnectionState.connected)
+		connector.peerConnection(callbackConnection, didAdd: receiver, streams: [])
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		for _ in 0..<16 { await Task.yield() }
+		let lateSuccesses: Set<WebRTCConnectorDiagnosticMilestone> = [.iceConnected, .iceCompleted, .peerConnected, .dataChannelOpen, .remoteAudioTrackObserved]
+		XCTAssertTrue(lateSuccesses.isDisjoint(with: Set(diagnostics.values)))
+
+		await drainGate.release()
+		await connector.closeAndSettle()
+		XCTAssertEqual(diagnostics.values, [
+			.peerCreated, .teardownBegan, .dataChannelClosing, .dataChannelClosed,
+			.iceClosed, .peerClosed, .teardownCompleted,
+		])
+	}
+
+	@MainActor
 	func testConnectorLifecycleTerminatesResourcesOnceAndDropsQueuedCallback() async throws {
 		let probe = ConnectorTerminalProbe()
 		let productionPeer = try WebRTCConnectorQualificationPeerFactory(
