@@ -197,6 +197,20 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	public init() {}
 
 	public func decode(_ data: Data) throws -> WebRTCInboundEvent {
+		guard let event = try decode(data, permitsKnownAudioLifecycleEvents: false) else {
+			throw WebRTCTransportFailure.unsupportedEvent
+		}
+		return event
+	}
+
+	package func decodeForConnector(_ data: Data) throws -> WebRTCInboundEvent? {
+		try decode(data, permitsKnownAudioLifecycleEvents: true)
+	}
+
+	private func decode(
+		_ data: Data,
+		permitsKnownAudioLifecycleEvents: Bool
+	) throws -> WebRTCInboundEvent? {
 		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
 			throw WebRTCTransportFailure.eventTooLarge
 		}
@@ -209,8 +223,34 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "response.output_audio_transcript.done":
 					guard let transcript = envelope.transcript, !transcript.isEmpty else { throw WebRTCTransportFailure.malformedEvent }
 					return .assistantTranscript(transcript)
-				case "response.done": return .responseFinished
+				case "response.done":
+					if permitsKnownAudioLifecycleEvents {
+						guard let response = envelope.response,
+							let output = response.output,
+							output.allSatisfy(\.isOutputAudioMessage)
+						else { throw WebRTCTransportFailure.unsupportedEvent }
+					}
+					return .responseFinished
 				case "error": return .providerError
+				case let type where permitsKnownAudioLifecycleEvents && Self.knownSimpleAudioLifecycleEventTypes.contains(type):
+					return nil
+				case "conversation.item.added" where permitsKnownAudioLifecycleEvents,
+					"conversation.item.done" where permitsKnownAudioLifecycleEvents:
+					guard envelope.item?.isInputAudioMessage == true else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
+				case "response.created" where permitsKnownAudioLifecycleEvents:
+					guard let response = envelope.response, response.output?.isEmpty != false else {
+						throw WebRTCTransportFailure.unsupportedEvent
+					}
+					return nil
+				case "response.output_item.added" where permitsKnownAudioLifecycleEvents,
+					"response.output_item.done" where permitsKnownAudioLifecycleEvents:
+					guard envelope.item?.isOutputAudioMessage == true else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
+				case "response.content_part.added" where permitsKnownAudioLifecycleEvents,
+					"response.content_part.done" where permitsKnownAudioLifecycleEvents:
+					guard envelope.part?.type == "output_audio" else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
 				default: throw WebRTCTransportFailure.unsupportedEvent
 			}
 		} catch let failure as WebRTCTransportFailure {
@@ -220,7 +260,51 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		}
 	}
 
-	private struct Envelope: Decodable { let type: String; let transcript: String? }
+	private static let knownSimpleAudioLifecycleEventTypes: Set<String> = [
+		"session.created",
+		"session.updated",
+		"input_audio_buffer.committed",
+		"input_audio_buffer.cleared",
+		"input_audio_buffer.speech_started",
+		"input_audio_buffer.speech_stopped",
+		"input_audio_buffer.timeout_triggered",
+		"conversation.item.input_audio_transcription.delta",
+		"conversation.item.input_audio_transcription.segment",
+		"response.output_audio_transcript.delta",
+		"response.output_audio.delta",
+		"response.output_audio.done",
+		"rate_limits.updated",
+	]
+
+	private struct Envelope: Decodable {
+		let type: String
+		let transcript: String?
+		let item: ItemEnvelope?
+		let part: ContentEnvelope?
+		let response: ResponseEnvelope?
+	}
+
+	private struct ItemEnvelope: Decodable {
+		let type: String
+		let role: String?
+		let content: [ContentEnvelope]?
+
+		var isInputAudioMessage: Bool {
+			type == "message" && role == "user" && hasOnlyContent(type: "input_audio")
+		}
+
+		var isOutputAudioMessage: Bool {
+			type == "message" && role == "assistant" && hasOnlyContent(type: "output_audio")
+		}
+
+		private func hasOnlyContent(type expectedType: String) -> Bool {
+			guard let content, !content.isEmpty else { return false }
+			return content.allSatisfy { $0.type == expectedType }
+		}
+	}
+
+	private struct ContentEnvelope: Decodable { let type: String }
+	private struct ResponseEnvelope: Decodable { let output: [ItemEnvelope]? }
 }
 
 /// Main-actor lifecycle identity and one terminal cleanup for the private connector.

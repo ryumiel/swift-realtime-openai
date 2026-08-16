@@ -631,7 +631,7 @@ extension WebRTCConnector {
 		guard lifecycle.isCurrent(generation) else { return }
 		terminalObserver.didDrainInbound()
 		do {
-			let inboundEvent = try inboundEventDecoder.decode(data)
+			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }
 			if inboundEvent == .providerError {
 				requestTerminalFromAcceptedIngress(WebRTCTransportFailure.providerError)
 				return
