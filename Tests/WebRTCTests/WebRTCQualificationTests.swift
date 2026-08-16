@@ -159,7 +159,7 @@ final class WebRTCQualificationTests: XCTestCase {
 
 	func testConnectorIngressIgnoresOnlyKnownAudioLifecycleEvents() throws {
 		let decoder = WebRTCInboundEventDecoder()
-		let eventTypes = [
+		let simpleEventTypes = [
 			"session.created",
 			"session.updated",
 			"input_audio_buffer.committed",
@@ -167,29 +167,54 @@ final class WebRTCQualificationTests: XCTestCase {
 			"input_audio_buffer.speech_started",
 			"input_audio_buffer.speech_stopped",
 			"input_audio_buffer.timeout_triggered",
-			"conversation.item.added",
-			"conversation.item.done",
 			"conversation.item.input_audio_transcription.delta",
 			"conversation.item.input_audio_transcription.segment",
-			"response.created",
-			"response.output_item.added",
-			"response.output_item.done",
-			"response.content_part.added",
-			"response.content_part.done",
 			"response.output_audio_transcript.delta",
 			"response.output_audio.delta",
 			"response.output_audio.done",
 			"rate_limits.updated",
 		]
 
-		for eventType in eventTypes {
+		for eventType in simpleEventTypes {
 			let payload = try XCTUnwrap(#"{"type":"\#(eventType)"}"#.data(using: .utf8))
 			XCTAssertNil(try decoder.decodeForConnector(payload), eventType)
+		}
+
+		let audioLifecyclePayloads = [
+			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"user","content":[{"type":"input_audio","transcript":"ignored"}]}}"#.utf8),
+			Data(#"{"type":"conversation.item.done","item":{"type":"message","role":"user","content":[{"type":"input_audio"}]}}"#.utf8),
+			Data(#"{"type":"response.created","response":{"output":[]}}"#.utf8),
+			Data(#"{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}}"#.utf8),
+			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_audio","transcript":"ignored"}]}}"#.utf8),
+			Data(#"{"type":"response.content_part.added","part":{"type":"output_audio"}}"#.utf8),
+			Data(#"{"type":"response.content_part.done","part":{"type":"output_audio","transcript":"ignored"}}"#.utf8),
+		]
+		for payload in audioLifecyclePayloads {
+			XCTAssertNil(try decoder.decodeForConnector(payload))
 		}
 
 		for eventType in ["response.function_call_arguments.done", "response.mcp_call.completed", "unknown.event"] {
 			let payload = try XCTUnwrap(#"{"type":"\#(eventType)"}"#.data(using: .utf8))
 			XCTAssertThrowsError(try decoder.decodeForConnector(payload), eventType) { error in
+				XCTAssertEqual(error as? WebRTCTransportFailure, .unsupportedEvent)
+			}
+		}
+	}
+
+	func testConnectorIngressRejectsNonAudioLifecyclePayloads() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		let rejectedPayloads = [
+			Data(#"{"type":"conversation.item.added"}"#.utf8),
+			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"user","content":[{"type":"input_text"}]}}"#.utf8),
+			Data(#"{"type":"response.created","response":{"output":[{"type":"function_call"}]}}"#.utf8),
+			Data(#"{"type":"response.output_item.done","item":{"type":"function_call"}}"#.utf8),
+			Data(#"{"type":"response.output_item.done","item":{"type":"mcp_tool_call"}}"#.utf8),
+			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text"}]}}"#.utf8),
+			Data(#"{"type":"response.content_part.done","part":{"type":"text"}}"#.utf8),
+		]
+
+		for payload in rejectedPayloads {
+			XCTAssertThrowsError(try decoder.decodeForConnector(payload)) { error in
 				XCTAssertEqual(error as? WebRTCTransportFailure, .unsupportedEvent)
 			}
 		}
