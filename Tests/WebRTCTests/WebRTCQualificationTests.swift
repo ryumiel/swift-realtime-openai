@@ -315,15 +315,39 @@ final class WebRTCQualificationTests: XCTestCase {
 	}
 
 	@MainActor
-	func testLocalICEGatheringWaitUsesTheBoundWhenGatheringNeverCompletes() async throws {
+	func testLocalICEGatheringWaitObservesCompletionAfterTheFinalSleep() async throws {
+		var checks = 0
 		var sleeps = 0
 
 		try await WebRTCConnector.waitForLocalICEGathering(
 			maximumChecks: 50,
 			isCurrent: { true },
-			isComplete: { false },
+			isComplete: {
+				checks += 1
+				return checks == 51
+			},
 			sleep: { sleeps += 1 }
 		)
+
+		XCTAssertEqual(checks, 51)
+		XCTAssertEqual(sleeps, 50)
+	}
+
+	@MainActor
+	func testLocalICEGatheringWaitTimesOutAfterTheBoundWhenGatheringNeverCompletes() async throws {
+		var sleeps = 0
+
+		do {
+			try await WebRTCConnector.waitForLocalICEGathering(
+				maximumChecks: 50,
+				isCurrent: { true },
+				isComplete: { false },
+				sleep: { sleeps += 1 }
+			)
+			XCTFail("Expected ICE gathering timeout")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .iceGatheringTimedOut)
+		}
 
 		XCTAssertEqual(sleeps, 50)
 	}
@@ -353,6 +377,69 @@ final class WebRTCQualificationTests: XCTestCase {
 		} catch {
 			XCTAssertTrue(error is CancellationError)
 		}
+	}
+
+	@MainActor
+	func testLocalICEGatheringWaitCancelsWhenGenerationChangesAfterASleep() async throws {
+		var current = true
+		var sleeps = 0
+
+		do {
+			try await WebRTCConnector.waitForLocalICEGathering(
+				maximumChecks: 50,
+				isCurrent: { current },
+				isComplete: { false },
+				sleep: {
+					sleeps += 1
+					current = false
+				}
+			)
+			XCTFail("Expected cancelled generation")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
+
+		XCTAssertEqual(sleeps, 1)
+	}
+
+	func testQualificationDiagnosticMilestonesAreFixedAndContentFree() {
+		let milestones: [WebRTCConnectorDiagnosticMilestone] = [
+			.peerCreated, .offerCreated, .localDescriptionInstalled, .iceGatheringComplete, .iceGatheringTimedOut,
+			.remoteDescriptionInstalled, .iceChecking, .iceConnected, .iceCompleted, .iceDisconnected, .iceFailed,
+			.iceClosed, .peerConnecting, .peerConnected, .peerDisconnected, .peerFailed, .peerClosed,
+			.dataChannelConnecting, .dataChannelOpen, .dataChannelClosing, .dataChannelClosed,
+			.remoteAudioTrackObserved, .teardownBegan, .teardownCompleted,
+		]
+
+		XCTAssertEqual(milestones.count, 24)
+		XCTAssertEqual(Set(milestones).count, milestones.count)
+		XCTAssertEqual(WebRTCConnectorDiagnosticMilestone.iceGatheringTimedOut.rawValue, "iceGatheringTimedOut")
+	}
+
+	@MainActor
+	func testQualificationDiagnosticsUseTheSeparateSinkWithoutOccupyingQualificationEvents() async throws {
+		let diagnostics = DiagnosticProbe()
+		let connector = try WebRTCConnectorQualificationPeerFactory(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			diagnosticSink: { diagnostics.record($0) }
+		).makePeer()
+		let concreteConnector = try XCTUnwrap(connector as? WebRTCConnector)
+		let events = concreteConnector.qualificationEvents
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			return [try await iterator.next(), try await iterator.next()]
+		}
+
+		concreteConnector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		concreteConnector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
+		let eventsReceived = try await reader.value
+		await concreteConnector.closeAndSettle()
+
+		XCTAssertEqual(eventsReceived, [.connected, .inbound(.responseFinished)])
+		XCTAssertEqual(diagnostics.values, [
+			.peerCreated, .dataChannelOpen, .teardownBegan, .dataChannelClosing,
+			.dataChannelClosed, .iceClosed, .peerClosed, .teardownCompleted,
+		])
 	}
 
 	@MainActor
@@ -2273,6 +2360,19 @@ private final class RetentionToken {}
 
 private final class WeakRetentionBox: @unchecked Sendable {
 	weak var token: RetentionToken?
+}
+
+private final class DiagnosticProbe: @unchecked Sendable {
+	private let lock = NSLock()
+	private var recorded: [WebRTCConnectorDiagnosticMilestone] = []
+
+	func record(_ milestone: WebRTCConnectorDiagnosticMilestone) {
+		lock.withLock { recorded.append(milestone) }
+	}
+
+	var values: [WebRTCConnectorDiagnosticMilestone] {
+		lock.withLock { recorded }
+	}
 }
 
 @MainActor private final class TestTaskCompletionProbe {

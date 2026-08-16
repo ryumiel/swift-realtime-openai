@@ -24,6 +24,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	case malformedEvent
 	case unsupportedEvent
 	case cancelled
+	case iceGatheringTimedOut
 }
 
 public struct WebRTCSignalingRequest: Sendable {

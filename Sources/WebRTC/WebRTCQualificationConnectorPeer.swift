@@ -10,6 +10,34 @@ import Foundation
 	case terminal
 }
 
+/// Fixed, content-free milestones intended only for Airbridge's local qualification.
+@_spi(AirbridgeQualification) public enum WebRTCConnectorDiagnosticMilestone: String, Sendable, Equatable {
+	case peerCreated
+	case offerCreated
+	case localDescriptionInstalled
+	case iceGatheringComplete
+	case iceGatheringTimedOut
+	case remoteDescriptionInstalled
+	case iceChecking
+	case iceConnected
+	case iceCompleted
+	case iceDisconnected
+	case iceFailed
+	case iceClosed
+	case peerConnecting
+	case peerConnected
+	case peerDisconnected
+	case peerFailed
+	case peerClosed
+	case dataChannelConnecting
+	case dataChannelOpen
+	case dataChannelClosing
+	case dataChannelClosed
+	case remoteAudioTrackObserved
+	case teardownBegan
+	case teardownCompleted
+}
+
 @_spi(AirbridgeQualification) @MainActor public protocol WebRTCConnectorQualificationPeer: Sendable {
 	var qualificationEvents: AsyncThrowingStream<WebRTCConnectorQualificationEvent, any Error> { get }
 	func makeOffer() async throws -> String
@@ -28,8 +56,11 @@ import Foundation
 @_spi(AirbridgeQualification) @MainActor public struct WebRTCConnectorQualificationPeerFactory: Sendable {
 	private let makePeerClosure: @MainActor @Sendable () throws -> any WebRTCConnectorQualificationPeer
 
-	public init(session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) {
-		makePeerClosure = { try WebRTCConnector.createQualification(session: session) }
+	public init(
+		session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession(),
+		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void = { _ in }
+	) {
+		makePeerClosure = { try WebRTCConnector.createQualification(session: session, diagnosticSink: diagnosticSink) }
 	}
 
 	public init(makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorQualificationPeer) {
