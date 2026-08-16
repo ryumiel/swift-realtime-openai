@@ -226,7 +226,8 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "response.done":
 					if permitsKnownAudioLifecycleEvents {
 						guard let response = envelope.response,
-							response.output?.allSatisfy(\.isOutputAudioMessage) != false
+							let output = response.output,
+							output.allSatisfy(\.isOutputAudioMessage)
 						else { throw WebRTCTransportFailure.unsupportedEvent }
 					}
 					return .responseFinished

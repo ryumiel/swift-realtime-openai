@@ -212,6 +212,8 @@ final class WebRTCQualificationTests: XCTestCase {
 			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"user","content":[{"type":"input_text"}]}}"#.utf8),
 			Data(#"{"type":"response.created","response":{"output":[{"type":"function_call"}]}}"#.utf8),
 			Data(#"{"type":"response.done"}"#.utf8),
+			Data(#"{"type":"response.done","response":{}}"#.utf8),
+			Data(#"{"type":"response.done","response":{"output":null}}"#.utf8),
 			Data(#"{"type":"response.done","response":{"output":[{"type":"function_call"}]}}"#.utf8),
 			Data(#"{"type":"response.done","response":{"output":[{"type":"mcp_tool_call"}]}}"#.utf8),
 			Data(#"{"type":"response.done","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text"}]}]}}"#.utf8),
