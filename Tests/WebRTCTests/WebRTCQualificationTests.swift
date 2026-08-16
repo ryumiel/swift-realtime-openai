@@ -175,6 +175,66 @@ final class WebRTCQualificationTests: XCTestCase {
     }
 
 	@MainActor
+	func testLocalICEGatheringWaitReturnsAsSoonAsGatheringCompletes() async throws {
+		var checks = 0
+		var sleeps = 0
+
+		try await WebRTCConnector.waitForLocalICEGathering(
+			maximumChecks: 50,
+			isCurrent: { true },
+			isComplete: {
+				checks += 1
+				return checks == 3
+			},
+			sleep: { sleeps += 1 }
+		)
+
+		XCTAssertEqual(checks, 3)
+		XCTAssertEqual(sleeps, 2)
+	}
+
+	@MainActor
+	func testLocalICEGatheringWaitUsesTheBoundWhenGatheringNeverCompletes() async throws {
+		var sleeps = 0
+
+		try await WebRTCConnector.waitForLocalICEGathering(
+			maximumChecks: 50,
+			isCurrent: { true },
+			isComplete: { false },
+			sleep: { sleeps += 1 }
+		)
+
+		XCTAssertEqual(sleeps, 50)
+	}
+
+	@MainActor
+	func testLocalICEGatheringWaitStopsOnGenerationOrSleepCancellation() async throws {
+		var slept = false
+		do {
+			try await WebRTCConnector.waitForLocalICEGathering(
+				isCurrent: { false },
+				isComplete: { false },
+				sleep: { slept = true }
+			)
+			XCTFail("Expected cancelled generation")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
+		XCTAssertFalse(slept)
+
+		do {
+			try await WebRTCConnector.waitForLocalICEGathering(
+				isCurrent: { true },
+				isComplete: { false },
+				sleep: { throw CancellationError() }
+			)
+			XCTFail("Expected cancelled sleep")
+		} catch {
+			XCTAssertTrue(error is CancellationError)
+		}
+	}
+
+	@MainActor
 	func testConnectorLifecycleTerminatesResourcesOnceAndDropsQueuedCallback() async throws {
 		let probe = ConnectorTerminalProbe()
 		let productionPeer = try WebRTCConnectorQualificationPeerFactory(
