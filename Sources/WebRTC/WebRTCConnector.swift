@@ -347,7 +347,10 @@ import FoundationNetworking
 
 		do { try await connection.setLocalDescription(sdp) }
 		catch { throw WebRTCError.failedToSetLocalDescription(error) }
-		try await waitForLocalICEGathering()
+		try await Self.waitForLocalICEGathering(
+			isCurrent: { self.lifecycle.isCurrent(self.generation) },
+			isComplete: { self.connection.iceGatheringState == .complete }
+		)
 		guard lifecycle.isCurrent(generation), let localSDP = connection.localDescription?.sdp else {
 			throw WebRTCTransportFailure.cancelled
 		}
@@ -470,20 +473,31 @@ extension WebRTCConnector {
 	}
 }
 
-private extension WebRTCConnector {
+	extension WebRTCConnector {
 	/// Keep the non-trickle SDP exchange self-contained. `localDescription` gains
 	/// host candidates asynchronously after `setLocalDescription`; submitting its
 	/// initial snapshot can leave the remote peer with no usable candidate.
-	func waitForLocalICEGathering() async throws {
-		for _ in 0..<50 {
-			guard lifecycle.isCurrent(generation) else {
+	package static func waitForLocalICEGathering(
+		maximumChecks: Int = 50,
+		isCurrent: @escaping @MainActor () -> Bool,
+		isComplete: @escaping @MainActor () -> Bool,
+		sleep: @escaping @MainActor () async throws -> Void = {
+			try await Task.sleep(for: .milliseconds(100))
+		}
+	) async throws {
+		for _ in 0..<maximumChecks {
+			guard isCurrent() else {
 				throw WebRTCTransportFailure.cancelled
 			}
-			guard connection.iceGatheringState != .complete else { return }
-			try await Task.sleep(for: .milliseconds(100))
+			guard !isComplete() else { return }
+			try await sleep()
 		}
 	}
 
+}
+
+
+private extension WebRTCConnector {
 	static func setupLocalAudio(for connection: LKRTCPeerConnection) -> LKRTCAudioTrack {
 		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(
 			mandatoryConstraints: [
