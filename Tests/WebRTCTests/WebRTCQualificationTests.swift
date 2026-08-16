@@ -425,6 +425,92 @@ final class WebRTCQualificationTests: XCTestCase {
 
 		XCTAssertTrue(WebRTCConnector.remoteStreamsContainAudioTrack([streamWithAudio]))
 		XCTAssertFalse(WebRTCConnector.remoteStreamsContainAudioTrack([streamWithoutAudio]))
+		XCTAssertTrue(WebRTCConnector.receiverOrStreamsContainAudioTrack(trackKind: "audio", streams: []))
+		XCTAssertFalse(WebRTCConnector.receiverOrStreamsContainAudioTrack(trackKind: "video", streams: []))
+		XCTAssertFalse(WebRTCConnector.receiverOrStreamsContainAudioTrack(trackKind: nil, streams: []))
+	}
+
+	@MainActor
+	func testSelectedTerminalImmediatelyRejectsOfferBeforeSignalingCanStart() async throws {
+		let drainGate = StickySuspensionGate()
+		let startedDrain = expectation(description: "accepted ingress is draining")
+		let signaling = CountingSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
+		let probe = ConnectorTerminalProbe(
+			beforeDrainInbound: {
+				startedDrain.fulfill()
+				await drainGate.wait()
+			},
+			recordPermissionGranted: { true }
+		)
+		let connector = try WebRTCConnector.createQualification(session: signaling, terminalObserver: probe.observer)
+
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
+		await fulfillment(of: [startedDrain], timeout: 1)
+		connector.disconnect()
+		for _ in 0..<8 { await Task.yield() }
+
+		do {
+			try await connector.connect(using: WebRTCSignalingRequest(
+				endpoint: URL(string: "https://local.invalid")!, model: "model", bearerToken: nil
+			))
+			XCTFail("A selected terminal must reject signaling progression")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
+		let callCount = await signaling.callCount
+		XCTAssertEqual(callCount, 0)
+
+		await drainGate.release()
+		await connector.closeAndSettle()
+		XCTAssertEqual(probe.signalingCancels, 1)
+	}
+
+	@MainActor
+	func testBlockingDiagnosticSinkCannotDelayTerminalCleanup() async throws {
+		let slowSink = BlockingDiagnosticProbe()
+		let probe = ConnectorTerminalProbe()
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			terminalObserver: probe.observer,
+			diagnosticSink: { slowSink.record($0) }
+		)
+		XCTAssertEqual(slowSink.didEnter.wait(timeout: .now() + 1), .success)
+
+		let started = ContinuousClock.now
+		await connector.closeAndSettle()
+		let elapsed = started.duration(to: .now)
+
+		XCTAssertLessThan(elapsed, .milliseconds(100))
+		XCTAssertEqual(probe.signalingCancels, 1)
+		XCTAssertEqual(probe.dataCloses, 1)
+		XCTAssertEqual(probe.peerCloses, 1)
+		XCTAssertEqual(probe.audioDisables, 1)
+		slowSink.release()
+	}
+
+	@MainActor
+	func testBlockedDiagnosticSinkRetainsOnlyTheFixedBoundedBacklog() async throws {
+		let slowSink = BlockingDiagnosticProbe()
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json")),
+			diagnosticSink: { slowSink.record($0) }
+		)
+		XCTAssertEqual(slowSink.didEnter.wait(timeout: .now() + 1), .success)
+		let factory = LKRTCPeerConnectionFactory()
+		let callbackConnection = try XCTUnwrap(factory.peerConnection(
+			with: LKRTCConfiguration(),
+			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+			delegate: nil
+		))
+
+		for _ in 0..<96 {
+			connector.peerConnection(callbackConnection, didChange: LKRTCIceConnectionState.checking)
+		}
+		await connector.closeAndSettle()
+		slowSink.release()
+		for _ in 0..<64 { await Task.yield() }
+
+		XCTAssertLessThanOrEqual(slowSink.values.count, 33)
 	}
 
 	@MainActor
@@ -448,7 +534,8 @@ final class WebRTCQualificationTests: XCTestCase {
 
 		XCTAssertEqual(eventsReceived, [.connected, .inbound(.responseFinished)])
 		XCTAssertEqual(diagnostics.values, [
-			.peerCreated, .dataChannelOpen, .teardownBegan, .teardownCompleted,
+			.peerCreated, .dataChannelOpen, .teardownBegan, .dataChannelClosing,
+			.dataChannelClosed, .iceClosed, .peerClosed, .teardownCompleted,
 		])
 	}
 
@@ -456,7 +543,7 @@ final class WebRTCQualificationTests: XCTestCase {
 	func testInjectedICETimeoutSettlesTheRealConnectorBeforeAnySignalingRequest() async throws {
 		let signaling = CountingSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
 		let diagnostics = DiagnosticProbe()
-		let probe = ConnectorTerminalProbe(waitForLocalICEGathering: {
+		let probe = ConnectorTerminalProbe(recordPermissionGranted: { true }, waitForLocalICEGathering: {
 			throw WebRTCTransportFailure.iceGatheringTimedOut
 		})
 		var connector: WebRTCConnector? = try WebRTCConnector.createQualification(
@@ -490,7 +577,7 @@ final class WebRTCQualificationTests: XCTestCase {
 	func testCancelledICEWaitCannotEmitAStaleCompletionMilestone() async throws {
 		let diagnostics = DiagnosticProbe()
 		var connector: WebRTCConnector?
-		let probe = ConnectorTerminalProbe(waitForLocalICEGathering: {
+		let probe = ConnectorTerminalProbe(recordPermissionGranted: { true }, waitForLocalICEGathering: {
 			await connector?.closeAndSettle()
 		})
 		connector = try WebRTCConnector.createQualification(
@@ -507,7 +594,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		}
 
 		XCTAssertFalse(diagnostics.values.contains(.iceGatheringComplete))
-		XCTAssertEqual(diagnostics.values.suffix(2), [.teardownBegan, .teardownCompleted])
+		XCTAssertEqual(diagnostics.values.suffix(2), [.peerClosed, .teardownCompleted])
 	}
 
 	@MainActor
@@ -528,8 +615,6 @@ final class WebRTCQualificationTests: XCTestCase {
 		))
 		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
 		let remoteAudioTrack = factory.audioTrack(with: audioSource, trackId: "qualification_remote_audio")
-		let remoteStream = factory.mediaStream(withStreamId: "qualification_remote_stream")
-		remoteStream.addAudioTrack(remoteAudioTrack)
 		_ = callbackConnection.add(remoteAudioTrack, streamIds: ["qualification_receiver_stream"])
 		let receiver = try XCTUnwrap(callbackConnection.transceivers.first?.receiver)
 
@@ -538,13 +623,16 @@ final class WebRTCQualificationTests: XCTestCase {
 		connector.peerConnection(callbackConnection, didChange: LKRTCPeerConnectionState.connecting)
 		connector.peerConnection(callbackConnection, didChange: LKRTCPeerConnectionState.connected)
 		connector.dataChannelDidChangeState(callbackChannel)
-		connector.peerConnection(callbackConnection, didAdd: receiver, streams: [remoteStream])
+		// Unified Plan supplies the receiver's authoritative audio track even
+		// when its legacy stream list is empty; this is observation only.
+		connector.peerConnection(callbackConnection, didAdd: receiver, streams: [])
 		for _ in 0..<16 { await Task.yield() }
 		await connector.closeAndSettle()
 
 		XCTAssertEqual(diagnostics.values, [
 			.peerCreated, .iceChecking, .iceConnected, .peerConnecting, .peerConnected,
-			.dataChannelConnecting, .remoteAudioTrackObserved, .teardownBegan, .teardownCompleted,
+			.dataChannelConnecting, .remoteAudioTrackObserved, .teardownBegan,
+			.dataChannelClosing, .dataChannelClosed, .iceClosed, .peerClosed, .teardownCompleted,
 		])
 	}
 
@@ -2422,6 +2510,7 @@ private struct ThrowingSession: WebRTCSignalingSession {
 	private let beforeDrainInbound: () async -> Void
 	private let beforeOpenTransition: () async -> Void
 	private let makePreReadyRetentionToken: () -> AnyObject?
+	private let recordPermissionGranted: () -> Bool
 	private let waitForLocalICEGathering: (@MainActor () async throws -> Void)?
 	private let drainExpectation: XCTestExpectation?
 	private let retirementExpectation: XCTestExpectation?
@@ -2435,6 +2524,7 @@ private struct ThrowingSession: WebRTCSignalingSession {
 		beforeDrainInbound: @escaping () async -> Void = {},
 		beforeOpenTransition: @escaping () async -> Void = {},
 		makePreReadyRetentionToken: @escaping () -> AnyObject? = { nil },
+		recordPermissionGranted: @escaping () -> Bool = { false },
 		waitForLocalICEGathering: (@MainActor () async throws -> Void)? = nil,
 		drainExpectation: XCTestExpectation? = nil,
 		retirementExpectation: XCTestExpectation? = nil,
@@ -2443,6 +2533,7 @@ private struct ThrowingSession: WebRTCSignalingSession {
 		self.beforeDrainInbound = beforeDrainInbound
 		self.beforeOpenTransition = beforeOpenTransition
 		self.makePreReadyRetentionToken = makePreReadyRetentionToken
+		self.recordPermissionGranted = recordPermissionGranted
 		self.waitForLocalICEGathering = waitForLocalICEGathering
 		self.drainExpectation = drainExpectation
 		self.retirementExpectation = retirementExpectation
@@ -2458,6 +2549,7 @@ private struct ThrowingSession: WebRTCSignalingSession {
 			beforeDrainInbound: beforeDrainInbound,
 			beforeOpenTransition: beforeOpenTransition,
 			makePreReadyRetentionToken: makePreReadyRetentionToken,
+			recordPermissionGranted: recordPermissionGranted,
 			waitForLocalICEGathering: waitForLocalICEGathering,
 			didDrainInbound: { self.drainExpectation?.fulfill() },
 			didRetireAcceptedIngress: { self.retirementExpectation?.fulfill() },
@@ -2478,6 +2570,35 @@ private final class DiagnosticProbe: @unchecked Sendable {
 
 	func record(_ milestone: WebRTCConnectorDiagnosticMilestone) {
 		lock.withLock { recorded.append(milestone) }
+	}
+
+	var values: [WebRTCConnectorDiagnosticMilestone] {
+		lock.withLock { recorded }
+	}
+}
+
+private final class BlockingDiagnosticProbe: @unchecked Sendable {
+	let didEnter = DispatchSemaphore(value: 0)
+	private let releaseGate = DispatchSemaphore(value: 0)
+	private let lock = NSLock()
+	private var isFirst = true
+	private var recorded: [WebRTCConnectorDiagnosticMilestone] = []
+
+	func record(_ milestone: WebRTCConnectorDiagnosticMilestone) {
+		let waits = lock.withLock { () -> Bool in
+			guard isFirst else { return false }
+			isFirst = false
+			return true
+		}
+		if waits {
+			didEnter.signal()
+			releaseGate.wait()
+		}
+		lock.withLock { recorded.append(milestone) }
+	}
+
+	func release() {
+		releaseGate.signal()
 	}
 
 	var values: [WebRTCConnectorDiagnosticMilestone] {
