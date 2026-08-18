@@ -43,11 +43,16 @@ import Foundation
 	func makeOffer() async throws -> String
 	func apply(answer: String) async throws
 	func send(event: ClientEvent) async throws
+	func sendSessionUpdate(voice: String, language: String) async throws
 	func disconnect()
 	func closeAndSettle() async
 }
 
 @_spi(AirbridgeQualification) @MainActor public extension WebRTCConnectorQualificationPeer {
+	func sendSessionUpdate(voice _: String, language _: String) async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
 	func closeAndSettle() async {
 		disconnect()
 	}

@@ -27,6 +27,56 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	case iceGatheringTimedOut
 }
 
+/// A bounded partial session update for Airbridge's qualified WebRTC seam.
+///
+/// This deliberately does not reuse the provider's full-session model: that
+/// model requires unrelated fields, restricts voice names, and cannot express
+/// a language-only transcription patch without selecting a transcription
+/// backend.
+@_spi(AirbridgeQualification) public struct WebRTCSessionUpdate: Equatable, Sendable {
+	public let voice: String
+	public let language: String
+
+	public init(voice: String, language: String) throws {
+		guard Self.isValidVoice(voice), Self.isISO6391Language(language) else {
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		self.voice = voice
+		self.language = language
+	}
+
+	public func encoded() throws -> Data {
+		try JSONEncoder().encode(Event(
+			type: "session.update",
+			session: .init(
+				type: "realtime",
+				audio: .init(
+					input: .init(transcription: .init(language: language)),
+					output: .init(voice: voice)
+				)
+			)
+		))
+	}
+
+	private static func isValidVoice(_ voice: String) -> Bool {
+		guard voice == voice.trimmingCharacters(in: .whitespacesAndNewlines),
+			(1...64).contains(voice.utf8.count)
+		else { return false }
+		return voice.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+	}
+
+	private static func isISO6391Language(_ language: String) -> Bool {
+		language.utf8.count == 2 && language.utf8.allSatisfy { (97...122).contains($0) }
+	}
+
+	private struct Event: Encodable { let type: String; let session: Session }
+	private struct Session: Encodable { let type: String; let audio: Audio }
+	private struct Audio: Encodable { let input: Input; let output: Output }
+	private struct Input: Encodable { let transcription: Transcription }
+	private struct Transcription: Encodable { let language: String }
+	private struct Output: Encodable { let voice: String }
+}
+
 public struct WebRTCSignalingRequest: Sendable {
 	public let endpoint: URL
 	public let model: String
@@ -218,6 +268,13 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		do {
 			let envelope = try JSONDecoder().decode(Envelope.self, from: data)
 			switch envelope.type {
+				case "session.updated":
+					guard envelope.session?.type == "realtime",
+						let voice = envelope.session?.audio?.output?.voice,
+						let language = envelope.session?.audio?.input?.transcription?.language
+					else { throw WebRTCTransportFailure.malformedEvent }
+					let update = try WebRTCSessionUpdate(voice: voice, language: language)
+					return .sessionUpdated(voice: update.voice, language: update.language)
 				case "conversation.item.input_audio_transcription.completed":
 					guard let transcript = envelope.transcript, !transcript.isEmpty else { throw WebRTCTransportFailure.malformedEvent }
 					return .userTranscript(transcript)
@@ -263,7 +320,6 @@ public struct WebRTCInboundEventDecoder: Sendable {
 
 	private static let knownSimpleAudioLifecycleEventTypes: Set<String> = [
 		"session.created",
-		"session.updated",
 		"input_audio_buffer.committed",
 		"input_audio_buffer.cleared",
 		"input_audio_buffer.speech_started",
@@ -283,7 +339,22 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		let item: ItemEnvelope?
 		let part: ContentEnvelope?
 		let response: ResponseEnvelope?
+		let session: SessionEnvelope?
 	}
+
+	private struct SessionEnvelope: Decodable {
+		let type: String?
+		let audio: AudioEnvelope?
+	}
+
+	private struct AudioEnvelope: Decodable {
+		let input: InputEnvelope?
+		let output: OutputEnvelope?
+	}
+
+	private struct InputEnvelope: Decodable { let transcription: TranscriptionEnvelope? }
+	private struct TranscriptionEnvelope: Decodable { let language: String? }
+	private struct OutputEnvelope: Decodable { let voice: String? }
 
 	private struct ItemEnvelope: Decodable {
 		let type: String

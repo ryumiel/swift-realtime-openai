@@ -512,6 +512,17 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: encoder.encode(event), isBinary: false))
 	}
 
+	@_spi(AirbridgeQualification) public func sendSessionUpdate(
+		voice: String,
+		language: String
+	) throws {
+		guard isCurrentAndAcceptingProgression(), dataChannel.readyState == .open else {
+			throw WebRTCTransportFailure.cancelled
+		}
+		let update = try WebRTCSessionUpdate(voice: voice, language: language)
+		try dataChannel.sendData(LKRTCDataBuffer(data: update.encoded(), isBinary: false))
+	}
+
 	public func disconnect() {
 		requestTerminal()
 	}
