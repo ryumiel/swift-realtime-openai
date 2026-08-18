@@ -139,8 +139,39 @@ final class WebRTCQualificationTests: XCTestCase {
 		try await assertRedirectIsNotFollowed(origin: crossOrigin, target: crossOriginTarget, expectedTargetPath: "/")
 	}
 
-    func testEventIngressAcceptsOnlyTranscriptTerminalAndProviderErrorEvents() throws {
+    func testPartialSessionUpdateUsesExactJSONWithoutTranscriptionModel() throws {
+		let update = try WebRTCSessionUpdate(voice: "Custom_Voice", language: "ko")
+		let object = try XCTUnwrap(
+			JSONSerialization.jsonObject(with: update.encoded()) as? [String: Any]
+		)
+
+		XCTAssertEqual(Set(object.keys), ["type", "session"])
+		XCTAssertEqual(object["type"] as? String, "session.update")
+		let session = try XCTUnwrap(object["session"] as? [String: Any])
+		XCTAssertEqual(Set(session.keys), ["type", "audio"])
+		XCTAssertEqual(session["type"] as? String, "realtime")
+		let audio = try XCTUnwrap(session["audio"] as? [String: Any])
+		let input = try XCTUnwrap(audio["input"] as? [String: Any])
+		let transcription = try XCTUnwrap(input["transcription"] as? [String: Any])
+		let output = try XCTUnwrap(audio["output"] as? [String: Any])
+		XCTAssertEqual(transcription as? [String: String], ["language": "ko"])
+		XCTAssertNil(transcription["model"])
+		XCTAssertEqual(output as? [String: String], ["voice": "Custom_Voice"])
+	}
+
+	func testPartialSessionUpdateValidatesVoiceAndISO6391Language() throws {
+		XCTAssertNoThrow(try WebRTCSessionUpdate(voice: "Ono_Anna", language: "ja"))
+		XCTAssertThrowsError(try WebRTCSessionUpdate(voice: "", language: "en"))
+		XCTAssertThrowsError(try WebRTCSessionUpdate(voice: "Ryan", language: "EN"))
+		XCTAssertThrowsError(try WebRTCSessionUpdate(voice: "Ryan", language: "eng"))
+	}
+
+    func testEventIngressAcceptsConfiguredSessionTranscriptTerminalAndProviderErrorEvents() throws {
         let decoder = WebRTCInboundEventDecoder()
+		XCTAssertEqual(
+			try decoder.decode(Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8)),
+			.sessionUpdated(voice: "Ono_Anna", language: "ja")
+		)
         let transcript = try decoder.decode(Data(#"{"type":"response.output_audio_transcript.done","transcript":"x"}"#.utf8))
         guard case .assistantTranscript = transcript else {
             return XCTFail("Expected transcript event kind")
@@ -156,13 +187,17 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertThrowsError(try decoder.decode(Data(#"{"type":"session.created"}"#.utf8))) { error in
 			XCTAssertEqual(error as? WebRTCTransportFailure, .unsupportedEvent)
 		}
+		XCTAssertThrowsError(
+			try decoder.decode(Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{}},"output":{"voice":"Ryan"}}}}"#.utf8))
+		) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .malformedEvent)
+		}
     }
 
 	func testConnectorIngressIgnoresOnlyKnownAudioLifecycleEvents() throws {
 		let decoder = WebRTCInboundEventDecoder()
 		let simpleEventTypes = [
 			"session.created",
-			"session.updated",
 			"input_audio_buffer.committed",
 			"input_audio_buffer.cleared",
 			"input_audio_buffer.speech_started",
