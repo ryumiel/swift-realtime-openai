@@ -450,6 +450,68 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(WebRTCConnectorDiagnosticMilestone.iceGatheringTimedOut.rawValue, "iceGatheringTimedOut")
 	}
 
+	func testQualificationAudioEvidenceFiltersAudioAndCapsCounts() {
+		let evidence = WebRTCConnector.audioEvidence(from: [
+			(type: "outbound-rtp", values: [
+				"kind": NSString(string: "audio"),
+				"bytesReceived": NSNumber(value: 999),
+			]),
+			(type: "inbound-rtp", values: [
+				"kind": NSString(string: "video"),
+				"bytesReceived": NSNumber(value: 999),
+			]),
+			(type: "inbound-rtp", values: [
+				"mediaType": NSString(string: "audio"),
+				"bytesReceived": NSNumber(value: 12),
+				"totalSamplesReceived": NSNumber(value: 34),
+			]),
+		])
+
+		XCTAssertEqual(evidence.receivedByteCount, 12)
+		XCTAssertEqual(evidence.receivedSampleCount, 34)
+		XCTAssertTrue(evidence.hasReceivedAudio)
+		XCTAssertFalse(evidence.limitExceeded)
+
+		let capped = WebRTCConnector.audioEvidence(from: [
+			(type: "inbound-rtp", values: [
+				"kind": NSString(string: "audio"),
+				"bytesReceived": NSNumber(value: UInt64.max),
+				"totalSamplesReceived": NSNumber(value: UInt64.max),
+			]),
+		])
+		XCTAssertEqual(
+			capped.receivedByteCount,
+			WebRTCConnectorQualificationAudioEvidence.maximumReportedByteCount
+		)
+		XCTAssertEqual(
+			capped.receivedSampleCount,
+			WebRTCConnectorQualificationAudioEvidence.maximumReportedSampleCount
+		)
+		XCTAssertTrue(capped.limitExceeded)
+	}
+
+	@MainActor
+	func testReceiveOnlyQualificationPeerNeedsNoMicrophoneAndSuppressesPlayout() async throws {
+		let probe = ConnectorTerminalProbe(
+			recordPermissionGranted: { false },
+			waitForLocalICEGathering: {}
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(
+				data: Data(), statusCode: 201, contentType: "application/sdp"
+			)),
+			terminalObserver: probe.observer,
+			mediaMode: .receiveOnlyAudioEvidence
+		)
+
+		XCTAssertFalse(connector.qualificationHasLocalAudioTrack)
+		XCTAssertTrue(connector.qualificationUsesManualAudioRendering)
+		let offer = try await connector.makeOffer()
+		XCTAssertTrue(offer.contains("m=audio"))
+		XCTAssertTrue(offer.contains("a=recvonly"))
+		await connector.closeAndSettle()
+	}
+
 	func testUnifiedPlanRemoteAudioDiagnosticRecognizesOnlyStreamsWithAudioTracks() {
 		let factory = LKRTCPeerConnectionFactory()
 		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
@@ -741,7 +803,11 @@ final class WebRTCQualificationTests: XCTestCase {
 		let productionPeer = try WebRTCConnectorQualificationPeerFactory(
 			session: StubSession(response: .init(data: Data(), statusCode: 201, contentType: "application/json"))
 		).makePeer()
-		XCTAssertTrue(productionPeer is WebRTCConnector)
+		guard let productionConnector = productionPeer as? WebRTCConnector else {
+			return XCTFail("Expected the production qualification factory to create WebRTCConnector")
+		}
+		XCTAssertTrue(productionConnector.qualificationHasLocalAudioTrack)
+		XCTAssertFalse(productionConnector.qualificationUsesManualAudioRendering)
 		let productionLifecycle = productionPeer.qualificationEvents
 		let lifecycleReady = expectation(description: "terminal reader ready")
 		let lifecycleProbe = TestTaskCompletionProbe()
@@ -1861,6 +1927,12 @@ final class WebRTCQualificationTests: XCTestCase {
 	@MainActor
 	func testQualificationPeerDefaultCloseAndSettlePreservesExistingConformers() async {
 		let peer = QualificationPeerWithoutExplicitSettlement()
+		do {
+			_ = try await peer.remoteAudioEvidence()
+			XCTFail("Expected the compatibility default to reject audio evidence")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
 		await peer.closeAndSettle()
 		XCTAssertTrue(peer.didDisconnect)
 	}

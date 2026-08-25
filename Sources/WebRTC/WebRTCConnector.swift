@@ -351,6 +351,8 @@ import FoundationNetworking
 
 	public enum WebRTCError: Error {
 		case missingAudioPermission
+		case failedToConfigureQualificationAudio
+		case failedToCreateReceiveOnlyAudioTransceiver
 		case failedToCreateDataChannel
 		case failedToCreatePeerConnection
 		case failedToCreateSDPOffer(Swift.Error)
@@ -363,12 +365,18 @@ import FoundationNetworking
 	@_spi(AirbridgeQualification) public let qualificationEvents: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>
 
 	public var isMuted: Bool {
-		!audioTrack.isEnabled
+		audioTrack.map { !$0.isEnabled } ?? true
 	}
 
-	private let audioTrack: LKRTCAudioTrack
+	private let audioTrack: LKRTCAudioTrack?
 	private let dataChannel: LKRTCDataChannel
 	private let connection: LKRTCPeerConnection
+	private let connectionFactory: LKRTCPeerConnectionFactory
+	private let qualificationMediaMode: WebRTCConnectorQualificationMediaMode
+	package var qualificationHasLocalAudioTrack: Bool { audioTrack != nil }
+	package var qualificationUsesManualAudioRendering: Bool {
+		connectionFactory.audioDeviceModule.isManualRenderingMode
+	}
 
 	private let stream: AsyncThrowingStream<WebRTCInboundEvent, Error>.Continuation
 	private let qualificationStream: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>.Continuation
@@ -404,8 +412,10 @@ import FoundationNetworking
 
 	private init(
 		connection: LKRTCPeerConnection,
-		audioTrack: LKRTCAudioTrack,
+		audioTrack: LKRTCAudioTrack?,
 		dataChannel: LKRTCDataChannel,
+		connectionFactory: LKRTCPeerConnectionFactory,
+		qualificationMediaMode: WebRTCConnectorQualificationMediaMode,
 		signalingClient: WebRTCSignalingClient,
 		terminalObserver: TerminalObserver,
 		deliveryMode: DeliveryMode,
@@ -414,6 +424,8 @@ import FoundationNetworking
 		self.connection = connection
 		self.audioTrack = audioTrack
 		self.dataChannel = dataChannel
+		self.connectionFactory = connectionFactory
+		self.qualificationMediaMode = qualificationMediaMode
 		self.signalingClient = signalingClient
 		self.terminalObserver = terminalObserver
 		self.deliveryMode = deliveryMode
@@ -460,9 +472,11 @@ import FoundationNetworking
 	@_spi(AirbridgeQualification) public func makeOffer() async throws -> String {
 		guard connection.connectionState == .new else { throw WebRTCTransportFailure.cancelled }
 		guard isCurrentAndAcceptingProgression() else { throw WebRTCTransportFailure.cancelled }
-		guard terminalObserver.recordPermissionGranted() else {
-			disconnect()
-			throw WebRTCError.missingAudioPermission
+		if audioTrack != nil {
+			guard terminalObserver.recordPermissionGranted() else {
+				disconnect()
+				throw WebRTCError.missingAudioPermission
+			}
 		}
 		let sdp: LKRTCSessionDescription
 		do {
@@ -500,7 +514,9 @@ import FoundationNetworking
 		do { try await connection.setRemoteDescription(LKRTCSessionDescription(type: .answer, sdp: answer)) }
 		catch { throw WebRTCError.failedToSetRemoteDescription(error) }
 		guard acceptProgression(.remoteDescriptionInstalled) else { throw WebRTCTransportFailure.cancelled }
-		Self.configureAudioSession()
+		if qualificationMediaMode == .production {
+			Self.configureAudioSession()
+		}
 	}
 
 	package func installSignalingTask(_ task: Task<String, Error>) -> Bool {
@@ -555,9 +571,11 @@ import FoundationNetworking
 		terminalObserver.closeData()
 		connection.close()
 		terminalObserver.closePeer()
-		audioTrack.isEnabled = false
+		audioTrack?.isEnabled = false
 		terminalObserver.disableAudio()
-		Self.deactivateAudioSession()
+		if qualificationMediaMode == .production {
+			Self.deactivateAudioSession()
+		}
 		preReadyInboundEvents.removeAll()
 		ingressStream.finish(throwing: failure)
 		let drain = ingressDrainTask
@@ -583,8 +601,80 @@ import FoundationNetworking
 	}
 
 	public func toggleMute() {
-		guard lifecycle.isCurrent(generation) else { return }
+		guard lifecycle.isCurrent(generation), let audioTrack else { return }
 		audioTrack.isEnabled.toggle()
+	}
+
+	@_spi(AirbridgeQualification) public func remoteAudioEvidence() async throws
+		-> WebRTCConnectorQualificationAudioEvidence
+	{
+		guard lifecycle.isCurrent(generation),
+			qualificationMediaMode == .receiveOnlyAudioEvidence
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let evidence = await withCheckedContinuation { continuation in
+			connection.statistics { report in
+				continuation.resume(returning: Self.audioEvidence(
+					from: report.statistics.values.map { statistic in
+						(type: statistic.type, values: statistic.values)
+					}
+				))
+			}
+		}
+		guard lifecycle.isCurrent(generation) else {
+			throw WebRTCTransportFailure.cancelled
+		}
+		return evidence
+	}
+
+	nonisolated package static func audioEvidence(
+		from statistics: [(type: String, values: [String: NSObject])]
+	) -> WebRTCConnectorQualificationAudioEvidence {
+		var byteCount: UInt64 = 0
+		var sampleCount: UInt64 = 0
+		var limitExceeded = false
+		for statistic in statistics where statistic.type == "inbound-rtp" {
+			let kind = statistic.values["kind"] as? String
+				?? statistic.values["mediaType"] as? String
+			guard kind == "audio" else { continue }
+			Self.addCapped(
+				Self.unsignedValue(statistic.values["bytesReceived"]),
+				to: &byteCount,
+				limit: WebRTCConnectorQualificationAudioEvidence.maximumReportedByteCount,
+				limitExceeded: &limitExceeded
+			)
+			Self.addCapped(
+				Self.unsignedValue(statistic.values["totalSamplesReceived"]),
+				to: &sampleCount,
+				limit: WebRTCConnectorQualificationAudioEvidence.maximumReportedSampleCount,
+				limitExceeded: &limitExceeded
+			)
+		}
+		return WebRTCConnectorQualificationAudioEvidence(
+			receivedByteCount: byteCount,
+			receivedSampleCount: sampleCount,
+			limitExceeded: limitExceeded
+		)
+	}
+
+	nonisolated private static func unsignedValue(_ value: NSObject?) -> UInt64 {
+		guard let number = value as? NSNumber,
+			number.compare(NSNumber(value: 0)) != .orderedAscending
+		else { return 0 }
+		return number.uint64Value
+	}
+
+	nonisolated private static func addCapped(
+		_ value: UInt64,
+		to total: inout UInt64,
+		limit: UInt64,
+		limitExceeded: inout Bool
+	) {
+		guard value <= limit - total else {
+			total = limit
+			limitExceeded = true
+			return
+		}
+		total += value
 	}
 
 	private func enqueueDiagnostic(_ milestone: WebRTCConnectorDiagnosticMilestone) {
@@ -637,37 +727,70 @@ extension WebRTCConnector {
 	}
 
 	package static func create(session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession(), terminalObserver: TerminalObserver = .none) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .ordinary, diagnosticSink: { _ in })
+		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .ordinary, qualificationMediaMode: .production, diagnosticSink: { _ in })
 	}
 
 	@_spi(AirbridgeQualification) public static func createQualification(
 		session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession(),
+		mediaMode: WebRTCConnectorQualificationMediaMode = .production,
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void = { _ in }
 	) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: .none, deliveryMode: .qualification, diagnosticSink: diagnosticSink)
+		try create(session: session, terminalObserver: .none, deliveryMode: .qualification, qualificationMediaMode: mediaMode, diagnosticSink: diagnosticSink)
 	}
 
 	package static func createQualification(
 		session: any WebRTCSignalingSession,
 		terminalObserver: TerminalObserver,
+		mediaMode: WebRTCConnectorQualificationMediaMode = .production,
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void = { _ in }
 	) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .qualification, diagnosticSink: diagnosticSink)
+		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .qualification, qualificationMediaMode: mediaMode, diagnosticSink: diagnosticSink)
 	}
 
 	private static func create(
 		session: any WebRTCSignalingSession,
 		terminalObserver: TerminalObserver,
 		deliveryMode: DeliveryMode,
+		qualificationMediaMode: WebRTCConnectorQualificationMediaMode,
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void
 	) throws -> WebRTCConnector {
-		guard let connection = factory.peerConnection(
+		let connectionFactory: LKRTCPeerConnectionFactory
+		switch qualificationMediaMode {
+		case .production:
+			connectionFactory = factory
+		case .receiveOnlyAudioEvidence:
+			connectionFactory = LKRTCPeerConnectionFactory(
+				audioDeviceModuleType: .audioEngine,
+				bypassVoiceProcessing: true,
+				encoderFactory: nil,
+				decoderFactory: nil,
+				audioProcessingModule: nil
+			)
+			guard connectionFactory.audioDeviceModule.setManualRenderingMode(true) == 0,
+				connectionFactory.audioDeviceModule.isManualRenderingMode
+			else {
+				throw WebRTCError.failedToConfigureQualificationAudio
+			}
+		}
+
+		guard let connection = connectionFactory.peerConnection(
 			with: LKRTCConfiguration(),
 			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
 			delegate: nil
 		) else { throw WebRTCError.failedToCreatePeerConnection }
 
-		let audioTrack = Self.setupLocalAudio(for: connection)
+		let audioTrack: LKRTCAudioTrack?
+		switch qualificationMediaMode {
+		case .production:
+			audioTrack = Self.setupLocalAudio(for: connection, connectionFactory: connectionFactory)
+		case .receiveOnlyAudioEvidence:
+			audioTrack = nil
+			let configuration = LKRTCRtpTransceiverInit()
+			configuration.direction = .recvOnly
+			guard connection.addTransceiver(of: .audio, init: configuration) != nil else {
+				throw WebRTCError.failedToCreateReceiveOnlyAudioTransceiver
+			}
+		}
 
 		guard let dataChannel = connection.dataChannel(forLabel: "oai-events", configuration: LKRTCDataChannelConfiguration()) else {
 			throw WebRTCError.failedToCreateDataChannel
@@ -677,6 +800,8 @@ extension WebRTCConnector {
 			connection: connection,
 			audioTrack: audioTrack,
 			dataChannel: dataChannel,
+			connectionFactory: connectionFactory,
+			qualificationMediaMode: qualificationMediaMode,
 			signalingClient: WebRTCSignalingClient(session: session),
 			terminalObserver: terminalObserver,
 			deliveryMode: deliveryMode,
@@ -712,8 +837,8 @@ extension WebRTCConnector {
 
 
 private extension WebRTCConnector {
-	static func setupLocalAudio(for connection: LKRTCPeerConnection) -> LKRTCAudioTrack {
-		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(
+	static func setupLocalAudio(for connection: LKRTCPeerConnection, connectionFactory: LKRTCPeerConnectionFactory) -> LKRTCAudioTrack {
+		let audioSource = connectionFactory.audioSource(with: LKRTCMediaConstraints(
 			mandatoryConstraints: [
 				"googNoiseSuppression": "true", "googHighpassFilter": "true",
 				"googEchoCancellation": "true", "googAutoGainControl": "true",
@@ -721,7 +846,7 @@ private extension WebRTCConnector {
 			optionalConstraints: nil
 		))
 
-		return tap(factory.audioTrack(with: audioSource, trackId: "local_audio")) { audioTrack in
+		return tap(connectionFactory.audioTrack(with: audioSource, trackId: "local_audio")) { audioTrack in
 			connection.add(audioTrack, streamIds: ["local_stream"])
 		}
 	}
