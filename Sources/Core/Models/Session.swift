@@ -58,6 +58,11 @@ import HelperCoders
 	public struct AudioFormat: Equatable, Hashable, Codable, Sendable {
 		public var rate: Int
 		public var type: String
+
+		public init(rate: Int, type: String) {
+			self.rate = rate
+			self.type = type
+		}
 	}
 
 	/// Configuration for input and output audio.
