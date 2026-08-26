@@ -159,7 +159,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(output as? [String: String], ["voice": "Custom_Voice"])
 	}
 
-	func testOpenAIQualificationSessionUpdateUsesCurrentDocumentedShape() throws {
+	func testOpenAIQualificationSessionUpdateUsesSmallestDocumentedPartialShape() throws {
 		let update = try OpenAIWebRTCQualificationSessionUpdate(
 			model: "gpt-realtime-2.1",
 			voice: "marin"
@@ -171,24 +171,14 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(Set(object.keys), ["type", "session"])
 		XCTAssertEqual(object["type"] as? String, "session.update")
 		let session = try XCTUnwrap(object["session"] as? [String: Any])
-		XCTAssertEqual(
-			Set(session.keys),
-			["type", "model", "output_modalities", "audio", "instructions"]
-		)
+		XCTAssertEqual(Set(session.keys), ["type", "audio"])
 		XCTAssertEqual(session["type"] as? String, "realtime")
-		XCTAssertEqual(session["model"] as? String, "gpt-realtime-2.1")
-		XCTAssertEqual(session["output_modalities"] as? [String], ["audio"])
-		XCTAssertNotNil(session["instructions"] as? String)
 		let audio = try XCTUnwrap(session["audio"] as? [String: Any])
 		let input = try XCTUnwrap(audio["input"] as? [String: Any])
+		XCTAssertEqual(Set(input.keys), ["turn_detection"])
 		XCTAssertTrue(input["turn_detection"] is NSNull)
-		XCTAssertEqual(
-			input["format"] as? [String: AnyHashable],
-			["type": "audio/pcm", "rate": 24_000]
-		)
 		let output = try XCTUnwrap(audio["output"] as? [String: Any])
-		XCTAssertEqual(output["voice"] as? String, "marin")
-		XCTAssertEqual(output["format"] as? [String: String], ["type": "audio/pcm"])
+		XCTAssertEqual(output as? [String: String], ["voice": "marin"])
 	}
 
 	func testOpenAIQualificationSessionUpdateRejectsUnboundedVariants() throws {

@@ -77,7 +77,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	private struct Output: Encodable { let voice: String }
 }
 
-/// OpenAI's current Realtime session-update shape, isolated from the
+/// OpenAI's current partial Realtime session-update shape, isolated from the
 /// LocalAI-compatible partial update used by Airbridge production.
 ///
 /// This is intentionally available only through the qualification SPI. It is
@@ -98,7 +98,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	public func encoded() throws -> Data {
 		try JSONEncoder().encode(Event(
 			type: "session.update",
-			session: .init(model: model, voice: voice)
+			session: .init(voice: voice)
 		))
 	}
 
@@ -109,19 +109,10 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 
 	private struct Session: Encodable {
 		let type = "realtime"
-		let model: String
-		let outputModalities = ["audio"]
 		let audio: Audio
-		let instructions = "Respond briefly to the supplied synthetic audio."
 
-		init(model: String, voice: String) {
-			self.model = model
+		init(voice: String) {
 			audio = Audio(voice: voice)
-		}
-
-		private enum CodingKeys: String, CodingKey {
-			case type, model, audio, instructions
-			case outputModalities = "output_modalities"
 		}
 	}
 
@@ -135,32 +126,18 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	}
 
 	private struct Input: Encodable {
-		let format = PCMInputFormat()
-
 		private enum CodingKeys: String, CodingKey {
-			case format
 			case turnDetection = "turn_detection"
 		}
 
 		func encode(to encoder: any Encoder) throws {
 			var container = encoder.container(keyedBy: CodingKeys.self)
-			try container.encode(format, forKey: .format)
 			try container.encodeNil(forKey: .turnDetection)
 		}
 	}
 
-	private struct PCMInputFormat: Encodable {
-		let type = "audio/pcm"
-		let rate = 24_000
-	}
-
 	private struct Output: Encodable {
-		let format = PCMOutputFormat()
 		let voice: String
-	}
-
-	private struct PCMOutputFormat: Encodable {
-		let type = "audio/pcm"
 	}
 }
 
