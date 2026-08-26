@@ -375,7 +375,7 @@ import FoundationNetworking
 	private let connection: LKRTCPeerConnection
 	private let connectionFactory: LKRTCPeerConnectionFactory
 	private let qualificationMediaMode: WebRTCConnectorQualificationMediaMode
-	private let qualificationSyntheticAudioSource: WebRTCQualificationSyntheticAudioSource?
+	nonisolated private let qualificationSyntheticAudioSource: WebRTCQualificationSyntheticAudioSource?
 	package var qualificationHasLocalAudioTrack: Bool { audioTrack != nil }
 	package var qualificationUsesManualAudioRendering: Bool {
 		connectionFactory.audioDeviceModule.isManualRenderingMode
@@ -1048,9 +1048,13 @@ private extension WebRTCConnector {
 extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 	nonisolated public func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didAdd stream: LKRTCMediaStream) {
+		attachQualificationAudioRenderer(to: stream.audioTracks)
 		reportRemoteAudioTrackIfPresent(in: [stream])
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didAdd receiver: LKRTCRtpReceiver, streams: [LKRTCMediaStream]) {
+		if let track = receiver.track as? LKRTCAudioTrack {
+			attachQualificationAudioRenderer(to: [track])
+		}
 		reportRemoteAudioTrackIfPresent(receiverTrackKind: receiver.track?.kind, streams: streams)
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
@@ -1118,6 +1122,13 @@ extension WebRTCConnector: LKRTCDataChannelDelegate {
 }
 
 extension WebRTCConnector {
+	nonisolated private func attachQualificationAudioRenderer(
+		to tracks: [LKRTCAudioTrack]
+	) {
+		guard let qualificationSyntheticAudioSource else { return }
+		tracks.forEach { $0.add(qualificationSyntheticAudioSource) }
+	}
+
 	nonisolated private func reportRemoteAudioTrackIfPresent(in streams: [LKRTCMediaStream]) {
 		reportRemoteAudioTrackIfPresent(receiverTrackKind: nil, streams: streams)
 	}

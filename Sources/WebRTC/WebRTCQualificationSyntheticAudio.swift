@@ -31,16 +31,15 @@ import LiveKitWebRTC
 
 /// Replaces the physical input node in LiveKit's manual-rendering audio graph.
 /// The render callback owns the sample cursor and performs no allocation.
-final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceModuleDelegate, @unchecked Sendable {
+package final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceModuleDelegate, LKRTCAudioRenderer, @unchecked Sendable {
 	private static let outputSampleRate = 48_000.0
 	private let renderer: Renderer
 	private let decodedAudioCounter = WebRTCQualificationDecodedAudioCounter()
 	private let sourceFormat: AVAudioFormat
 	private weak var configuredEngine: AVAudioEngine?
 	private var sourceNode: AVAudioSourceNode?
-	private var sinkNode: AVAudioSinkNode?
 
-	init(audio: WebRTCConnectorQualificationSyntheticAudio) throws {
+	package init(audio: WebRTCConnectorQualificationSyntheticAudio) throws {
 		guard let sourceFormat = AVAudioFormat(
 			commonFormat: .pcmFormatFloat32,
 			sampleRate: Self.outputSampleRate,
@@ -60,15 +59,22 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 		renderer.evidence()
 	}
 
-	func decodedAudioEvidence() -> WebRTCConnectorQualificationAudioEvidence {
+	package func decodedAudioEvidence() -> WebRTCConnectorQualificationAudioEvidence {
 		decodedAudioCounter.evidence()
+	}
+
+	package func render(pcmBuffer: AVAudioPCMBuffer) {
+		decodedAudioCounter.observe(
+			frameCount: pcmBuffer.frameLength,
+			audioData: pcmBuffer.audioBufferList
+		)
 	}
 
 	func stop() {
 		renderer.stop()
 	}
 
-	func audioDeviceModule(
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		engine: AVAudioEngine,
 		configureInputFromSource source: AVAudioNode?,
@@ -93,7 +99,7 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 		return 0
 	}
 
-	func audioDeviceModule(
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		engine: AVAudioEngine,
 		configureOutputFromSource source: AVAudioNode,
@@ -102,64 +108,49 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 		context _: [AnyHashable: Any]
 	) -> Int {
 		guard destination == nil, engine.isInManualRenderingMode else { return -1 }
-		if let sinkNode {
-			engine.disconnectNodeInput(sinkNode)
-			engine.detach(sinkNode)
-		}
-		let decodedAudioCounter = decodedAudioCounter
-		let sinkNode = AVAudioSinkNode { _, frameCount, audioData in
-			decodedAudioCounter.observe(frameCount: frameCount, audioData: audioData)
-			return noErr
-		}
-		engine.attach(sinkNode)
-		engine.connect(source, to: sinkNode, format: format)
-		self.sinkNode = sinkNode
+		// Decoded PCM is observed through LKRTCAudioRenderer on the remote track.
+		// Leaving this nil-destination manual graph unconnected suppresses devices.
 		configuredEngine = engine
 		return 0
 	}
 
-	func audioDeviceModule(
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		didReceiveSpeechActivityEvent _: LKRTCSpeechActivityEvent
 	) {}
 
-	func audioDeviceModuleDidUpdateDevices(_: LKRTCAudioDeviceModule) {}
-	func audioDeviceModule(_: LKRTCAudioDeviceModule, didCreateEngine _: AVAudioEngine) -> Int { 0 }
-	func audioDeviceModule(
+	package func audioDeviceModuleDidUpdateDevices(_: LKRTCAudioDeviceModule) {}
+	package func audioDeviceModule(_: LKRTCAudioDeviceModule, didCreateEngine _: AVAudioEngine) -> Int { 0 }
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		willEnableEngine _: AVAudioEngine,
 		isPlayoutEnabled _: Bool,
 		isRecordingEnabled _: Bool
 	) -> Int { 0 }
-	func audioDeviceModule(
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		willStartEngine _: AVAudioEngine,
 		isPlayoutEnabled _: Bool,
 		isRecordingEnabled _: Bool
 	) -> Int { 0 }
-	func audioDeviceModule(
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		didStopEngine _: AVAudioEngine,
 		isPlayoutEnabled _: Bool,
 		isRecordingEnabled _: Bool
 	) -> Int { 0 }
-	func audioDeviceModule(
+	package func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
 		didDisableEngine _: AVAudioEngine,
 		isPlayoutEnabled _: Bool,
 		isRecordingEnabled _: Bool
 	) -> Int { 0 }
-	func audioDeviceModule(_: LKRTCAudioDeviceModule, willReleaseEngine engine: AVAudioEngine) -> Int {
+	package func audioDeviceModule(_: LKRTCAudioDeviceModule, willReleaseEngine engine: AVAudioEngine) -> Int {
 		if let sourceNode {
 			engine.disconnectNodeOutput(sourceNode)
 			engine.detach(sourceNode)
 		}
-		if let sinkNode {
-			engine.disconnectNodeInput(sinkNode)
-			engine.detach(sinkNode)
-		}
 		sourceNode = nil
-		sinkNode = nil
 		configuredEngine = nil
 		return 0
 	}

@@ -858,6 +858,34 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertTrue(evidence.limitExceeded)
 	}
 
+	func testRemoteAudioRendererCountsDecodedNonSilentFrames() throws {
+		let qualificationAudio = try WebRTCConnectorQualificationSyntheticAudio(
+			pcm16Mono24kHz: Data(repeating: 1, count: 4_800)
+		)
+		let observer = try WebRTCQualificationSyntheticAudioSource(
+			audio: qualificationAudio
+		)
+		let format = try XCTUnwrap(AVAudioFormat(
+			commonFormat: .pcmFormatFloat32,
+			sampleRate: 48_000,
+			channels: 1,
+			interleaved: false
+		))
+		let output = try XCTUnwrap(AVAudioPCMBuffer(
+			pcmFormat: format,
+			frameCapacity: 480
+		))
+		output.frameLength = 480
+		let samples = try XCTUnwrap(output.floatChannelData?[0])
+		samples.update(repeating: 0.25, count: 480)
+		observer.render(pcmBuffer: output)
+
+		let evidence = observer.decodedAudioEvidence()
+		XCTAssertGreaterThan(evidence.decodedFrameCount, 0)
+		XCTAssertGreaterThan(evidence.nonZeroDecodedByteCount, 0)
+		XCTAssertTrue(evidence.hasDecodedNonSilentAudio)
+	}
+
 	@MainActor
 	func testReceiveOnlyQualificationPeerNeedsNoMicrophoneAndSuppressesPlayout() async throws {
 		let probe = ConnectorTerminalProbe(
