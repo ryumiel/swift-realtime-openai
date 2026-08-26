@@ -400,6 +400,7 @@ import FoundationNetworking
 	}
 	private var preReadyInboundEvents: [PreReadyInboundEvent] = []
 	private var qualificationSessionCreatedObserved = false
+	private var qualificationSessionUpdatedObserved = false
 
 	private static let factory: LKRTCPeerConnectionFactory = {
 		LKRTCInitializeSSL()
@@ -1051,6 +1052,15 @@ extension WebRTCConnector {
 			{
 				qualificationSessionCreatedObserved = true
 				yieldQualification(.sessionCreated, fromAcceptedIngress: true)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				!qualificationSessionUpdatedObserved,
+				try inboundEventDecoder.isSessionUpdatedForConnector(data)
+			{
+				qualificationSessionUpdatedObserved = true
+				yieldQualification(.sessionUpdated, fromAcceptedIngress: true)
 				return
 			}
 			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }

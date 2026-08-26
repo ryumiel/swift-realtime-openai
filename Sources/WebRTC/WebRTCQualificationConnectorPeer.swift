@@ -7,6 +7,7 @@ import Foundation
 @_spi(AirbridgeQualification) public enum WebRTCConnectorQualificationEvent: Sendable, Equatable {
 	case connected
 	case sessionCreated
+	case sessionUpdated
 	case inbound(WebRTCInboundEvent)
 	case terminal
 }

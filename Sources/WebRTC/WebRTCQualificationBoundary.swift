@@ -259,11 +259,19 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	}
 
 	package func isSessionCreatedForConnector(_ data: Data) throws -> Bool {
+		try hasEventType("session.created", data: data)
+	}
+
+	package func isSessionUpdatedForConnector(_ data: Data) throws -> Bool {
+		try hasEventType("session.updated", data: data)
+	}
+
+	private func hasEventType(_ expectedType: String, data: Data) throws -> Bool {
 		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
 			throw WebRTCTransportFailure.eventTooLarge
 		}
 		do {
-			return try JSONDecoder().decode(EventTypeEnvelope.self, from: data).type == "session.created"
+			return try JSONDecoder().decode(EventTypeEnvelope.self, from: data).type == expectedType
 		} catch {
 			throw WebRTCTransportFailure.malformedEvent
 		}

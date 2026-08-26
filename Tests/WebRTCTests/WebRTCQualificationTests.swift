@@ -194,6 +194,36 @@ final class WebRTCQualificationTests: XCTestCase {
 		}
     }
 
+	func testQualificationSessionLifecycleRecognitionNeedsOnlyTheBoundedEventType() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		let updated = Data(#"{"type":"session.updated","session":{"type":"realtime"}}"#.utf8)
+		XCTAssertTrue(try decoder.isSessionUpdatedForConnector(updated))
+		XCTAssertFalse(try decoder.isSessionCreatedForConnector(updated))
+	}
+
+	@MainActor
+	func testNoMicrophoneQualificationEmitsContentFreeSessionUpdated() async throws {
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(
+				data: Data(), statusCode: 201, contentType: "application/sdp"
+			)),
+			mediaMode: .sendReceiveAudioEvidence
+		)
+		let events = connector.qualificationEvents
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			return [try await iterator.next(), try await iterator.next()]
+		}
+
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		connector.receiveInbound(Data(
+			#"{"type":"session.updated","session":{"type":"realtime","audio":{"output":{"voice":"marin"}}}}"#.utf8
+		))
+		let received = try await reader.value
+		XCTAssertEqual(received, [.connected, .sessionUpdated])
+		await connector.closeAndSettle()
+	}
+
 	func testConnectorIngressIgnoresOnlyKnownAudioLifecycleEvents() throws {
 		let decoder = WebRTCInboundEventDecoder()
 		let simpleEventTypes = [
