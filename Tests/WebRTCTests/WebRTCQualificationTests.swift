@@ -416,6 +416,9 @@ final class WebRTCQualificationTests: XCTestCase {
 			"response.output_audio.delta",
 			"response.audio.delta",
 			"response.output_audio.done",
+			"output_audio_buffer.started",
+			"output_audio_buffer.stopped",
+			"output_audio_buffer.cleared",
 			"rate_limits.updated",
 		]
 

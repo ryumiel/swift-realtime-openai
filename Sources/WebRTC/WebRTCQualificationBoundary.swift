@@ -327,6 +327,9 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 		case responseAudioDelta = "response.audio.delta"
 		case responseOutputTextDelta = "response.output_text.delta"
 		case responseOutputTextDone = "response.output_text.done"
+		case outputAudioBufferStarted = "output_audio_buffer.started"
+		case outputAudioBufferStopped = "output_audio_buffer.stopped"
+		case outputAudioBufferCleared = "output_audio_buffer.cleared"
 		case responseDone = "response.done"
 		case unknown
 	}
@@ -768,6 +771,9 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		"response.output_audio.delta",
 		"response.audio.delta",
 		"response.output_audio.done",
+		"output_audio_buffer.started",
+		"output_audio_buffer.stopped",
+		"output_audio_buffer.cleared",
 		"rate_limits.updated",
 	]
 
