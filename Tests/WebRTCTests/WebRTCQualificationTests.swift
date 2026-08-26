@@ -159,6 +159,54 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(output as? [String: String], ["voice": "Custom_Voice"])
 	}
 
+	func testOpenAIQualificationSessionUpdateUsesCurrentDocumentedShape() throws {
+		let update = try OpenAIWebRTCQualificationSessionUpdate(
+			model: "gpt-realtime-2.1",
+			voice: "marin"
+		)
+		let object = try XCTUnwrap(
+			JSONSerialization.jsonObject(with: update.encoded()) as? [String: Any]
+		)
+
+		XCTAssertEqual(Set(object.keys), ["type", "session"])
+		XCTAssertEqual(object["type"] as? String, "session.update")
+		let session = try XCTUnwrap(object["session"] as? [String: Any])
+		XCTAssertEqual(
+			Set(session.keys),
+			["type", "model", "output_modalities", "audio", "instructions"]
+		)
+		XCTAssertEqual(session["type"] as? String, "realtime")
+		XCTAssertEqual(session["model"] as? String, "gpt-realtime-2.1")
+		XCTAssertEqual(session["output_modalities"] as? [String], ["audio"])
+		XCTAssertNotNil(session["instructions"] as? String)
+		let audio = try XCTUnwrap(session["audio"] as? [String: Any])
+		let input = try XCTUnwrap(audio["input"] as? [String: Any])
+		XCTAssertTrue(input["turn_detection"] is NSNull)
+		XCTAssertEqual(
+			input["format"] as? [String: AnyHashable],
+			["type": "audio/pcm", "rate": 24_000]
+		)
+		let output = try XCTUnwrap(audio["output"] as? [String: Any])
+		XCTAssertEqual(output["voice"] as? String, "marin")
+		XCTAssertEqual(output["format"] as? [String: String], ["type": "audio/pcm"])
+	}
+
+	func testOpenAIQualificationSessionUpdateRejectsUnboundedVariants() throws {
+		XCTAssertThrowsError(
+			try OpenAIWebRTCQualificationSessionUpdate(model: "other", voice: "marin")
+		)
+		XCTAssertThrowsError(
+			try OpenAIWebRTCQualificationSessionUpdate(model: "gpt-realtime-2.1", voice: "alloy")
+		)
+	}
+
+	func testOpenAIQualificationResponseCreateIsMinimal() throws {
+		let object = try XCTUnwrap(JSONSerialization.jsonObject(
+			with: OpenAIWebRTCQualificationResponseCreate().encoded()
+		) as? [String: String])
+		XCTAssertEqual(object, ["type": "response.create"])
+	}
+
 	func testPartialSessionUpdateValidatesVoiceAndISO6391Language() throws {
 		XCTAssertNoThrow(try WebRTCSessionUpdate(voice: "Ono_Anna", language: "ja"))
 		XCTAssertThrowsError(try WebRTCSessionUpdate(voice: "", language: "en"))

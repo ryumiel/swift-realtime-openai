@@ -80,6 +80,8 @@ import Foundation
 	func apply(answer: String) async throws
 	func send(event: ClientEvent) async throws
 	func sendSessionUpdate(voice: String, language: String) async throws
+	func sendOpenAIQualificationSessionUpdate(model: String, voice: String) async throws
+	func sendOpenAIQualificationResponseCreate() async throws
 	func remoteAudioEvidence() async throws -> WebRTCConnectorQualificationAudioEvidence
 	func disconnect()
 	func closeAndSettle() async
@@ -87,6 +89,14 @@ import Foundation
 
 @_spi(AirbridgeQualification) @MainActor public extension WebRTCConnectorQualificationPeer {
 	func sendSessionUpdate(voice _: String, language _: String) async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	func sendOpenAIQualificationSessionUpdate(model _: String, voice _: String) async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	func sendOpenAIQualificationResponseCreate() async throws {
 		throw WebRTCTransportFailure.invalidRequest
 	}
 

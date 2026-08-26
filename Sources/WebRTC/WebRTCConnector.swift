@@ -546,6 +546,25 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: update.encoded(), isBinary: false))
 	}
 
+	@_spi(AirbridgeQualification) public func sendOpenAIQualificationSessionUpdate(
+		model: String,
+		voice: String
+	) throws {
+		guard qualificationMediaMode != .production,
+			isCurrentAndAcceptingProgression(), dataChannel.readyState == .open
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let update = try OpenAIWebRTCQualificationSessionUpdate(model: model, voice: voice)
+		try dataChannel.sendData(LKRTCDataBuffer(data: update.encoded(), isBinary: false))
+	}
+
+	@_spi(AirbridgeQualification) public func sendOpenAIQualificationResponseCreate() throws {
+		guard qualificationMediaMode != .production,
+			isCurrentAndAcceptingProgression(), dataChannel.readyState == .open
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let event = OpenAIWebRTCQualificationResponseCreate()
+		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
+	}
+
 	public func disconnect() {
 		requestTerminal()
 	}
