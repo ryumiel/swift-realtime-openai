@@ -375,6 +375,7 @@ import FoundationNetworking
 	private let connection: LKRTCPeerConnection
 	private let connectionFactory: LKRTCPeerConnectionFactory
 	private let qualificationMediaMode: WebRTCConnectorQualificationMediaMode
+	private let qualificationSyntheticAudioSource: WebRTCQualificationSyntheticAudioSource?
 	package var qualificationHasLocalAudioTrack: Bool { audioTrack != nil }
 	package var qualificationUsesManualAudioRendering: Bool {
 		connectionFactory.audioDeviceModule.isManualRenderingMode
@@ -420,6 +421,7 @@ import FoundationNetworking
 		dataChannel: LKRTCDataChannel,
 		connectionFactory: LKRTCPeerConnectionFactory,
 		qualificationMediaMode: WebRTCConnectorQualificationMediaMode,
+		qualificationSyntheticAudioSource: WebRTCQualificationSyntheticAudioSource?,
 		signalingClient: WebRTCSignalingClient,
 		terminalObserver: TerminalObserver,
 		deliveryMode: DeliveryMode,
@@ -430,6 +432,7 @@ import FoundationNetworking
 		self.dataChannel = dataChannel
 		self.connectionFactory = connectionFactory
 		self.qualificationMediaMode = qualificationMediaMode
+		self.qualificationSyntheticAudioSource = qualificationSyntheticAudioSource
 		self.signalingClient = signalingClient
 		self.terminalObserver = terminalObserver
 		self.deliveryMode = deliveryMode
@@ -479,7 +482,7 @@ import FoundationNetworking
 	@_spi(AirbridgeQualification) public func makeOffer() async throws -> String {
 		guard connection.connectionState == .new else { throw WebRTCTransportFailure.cancelled }
 		guard isCurrentAndAcceptingProgression() else { throw WebRTCTransportFailure.cancelled }
-		if audioTrack != nil {
+		if audioTrack != nil, qualificationMediaMode == .production {
 			guard terminalObserver.recordPermissionGranted() else {
 				disconnect()
 				throw WebRTCError.missingAudioPermission
@@ -565,6 +568,14 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
 	}
 
+	@_spi(AirbridgeQualification) public func sendOpenAIQualificationOutputControl() async throws {
+		guard qualificationMediaMode != .production,
+			isCurrentAndAcceptingProgression(), dataChannel.readyState == .open
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let event = OpenAIWebRTCQualificationOutputControl()
+		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
+	}
+
 	public func disconnect() {
 		requestTerminal()
 	}
@@ -598,6 +609,10 @@ import FoundationNetworking
 		connection.close()
 		terminalObserver.closePeer()
 		audioTrack?.isEnabled = false
+		qualificationSyntheticAudioSource?.stop()
+		if qualificationSyntheticAudioSource != nil {
+			connectionFactory.audioDeviceModule.observer = nil
+		}
 		terminalObserver.disableAudio()
 		if qualificationMediaMode == .production {
 			Self.deactivateAudioSession()
@@ -650,6 +665,32 @@ import FoundationNetworking
 			throw WebRTCTransportFailure.cancelled
 		}
 		return evidence
+	}
+
+	@_spi(AirbridgeQualification) public func clearOpenAIQualificationInputAudio() async throws {
+		guard qualificationMediaMode != .production else {
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		try send(event: .clearInputAudioBuffer(
+			eventId: "airbridge-qualification-input-audio-clear"
+		))
+	}
+
+	@_spi(AirbridgeQualification) public func startQualificationSyntheticAudio() async throws {
+		guard isCurrentAndAcceptingProgression(),
+			let qualificationSyntheticAudioSource,
+			audioTrack?.isEnabled == true
+		else { throw WebRTCTransportFailure.invalidRequest }
+		qualificationSyntheticAudioSource.start()
+	}
+
+	@_spi(AirbridgeQualification) public func qualificationSyntheticAudioEvidence() async throws
+		-> WebRTCConnectorQualificationSyntheticAudioEvidence
+	{
+		guard isCurrentAndAcceptingProgression(), let qualificationSyntheticAudioSource else {
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		return qualificationSyntheticAudioSource.evidence()
 	}
 
 	nonisolated package static func audioEvidence(
@@ -784,7 +825,8 @@ extension WebRTCConnector {
 		switch qualificationMediaMode {
 		case .production:
 			connectionFactory = factory
-		case .inactiveAudioEvidence, .sendReceiveAudioEvidence, .receiveOnlyAudioEvidence:
+		case .inactiveAudioEvidence, .sendReceiveAudioEvidence,
+			.syntheticSendReceiveAudioEvidence, .receiveOnlyAudioEvidence:
 			connectionFactory = LKRTCPeerConnectionFactory(
 				audioDeviceModuleType: .audioEngine,
 				bypassVoiceProcessing: true,
@@ -797,6 +839,16 @@ extension WebRTCConnector {
 			else {
 				throw WebRTCError.failedToConfigureQualificationAudio
 			}
+		}
+
+		let qualificationSyntheticAudioSource: WebRTCQualificationSyntheticAudioSource?
+		switch qualificationMediaMode {
+		case .syntheticSendReceiveAudioEvidence(let audio):
+			let source = try WebRTCQualificationSyntheticAudioSource(audio: audio)
+			connectionFactory.audioDeviceModule.observer = source
+			qualificationSyntheticAudioSource = source
+		case .production, .inactiveAudioEvidence, .sendReceiveAudioEvidence, .receiveOnlyAudioEvidence:
+			qualificationSyntheticAudioSource = nil
 		}
 
 		guard let connection = connectionFactory.peerConnection(
@@ -823,6 +875,11 @@ extension WebRTCConnector {
 			guard connection.addTransceiver(of: .audio, init: configuration) != nil else {
 				throw WebRTCError.failedToCreateSendReceiveAudioTransceiver
 			}
+		case .syntheticSendReceiveAudioEvidence:
+			audioTrack = Self.setupQualificationSyntheticAudio(
+				for: connection,
+				connectionFactory: connectionFactory
+			)
 		case .receiveOnlyAudioEvidence:
 			audioTrack = nil
 			let configuration = LKRTCRtpTransceiverInit()
@@ -842,6 +899,7 @@ extension WebRTCConnector {
 			dataChannel: dataChannel,
 			connectionFactory: connectionFactory,
 			qualificationMediaMode: qualificationMediaMode,
+			qualificationSyntheticAudioSource: qualificationSyntheticAudioSource,
 			signalingClient: WebRTCSignalingClient(session: session),
 			terminalObserver: terminalObserver,
 			deliveryMode: deliveryMode,
@@ -888,6 +946,25 @@ private extension WebRTCConnector {
 
 		return tap(connectionFactory.audioTrack(with: audioSource, trackId: "local_audio")) { audioTrack in
 			connection.add(audioTrack, streamIds: ["local_stream"])
+		}
+	}
+
+	static func setupQualificationSyntheticAudio(
+		for connection: LKRTCPeerConnection,
+		connectionFactory: LKRTCPeerConnectionFactory
+	) -> LKRTCAudioTrack {
+		let audioSource = connectionFactory.audioSource(with: LKRTCMediaConstraints(
+			mandatoryConstraints: [
+				"googNoiseSuppression": "false", "googHighpassFilter": "false",
+				"googEchoCancellation": "false", "googAutoGainControl": "false",
+			],
+			optionalConstraints: nil
+		))
+		return tap(connectionFactory.audioTrack(
+			with: audioSource,
+			trackId: "qualification_synthetic_audio"
+		)) { audioTrack in
+			connection.add(audioTrack, streamIds: ["qualification_synthetic_stream"])
 		}
 	}
 
@@ -1084,6 +1161,13 @@ extension WebRTCConnector {
 			}
 			if deliveryMode == .qualification,
 				qualificationMediaMode != .production,
+				try inboundEventDecoder.isInputAudioClearedForConnector(data)
+			{
+				yieldQualification(.inputAudioCleared, fromAcceptedIngress: true)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
 				try inboundEventDecoder.isInputAudioCommittedForConnector(data)
 			{
 				yieldQualification(.inputAudioCommitted, fromAcceptedIngress: true)
@@ -1094,6 +1178,21 @@ extension WebRTCConnector {
 				try inboundEventDecoder.isResponseCreatedForConnector(data)
 			{
 				yieldQualification(.responseCreated, fromAcceptedIngress: true)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				let evidence = try inboundEventDecoder.providerErrorEvidenceForConnector(data)
+			{
+				yieldQualification(.providerError(evidence), fromAcceptedIngress: true)
+				requestTerminalFromAcceptedIngress(WebRTCTransportFailure.providerError)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				let evidence = try inboundEventDecoder.responseCompletionEvidenceForConnector(data)
+			{
+				yieldQualification(.responseDone(evidence), fromAcceptedIngress: true)
 				return
 			}
 			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }

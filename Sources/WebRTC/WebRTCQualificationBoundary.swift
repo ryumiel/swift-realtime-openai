@@ -84,6 +84,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 /// not a general raw-event escape hatch and is fixed to the bounded synthetic
 /// audio experiment that exercises manual input-buffer commit over WebRTC.
 @_spi(AirbridgeQualification) public struct OpenAIWebRTCQualificationSessionUpdate: Equatable, Sendable {
+	public static let eventID = "airbridge-qualification-session-update"
 	public let model: String
 	public let voice: String
 
@@ -97,14 +98,22 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 
 	public func encoded() throws -> Data {
 		try JSONEncoder().encode(Event(
+			eventID: Self.eventID,
 			type: "session.update",
 			session: .init(voice: voice)
 		))
 	}
 
 	private struct Event: Encodable {
+		let eventID: String
 		let type: String
 		let session: Session
+
+		private enum CodingKeys: String, CodingKey {
+			case eventID = "event_id"
+			case type
+			case session
+		}
 	}
 
 	private struct Session: Encodable {
@@ -144,25 +153,157 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 /// The minimal documented response trigger after a manually committed input
 /// buffer. Session-level qualification policy owns the audio modality.
 @_spi(AirbridgeQualification) public struct OpenAIWebRTCQualificationResponseCreate: Equatable, Sendable {
+	public static let eventID = "airbridge-qualification-response-create"
+
 	public init() {}
 
 	public func encoded() throws -> Data {
-		try JSONEncoder().encode(Event(type: "response.create", response: Response()))
+		try JSONEncoder().encode(Event(
+			eventID: Self.eventID,
+			type: "response.create",
+			response: Response()
+		))
 	}
 
 	private struct Event: Encodable {
+		let eventID: String
 		let type: String
 		let response: Response
+
+		private enum CodingKeys: String, CodingKey {
+			case eventID = "event_id"
+			case type
+			case response
+		}
 	}
 
 	private struct Response: Encodable {
 		let outputModalities = ["audio"]
-		let maximumOutputTokens = 64
+		let maximumOutputTokens = 256
 
 		private enum CodingKeys: String, CodingKey {
 			case outputModalities = "output_modalities"
 			case maximumOutputTokens = "max_output_tokens"
 		}
+	}
+}
+
+/// A fixed out-of-band audio-output control that does not consume conversation input.
+@_spi(AirbridgeQualification) public struct OpenAIWebRTCQualificationOutputControl: Equatable, Sendable {
+	public static let eventID = "airbridge-qualification-output-control"
+	public init() {}
+
+	public func encoded() throws -> Data {
+		try JSONEncoder().encode(Event(
+			eventID: Self.eventID,
+			type: "response.create",
+			response: Response()
+		))
+	}
+
+	private struct Event: Encodable {
+		let eventID: String
+		let type: String
+		let response: Response
+
+		private enum CodingKeys: String, CodingKey {
+			case eventID = "event_id"
+			case type
+			case response
+		}
+	}
+
+	private struct Response: Encodable {
+		let conversation = "none"
+		let input: [String] = []
+		let instructions = "Say one short greeting."
+		let outputModalities = ["audio"]
+		let maximumOutputTokens = 256
+
+		private enum CodingKeys: String, CodingKey {
+			case conversation
+			case input
+			case instructions
+			case outputModalities = "output_modalities"
+			case maximumOutputTokens = "max_output_tokens"
+		}
+	}
+}
+
+/// Content-free classifications retained from a provider `error` event.
+///
+/// Raw provider strings and messages never cross this boundary. Only exact,
+/// documented identifiers selected by this allowlist are represented.
+@_spi(AirbridgeQualification) public struct WebRTCProviderErrorEvidence: Equatable, Sendable {
+	public enum ErrorType: String, Equatable, Sendable {
+		case invalidRequest = "invalid_request_error"
+		case server = "server_error"
+		case unknown
+	}
+
+	public enum Code: String, Equatable, Sendable {
+		case insufficientQuota = "insufficient_quota"
+		case rateLimitExceeded = "rate_limit_exceeded"
+		case inputAudioBufferCommitEmpty = "input_audio_buffer_commit_empty"
+		case invalidAudioBuffer = "invalid_audio_buffer"
+		case invalidAudioFormat = "invalid_audio_format"
+		case invalidValue = "invalid_value"
+		case modelNotFound = "model_not_found"
+		case serverError = "server_error"
+		case unknown
+	}
+
+	public enum Parameter: String, Equatable, Sendable {
+		case session
+		case sessionAudioInput = "session.audio.input"
+		case sessionAudioInputFormat = "session.audio.input.format"
+		case response
+		case responseMaxOutputTokens = "response.max_output_tokens"
+		case model
+		case inputAudioBuffer = "input_audio_buffer"
+		case none
+		case unknown
+	}
+
+	public enum Trigger: String, Equatable, Sendable {
+		case sessionUpdate = "session.update"
+		case inputAudioClear = "input_audio_buffer.clear"
+		case inputAudioCommit = "input_audio_buffer.commit"
+		case responseCreate = "response.create"
+		case outputControl = "output-control response.create"
+		case none
+		case unknown
+	}
+
+	public let type: ErrorType
+	public let code: Code
+	public let parameter: Parameter
+	public let trigger: Trigger
+
+	public init(type: ErrorType, code: Code, parameter: Parameter, trigger: Trigger) {
+		self.type = type
+		self.code = code
+		self.parameter = parameter
+		self.trigger = trigger
+	}
+}
+
+/// Content-free terminal status from a qualification `response.done` event.
+@_spi(AirbridgeQualification) public struct WebRTCResponseCompletionEvidence: Equatable, Sendable {
+	public enum Status: String, Equatable, Sendable {
+		case completed
+		case failed
+		case cancelled
+		case incomplete
+		case unknown
+	}
+
+	public let status: Status
+	public let code: WebRTCProviderErrorEvidence.Code
+
+	public init(status: Status, code: WebRTCProviderErrorEvidence.Code) {
+		self.status = status
+		self.code = code
 	}
 }
 
@@ -359,6 +500,10 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		try hasEventType("input_audio_buffer.committed", data: data)
 	}
 
+	package func isInputAudioClearedForConnector(_ data: Data) throws -> Bool {
+		try hasEventType("input_audio_buffer.cleared", data: data)
+	}
+
 	package func isResponseCreatedForConnector(_ data: Data) throws -> Bool {
 		guard try hasEventType("response.created", data: data) else { return false }
 		do {
@@ -367,6 +512,108 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				throw WebRTCTransportFailure.unsupportedEvent
 			}
 			return true
+		} catch let failure as WebRTCTransportFailure {
+			throw failure
+		} catch {
+			throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
+	package func providerErrorEvidenceForConnector(
+		_ data: Data
+	) throws -> WebRTCProviderErrorEvidence? {
+		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
+			throw WebRTCTransportFailure.eventTooLarge
+		}
+		do {
+			let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+			guard envelope.type == "error", let error = envelope.error else { return nil }
+			let errorType: WebRTCProviderErrorEvidence.ErrorType
+			switch error.type {
+			case "invalid_request_error": errorType = .invalidRequest
+			case "server_error": errorType = .server
+			default: errorType = .unknown
+			}
+			let code: WebRTCProviderErrorEvidence.Code
+			switch error.code {
+			case "insufficient_quota": code = .insufficientQuota
+			case "rate_limit_exceeded": code = .rateLimitExceeded
+			case "input_audio_buffer_commit_empty": code = .inputAudioBufferCommitEmpty
+			case "invalid_audio_buffer": code = .invalidAudioBuffer
+			case "invalid_audio_format": code = .invalidAudioFormat
+			case "invalid_value": code = .invalidValue
+			case "model_not_found": code = .modelNotFound
+			case "server_error": code = .serverError
+			default: code = .unknown
+			}
+			let parameter: WebRTCProviderErrorEvidence.Parameter
+			switch error.param {
+			case "session": parameter = .session
+			case "session.audio.input": parameter = .sessionAudioInput
+			case "session.audio.input.format": parameter = .sessionAudioInputFormat
+			case "response": parameter = .response
+			case "response.max_output_tokens", "max_output_tokens": parameter = .responseMaxOutputTokens
+			case "model": parameter = .model
+			case "input_audio_buffer": parameter = .inputAudioBuffer
+			case nil: parameter = .none
+			default: parameter = .unknown
+			}
+			let trigger: WebRTCProviderErrorEvidence.Trigger
+			switch error.eventID {
+			case OpenAIWebRTCQualificationSessionUpdate.eventID: trigger = .sessionUpdate
+			case "airbridge-qualification-input-audio-clear": trigger = .inputAudioClear
+			case "airbridge-qualification-input-audio-commit": trigger = .inputAudioCommit
+			case OpenAIWebRTCQualificationResponseCreate.eventID: trigger = .responseCreate
+			case OpenAIWebRTCQualificationOutputControl.eventID: trigger = .outputControl
+			case nil: trigger = .none
+			default: trigger = .unknown
+			}
+			return WebRTCProviderErrorEvidence(
+				type: errorType,
+				code: code,
+				parameter: parameter,
+				trigger: trigger
+			)
+		} catch let failure as WebRTCTransportFailure {
+			throw failure
+		} catch {
+			throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
+	package func responseCompletionEvidenceForConnector(
+		_ data: Data
+	) throws -> WebRTCResponseCompletionEvidence? {
+		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
+			throw WebRTCTransportFailure.eventTooLarge
+		}
+		do {
+			let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+			guard envelope.type == "response.done", let response = envelope.response,
+				let output = response.output,
+				output.allSatisfy(\.isOutputAudioMessage)
+			else { return nil }
+			let status: WebRTCResponseCompletionEvidence.Status
+			switch response.status {
+			case "completed": status = .completed
+			case "failed": status = .failed
+			case "cancelled": status = .cancelled
+			case "incomplete": status = .incomplete
+			default: status = .unknown
+			}
+			let code: WebRTCProviderErrorEvidence.Code
+			switch response.statusDetails?.error?.code {
+			case "insufficient_quota": code = .insufficientQuota
+			case "rate_limit_exceeded": code = .rateLimitExceeded
+			case "input_audio_buffer_commit_empty": code = .inputAudioBufferCommitEmpty
+			case "invalid_audio_buffer": code = .invalidAudioBuffer
+			case "invalid_audio_format": code = .invalidAudioFormat
+			case "invalid_value": code = .invalidValue
+			case "model_not_found": code = .modelNotFound
+			case "server_error": code = .serverError
+			default: code = .unknown
+			}
+			return .init(status: status, code: code)
 		} catch let failure as WebRTCTransportFailure {
 			throw failure
 		} catch {
@@ -463,10 +710,25 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	private struct Envelope: Decodable {
 		let type: String
 		let transcript: String?
+		let error: ErrorEnvelope?
 		let item: ItemEnvelope?
 		let part: ContentEnvelope?
 		let response: ResponseEnvelope?
 		let session: SessionEnvelope?
+	}
+
+	private struct ErrorEnvelope: Decodable {
+		let type: String?
+		let code: String?
+		let param: String?
+		let eventID: String?
+
+		private enum CodingKeys: String, CodingKey {
+			case type
+			case code
+			case param
+			case eventID = "event_id"
+		}
 	}
 
 	private struct EventTypeEnvelope: Decodable { let type: String }
@@ -505,7 +767,19 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	}
 
 	private struct ContentEnvelope: Decodable { let type: String }
-	private struct ResponseEnvelope: Decodable { let output: [ItemEnvelope]? }
+	private struct ResponseEnvelope: Decodable {
+		let output: [ItemEnvelope]?
+		let status: String?
+		let statusDetails: StatusDetailsEnvelope?
+
+		private enum CodingKeys: String, CodingKey {
+			case output
+			case status
+			case statusDetails = "status_details"
+		}
+	}
+	private struct StatusDetailsEnvelope: Decodable { let error: StatusErrorEnvelope? }
+	private struct StatusErrorEnvelope: Decodable { let code: String? }
 }
 
 /// Main-actor lifecycle identity and one terminal cleanup for the private connector.

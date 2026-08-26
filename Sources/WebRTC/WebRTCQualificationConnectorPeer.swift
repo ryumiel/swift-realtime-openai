@@ -8,8 +8,11 @@ import Foundation
 	case connected
 	case sessionCreated
 	case sessionUpdated
+	case inputAudioCleared
 	case inputAudioCommitted
 	case responseCreated
+	case responseDone(WebRTCResponseCompletionEvidence)
+	case providerError(WebRTCProviderErrorEvidence)
 	case inbound(WebRTCInboundEvent)
 	case terminal
 }
@@ -22,6 +25,8 @@ import Foundation
 	case inactiveAudioEvidence
 	/// Negotiate send/receive audio with no local track and suppress device playout.
 	case sendReceiveAudioEvidence
+	/// Send fixed PCM through a no-device RTP source and suppress device playout.
+	case syntheticSendReceiveAudioEvidence(WebRTCConnectorQualificationSyntheticAudio)
 	/// Negotiate receive-only audio, create no local track, and suppress device playout.
 	case receiveOnlyAudioEvidence
 }
@@ -84,6 +89,10 @@ import Foundation
 	func sendSessionUpdate(voice: String, language: String) async throws
 	func sendOpenAIQualificationSessionUpdate(model: String, voice: String) async throws
 	func sendOpenAIQualificationResponseCreate() async throws
+	func sendOpenAIQualificationOutputControl() async throws
+	func clearOpenAIQualificationInputAudio() async throws
+	func startQualificationSyntheticAudio() async throws
+	func qualificationSyntheticAudioEvidence() async throws -> WebRTCConnectorQualificationSyntheticAudioEvidence
 	func remoteAudioEvidence() async throws -> WebRTCConnectorQualificationAudioEvidence
 	func disconnect()
 	func closeAndSettle() async
@@ -99,6 +108,22 @@ import Foundation
 	}
 
 	func sendOpenAIQualificationResponseCreate() async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	func sendOpenAIQualificationOutputControl() async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	func clearOpenAIQualificationInputAudio() async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	func startQualificationSyntheticAudio() async throws {
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	func qualificationSyntheticAudioEvidence() async throws -> WebRTCConnectorQualificationSyntheticAudioEvidence {
 		throw WebRTCTransportFailure.invalidRequest
 	}
 

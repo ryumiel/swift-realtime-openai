@@ -168,7 +168,11 @@ final class WebRTCQualificationTests: XCTestCase {
 			JSONSerialization.jsonObject(with: update.encoded()) as? [String: Any]
 		)
 
-		XCTAssertEqual(Set(object.keys), ["type", "session"])
+		XCTAssertEqual(Set(object.keys), ["event_id", "type", "session"])
+		XCTAssertEqual(
+			object["event_id"] as? String,
+			OpenAIWebRTCQualificationSessionUpdate.eventID
+		)
 		XCTAssertEqual(object["type"] as? String, "session.update")
 		let session = try XCTUnwrap(object["session"] as? [String: Any])
 		XCTAssertEqual(Set(session.keys), ["type", "audio"])
@@ -194,12 +198,96 @@ final class WebRTCQualificationTests: XCTestCase {
 		let object = try XCTUnwrap(JSONSerialization.jsonObject(
 			with: OpenAIWebRTCQualificationResponseCreate().encoded()
 		) as? [String: Any])
-		XCTAssertEqual(Set(object.keys), ["type", "response"])
+		XCTAssertEqual(Set(object.keys), ["event_id", "type", "response"])
+		XCTAssertEqual(
+			object["event_id"] as? String,
+			OpenAIWebRTCQualificationResponseCreate.eventID
+		)
 		XCTAssertEqual(object["type"] as? String, "response.create")
 		let response = try XCTUnwrap(object["response"] as? [String: Any])
 		XCTAssertEqual(Set(response.keys), ["output_modalities", "max_output_tokens"])
 		XCTAssertEqual(response["output_modalities"] as? [String], ["audio"])
-		XCTAssertEqual(response["max_output_tokens"] as? Int, 64)
+		XCTAssertEqual(response["max_output_tokens"] as? Int, 256)
+	}
+
+	func testOpenAIQualificationOutputControlIsFixedBoundedAndOutOfBand() throws {
+		let object = try XCTUnwrap(JSONSerialization.jsonObject(
+			with: OpenAIWebRTCQualificationOutputControl().encoded()
+		) as? [String: Any])
+		XCTAssertEqual(Set(object.keys), ["event_id", "type", "response"])
+		XCTAssertEqual(object["event_id"] as? String, OpenAIWebRTCQualificationOutputControl.eventID)
+		XCTAssertEqual(object["type"] as? String, "response.create")
+		let response = try XCTUnwrap(object["response"] as? [String: Any])
+		XCTAssertEqual(Set(response.keys), [
+			"conversation", "input", "instructions", "output_modalities", "max_output_tokens",
+		])
+		XCTAssertEqual(response["conversation"] as? String, "none")
+		XCTAssertEqual(response["input"] as? [String], [])
+		XCTAssertEqual(response["instructions"] as? String, "Say one short greeting.")
+		XCTAssertEqual(response["output_modalities"] as? [String], ["audio"])
+		XCTAssertEqual(response["max_output_tokens"] as? Int, 256)
+	}
+
+	func testProviderErrorEvidenceRetainsOnlyAllowlistedContentFreeFields() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		let evidence = try XCTUnwrap(decoder.providerErrorEvidenceForConnector(Data(
+			#"{"type":"error","event_id":"server-event","error":{"type":"invalid_request_error","code":"invalid_audio_format","message":"private provider detail","param":"session.audio.input.format","event_id":"airbridge-qualification-response-create"}}"#.utf8
+		)))
+
+		XCTAssertEqual(evidence.type, .invalidRequest)
+		XCTAssertEqual(evidence.code, .invalidAudioFormat)
+		XCTAssertEqual(evidence.parameter, .sessionAudioInputFormat)
+		XCTAssertEqual(evidence.trigger, .responseCreate)
+
+		let unknown = try XCTUnwrap(decoder.providerErrorEvidenceForConnector(Data(
+			#"{"type":"error","error":{"type":"private-type","code":"private-code","message":"private provider detail","param":"private-param","event_id":"private-event"}}"#.utf8
+		)))
+		XCTAssertEqual(unknown.type, .unknown)
+		XCTAssertEqual(unknown.code, .unknown)
+		XCTAssertEqual(unknown.parameter, .unknown)
+		XCTAssertEqual(unknown.trigger, .unknown)
+	}
+
+	func testResponseCompletionEvidenceRetainsOnlyAllowlistedTerminalStatus() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		let completed = try XCTUnwrap(decoder.responseCompletionEvidenceForConnector(Data(
+			#"{"type":"response.done","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}]}}"#.utf8
+		)))
+		XCTAssertEqual(completed, .init(status: .completed, code: .unknown))
+
+		let failed = try XCTUnwrap(decoder.responseCompletionEvidenceForConnector(Data(
+			#"{"type":"response.done","response":{"status":"failed","status_details":{"error":{"code":"insufficient_quota","message":"private provider detail"}},"output":[]}}"#.utf8
+		)))
+		XCTAssertEqual(failed, .init(status: .failed, code: .insufficientQuota))
+	}
+
+	@MainActor
+	func testQualificationEmitsStructuredProviderErrorBeforeTerminal() async throws {
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(
+				data: Data(), statusCode: 201, contentType: "application/sdp"
+			)),
+			mediaMode: .sendReceiveAudioEvidence
+		)
+		let events = connector.qualificationEvents
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			return [try await iterator.next(), try await iterator.next()]
+		}
+
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		connector.receiveInbound(Data(
+			#"{"type":"error","error":{"type":"server_error","code":"server_error","param":null,"event_id":"airbridge-qualification-response-create"}}"#.utf8
+		))
+		let evidence = WebRTCProviderErrorEvidence(
+			type: .server,
+			code: .serverError,
+			parameter: .none,
+			trigger: .responseCreate
+		)
+		let received = try await reader.value
+		XCTAssertEqual(received, [.connected, .providerError(evidence)])
+		await connector.closeAndSettle()
 	}
 
 	func testPartialSessionUpdateValidatesVoiceAndISO6391Language() throws {
@@ -637,6 +725,57 @@ final class WebRTCQualificationTests: XCTestCase {
 			XCTAssertTrue(offer.contains(expectedDirection))
 			await connector.closeAndSettle()
 		}
+	}
+
+	func testSyntheticQualificationAudioAcceptsOnlyBoundedPCM16Mono24kHz() throws {
+		XCTAssertNoThrow(try WebRTCConnectorQualificationSyntheticAudio(
+			pcm16Mono24kHz: Data(
+				repeating: 1,
+				count: WebRTCConnectorQualificationSyntheticAudio.minimumByteCount
+			)
+		))
+		XCTAssertThrowsError(try WebRTCConnectorQualificationSyntheticAudio(
+			pcm16Mono24kHz: Data(repeating: 1, count: 3)
+		))
+		XCTAssertThrowsError(try WebRTCConnectorQualificationSyntheticAudio(
+			pcm16Mono24kHz: Data(
+				repeating: 1,
+				count: WebRTCConnectorQualificationSyntheticAudio.maximumByteCount + 2
+			)
+		))
+	}
+
+	@MainActor
+	func testSyntheticQualificationUsesALocalNoDeviceRTPTrack() async throws {
+		let audio = try WebRTCConnectorQualificationSyntheticAudio(
+			pcm16Mono24kHz: Data(
+				repeating: 1,
+				count: WebRTCConnectorQualificationSyntheticAudio.minimumByteCount
+			)
+		)
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(
+				data: Data(), statusCode: 201, contentType: "application/sdp"
+			)),
+			terminalObserver: ConnectorTerminalProbe(
+				recordPermissionGranted: { false },
+				waitForLocalICEGathering: {}
+			).observer,
+			mediaMode: .syntheticSendReceiveAudioEvidence(audio)
+		)
+
+		XCTAssertTrue(connector.qualificationHasLocalAudioTrack)
+		XCTAssertTrue(connector.qualificationUsesManualAudioRendering)
+		try await connector.startQualificationSyntheticAudio()
+		let evidence = try await connector.qualificationSyntheticAudioEvidence()
+		XCTAssertTrue(evidence.started)
+		XCTAssertEqual(evidence.renderedFrameCount, 0)
+		XCTAssertEqual(evidence.totalFrameCount, audio.pcm16LittleEndian.count)
+		XCTAssertFalse(evidence.isComplete)
+		let offer = try await connector.makeOffer()
+		XCTAssertTrue(offer.contains("m=audio"))
+		XCTAssertTrue(offer.contains("a=sendrecv"))
+		await connector.closeAndSettle()
 	}
 
 	func testUnifiedPlanRemoteAudioDiagnosticRecognizesOnlyStreamsWithAudioTracks() {
