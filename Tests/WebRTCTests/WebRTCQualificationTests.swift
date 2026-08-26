@@ -405,9 +405,11 @@ final class WebRTCQualificationTests: XCTestCase {
 
 		let audioLifecyclePayloads = [
 			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"user","content":[{"type":"input_audio","transcript":"ignored"}]}}"#.utf8),
+			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"assistant","content":[]}}"#.utf8),
 			Data(#"{"type":"conversation.item.done","item":{"type":"message","role":"user","content":[{"type":"input_audio"}]}}"#.utf8),
+			Data(#"{"type":"conversation.item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}}"#.utf8),
 			Data(#"{"type":"response.created","response":{"output":[]}}"#.utf8),
-			Data(#"{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}}"#.utf8),
+			Data(#"{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[]}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_audio","transcript":"ignored"}]}}"#.utf8),
 			Data(#"{"type":"response.content_part.added","part":{"type":"output_audio"}}"#.utf8),
 			Data(#"{"type":"response.content_part.done","part":{"type":"output_audio","transcript":"ignored"}}"#.utf8),
@@ -443,6 +445,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			Data(#"{"type":"response.output_item.done","item":{"type":"function_call"}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"mcp_tool_call"}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text"}]}}"#.utf8),
+			Data(#"{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}}"#.utf8),
 			Data(#"{"type":"response.content_part.done","part":{"type":"text"}}"#.utf8),
 		]
 

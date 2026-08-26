@@ -666,17 +666,25 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "error": return .providerError
 				case let type where permitsKnownAudioLifecycleEvents && Self.knownSimpleAudioLifecycleEventTypes.contains(type):
 					return nil
-				case "conversation.item.added" where permitsKnownAudioLifecycleEvents,
-					"conversation.item.done" where permitsKnownAudioLifecycleEvents:
-					guard envelope.item?.isInputAudioMessage == true else { throw WebRTCTransportFailure.unsupportedEvent }
+				case "conversation.item.added" where permitsKnownAudioLifecycleEvents:
+					guard envelope.item?.isInputAudioMessage == true
+						|| envelope.item?.isOutputAudioMessageStart == true
+					else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
+				case "conversation.item.done" where permitsKnownAudioLifecycleEvents:
+					guard envelope.item?.isInputAudioMessage == true
+						|| envelope.item?.isOutputAudioMessage == true
+					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "response.created" where permitsKnownAudioLifecycleEvents:
 					guard let response = envelope.response, response.output?.isEmpty != false else {
 						throw WebRTCTransportFailure.unsupportedEvent
 					}
 					return nil
-				case "response.output_item.added" where permitsKnownAudioLifecycleEvents,
-					"response.output_item.done" where permitsKnownAudioLifecycleEvents:
+				case "response.output_item.added" where permitsKnownAudioLifecycleEvents:
+					guard envelope.item?.isOutputAudioMessageStart == true else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
+				case "response.output_item.done" where permitsKnownAudioLifecycleEvents:
 					guard envelope.item?.isOutputAudioMessage == true else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "response.content_part.added" where permitsKnownAudioLifecycleEvents,
@@ -758,6 +766,10 @@ public struct WebRTCInboundEventDecoder: Sendable {
 
 		var isOutputAudioMessage: Bool {
 			type == "message" && role == "assistant" && hasOnlyContent(type: "output_audio")
+		}
+
+		var isOutputAudioMessageStart: Bool {
+			type == "message" && role == "assistant" && content?.isEmpty == true
 		}
 
 		private func hasOnlyContent(type expectedType: String) -> Bool {
