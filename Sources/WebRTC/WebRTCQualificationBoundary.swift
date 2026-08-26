@@ -170,10 +170,23 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	public init() {}
 
 	public func encoded() throws -> Data {
-		try JSONEncoder().encode(Event(type: "response.create"))
+		try JSONEncoder().encode(Event(type: "response.create", response: Response()))
 	}
 
-	private struct Event: Encodable { let type: String }
+	private struct Event: Encodable {
+		let type: String
+		let response: Response
+	}
+
+	private struct Response: Encodable {
+		let outputModalities = ["audio"]
+		let maximumOutputTokens = 64
+
+		private enum CodingKeys: String, CodingKey {
+			case outputModalities = "output_modalities"
+			case maximumOutputTokens = "max_output_tokens"
+		}
+	}
 }
 
 public struct WebRTCSignalingRequest: Sendable {

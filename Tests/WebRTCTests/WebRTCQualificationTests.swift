@@ -200,11 +200,16 @@ final class WebRTCQualificationTests: XCTestCase {
 		)
 	}
 
-	func testOpenAIQualificationResponseCreateIsMinimal() throws {
+	func testOpenAIQualificationResponseCreateIsBoundedAndAudioOnly() throws {
 		let object = try XCTUnwrap(JSONSerialization.jsonObject(
 			with: OpenAIWebRTCQualificationResponseCreate().encoded()
-		) as? [String: String])
-		XCTAssertEqual(object, ["type": "response.create"])
+		) as? [String: Any])
+		XCTAssertEqual(Set(object.keys), ["type", "response"])
+		XCTAssertEqual(object["type"] as? String, "response.create")
+		let response = try XCTUnwrap(object["response"] as? [String: Any])
+		XCTAssertEqual(Set(response.keys), ["output_modalities", "max_output_tokens"])
+		XCTAssertEqual(response["output_modalities"] as? [String], ["audio"])
+		XCTAssertEqual(response["max_output_tokens"] as? Int, 64)
 	}
 
 	func testPartialSessionUpdateValidatesVoiceAndISO6391Language() throws {
