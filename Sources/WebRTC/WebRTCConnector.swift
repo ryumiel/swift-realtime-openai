@@ -397,6 +397,7 @@ import FoundationNetworking
 		let retentionToken: AnyObject?
 	}
 	private var preReadyInboundEvents: [PreReadyInboundEvent] = []
+	private var qualificationSessionCreatedObserved = false
 
 	private static let factory: LKRTCPeerConnectionFactory = {
 		LKRTCInitializeSSL()
@@ -1025,6 +1026,14 @@ extension WebRTCConnector {
 		guard lifecycle.isCurrent(generation) else { return }
 		terminalObserver.didDrainInbound()
 		do {
+			if deliveryMode == .qualification,
+				!qualificationSessionCreatedObserved,
+				try inboundEventDecoder.isSessionCreatedForConnector(data)
+			{
+				qualificationSessionCreatedObserved = true
+				yieldQualification(.sessionCreated, fromAcceptedIngress: true)
+				return
+			}
 			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }
 			if inboundEvent == .providerError {
 				requestTerminalFromAcceptedIngress(WebRTCTransportFailure.providerError)

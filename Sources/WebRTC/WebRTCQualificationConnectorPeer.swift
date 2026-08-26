@@ -6,6 +6,7 @@ import Foundation
 /// offer/answer, event, command, and teardown boundary in focused tests.
 @_spi(AirbridgeQualification) public enum WebRTCConnectorQualificationEvent: Sendable, Equatable {
 	case connected
+	case sessionCreated
 	case inbound(WebRTCInboundEvent)
 	case terminal
 }

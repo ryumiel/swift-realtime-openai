@@ -258,6 +258,17 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		try decode(data, permitsKnownAudioLifecycleEvents: true)
 	}
 
+	package func isSessionCreatedForConnector(_ data: Data) throws -> Bool {
+		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
+			throw WebRTCTransportFailure.eventTooLarge
+		}
+		do {
+			return try JSONDecoder().decode(EventTypeEnvelope.self, from: data).type == "session.created"
+		} catch {
+			throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
 	private func decode(
 		_ data: Data,
 		permitsKnownAudioLifecycleEvents: Bool
@@ -341,6 +352,8 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		let response: ResponseEnvelope?
 		let session: SessionEnvelope?
 	}
+
+	private struct EventTypeEnvelope: Decodable { let type: String }
 
 	private struct SessionEnvelope: Decodable {
 		let type: String?

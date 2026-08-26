@@ -287,6 +287,7 @@ final class WebRTCQualificationTests: XCTestCase {
 			var iterator = events.makeAsyncIterator()
 			do {
 				guard case .connected = try await iterator.next() else { return false }
+				guard case .sessionCreated = try await iterator.next() else { return false }
 				guard case .inbound(.responseFinished) = try await iterator.next() else { return false }
 				return true
 			} catch {
@@ -1055,6 +1056,9 @@ final class WebRTCQualificationTests: XCTestCase {
 			defer { readerProbe.markComplete() }
 			var iterator = qualification.makeAsyncIterator()
 			do {
+				guard case .sessionCreated = try await iterator.next() else {
+					return .unexpected
+				}
 				_ = try await iterator.next()
 				return TerminalObservation.unexpected
 			} catch let failure as WebRTCTransportFailure {
