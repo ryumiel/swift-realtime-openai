@@ -245,6 +245,32 @@ final class WebRTCQualificationTests: XCTestCase {
 	}
 
 	@MainActor
+	func testNoMicrophoneQualificationEmitsCommitAndResponseAcknowledgements() async throws {
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(
+				data: Data(), statusCode: 201, contentType: "application/sdp"
+			)),
+			mediaMode: .sendReceiveAudioEvidence
+		)
+		let events = connector.qualificationEvents
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			return [
+				try await iterator.next(),
+				try await iterator.next(),
+				try await iterator.next(),
+			]
+		}
+
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		connector.receiveInbound(Data(#"{"type":"input_audio_buffer.committed"}"#.utf8))
+		connector.receiveInbound(Data(#"{"type":"response.created","response":{"output":[]}}"#.utf8))
+		let received = try await reader.value
+		XCTAssertEqual(received, [.connected, .inputAudioCommitted, .responseCreated])
+		await connector.closeAndSettle()
+	}
+
+	@MainActor
 	func testNoMicrophoneQualificationEmitsContentFreeSessionUpdated() async throws {
 		let connector = try WebRTCConnector.createQualification(
 			session: StubSession(response: .init(

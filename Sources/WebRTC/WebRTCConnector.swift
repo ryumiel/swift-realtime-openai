@@ -1082,6 +1082,20 @@ extension WebRTCConnector {
 				yieldQualification(.sessionUpdated, fromAcceptedIngress: true)
 				return
 			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				try inboundEventDecoder.isInputAudioCommittedForConnector(data)
+			{
+				yieldQualification(.inputAudioCommitted, fromAcceptedIngress: true)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				try inboundEventDecoder.isResponseCreatedForConnector(data)
+			{
+				yieldQualification(.responseCreated, fromAcceptedIngress: true)
+				return
+			}
 			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }
 			if inboundEvent == .providerError {
 				requestTerminalFromAcceptedIngress(WebRTCTransportFailure.providerError)

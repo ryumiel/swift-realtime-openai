@@ -355,6 +355,25 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		try hasEventType("session.updated", data: data)
 	}
 
+	package func isInputAudioCommittedForConnector(_ data: Data) throws -> Bool {
+		try hasEventType("input_audio_buffer.committed", data: data)
+	}
+
+	package func isResponseCreatedForConnector(_ data: Data) throws -> Bool {
+		guard try hasEventType("response.created", data: data) else { return false }
+		do {
+			let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+			guard let response = envelope.response, response.output?.isEmpty != false else {
+				throw WebRTCTransportFailure.unsupportedEvent
+			}
+			return true
+		} catch let failure as WebRTCTransportFailure {
+			throw failure
+		} catch {
+			throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
 	private func hasEventType(_ expectedType: String, data: Data) throws -> Bool {
 		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
 			throw WebRTCTransportFailure.eventTooLarge

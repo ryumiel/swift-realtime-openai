@@ -8,6 +8,8 @@ import Foundation
 	case connected
 	case sessionCreated
 	case sessionUpdated
+	case inputAudioCommitted
+	case responseCreated
 	case inbound(WebRTCInboundEvent)
 	case terminal
 }
