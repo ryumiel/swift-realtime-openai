@@ -513,6 +513,33 @@ final class WebRTCQualificationTests: XCTestCase {
 		await connector.closeAndSettle()
 	}
 
+	@MainActor
+	func testNoMicrophoneQualificationControlsExposeExactAudioDirections() async throws {
+		let cases: [(WebRTCConnectorQualificationMediaMode, String)] = [
+			(.inactiveAudioEvidence, "a=inactive"),
+			(.sendReceiveAudioEvidence, "a=sendrecv"),
+		]
+		for (mediaMode, expectedDirection) in cases {
+			let connector = try WebRTCConnector.createQualification(
+				session: StubSession(response: .init(
+					data: Data(), statusCode: 201, contentType: "application/sdp"
+				)),
+				terminalObserver: ConnectorTerminalProbe(
+					recordPermissionGranted: { false },
+					waitForLocalICEGathering: {}
+				).observer,
+				mediaMode: mediaMode
+			)
+
+			XCTAssertFalse(connector.qualificationHasLocalAudioTrack)
+			XCTAssertTrue(connector.qualificationUsesManualAudioRendering)
+			let offer = try await connector.makeOffer()
+			XCTAssertTrue(offer.contains("m=audio"))
+			XCTAssertTrue(offer.contains(expectedDirection))
+			await connector.closeAndSettle()
+		}
+	}
+
 	func testUnifiedPlanRemoteAudioDiagnosticRecognizesOnlyStreamsWithAudioTracks() {
 		let factory = LKRTCPeerConnectionFactory()
 		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))

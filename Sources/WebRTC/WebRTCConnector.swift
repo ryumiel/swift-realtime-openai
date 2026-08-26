@@ -352,6 +352,8 @@ import FoundationNetworking
 	public enum WebRTCError: Error {
 		case missingAudioPermission
 		case failedToConfigureQualificationAudio
+		case failedToCreateInactiveAudioTransceiver
+		case failedToCreateSendReceiveAudioTransceiver
 		case failedToCreateReceiveOnlyAudioTransceiver
 		case failedToCreateDataChannel
 		case failedToCreatePeerConnection
@@ -433,7 +435,10 @@ import FoundationNetworking
 		diagnosticDispatcher = DiagnosticDispatcher(sink: diagnosticSink)
 		generation = lifecycle.begin()
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self, bufferingPolicy: .bufferingOldest(0))
-		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorQualificationEvent.self, bufferingPolicy: .bufferingOldest(2))
+		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(
+			of: WebRTCConnectorQualificationEvent.self,
+			bufferingPolicy: .bufferingOldest(2)
+		)
 		(ingressEvents, ingressStream) = AsyncThrowingStream.makeStream(
 			of: Data.self,
 			bufferingPolicy: .bufferingOldest(Self.inboundMailboxCapacity)
@@ -610,7 +615,7 @@ import FoundationNetworking
 		-> WebRTCConnectorQualificationAudioEvidence
 	{
 		guard lifecycle.isCurrent(generation),
-			qualificationMediaMode == .receiveOnlyAudioEvidence
+			qualificationMediaMode != .production
 		else { throw WebRTCTransportFailure.invalidRequest }
 		let evidence = await withCheckedContinuation { continuation in
 			connection.statistics { report in
@@ -759,7 +764,7 @@ extension WebRTCConnector {
 		switch qualificationMediaMode {
 		case .production:
 			connectionFactory = factory
-		case .receiveOnlyAudioEvidence:
+		case .inactiveAudioEvidence, .sendReceiveAudioEvidence, .receiveOnlyAudioEvidence:
 			connectionFactory = LKRTCPeerConnectionFactory(
 				audioDeviceModuleType: .audioEngine,
 				bypassVoiceProcessing: true,
@@ -784,6 +789,20 @@ extension WebRTCConnector {
 		switch qualificationMediaMode {
 		case .production:
 			audioTrack = Self.setupLocalAudio(for: connection, connectionFactory: connectionFactory)
+		case .inactiveAudioEvidence:
+			audioTrack = nil
+			let configuration = LKRTCRtpTransceiverInit()
+			configuration.direction = .inactive
+			guard connection.addTransceiver(of: .audio, init: configuration) != nil else {
+				throw WebRTCError.failedToCreateInactiveAudioTransceiver
+			}
+		case .sendReceiveAudioEvidence:
+			audioTrack = nil
+			let configuration = LKRTCRtpTransceiverInit()
+			configuration.direction = .sendRecv
+			guard connection.addTransceiver(of: .audio, init: configuration) != nil else {
+				throw WebRTCError.failedToCreateSendReceiveAudioTransceiver
+			}
 		case .receiveOnlyAudioEvidence:
 			audioTrack = nil
 			let configuration = LKRTCRtpTransceiverInit()

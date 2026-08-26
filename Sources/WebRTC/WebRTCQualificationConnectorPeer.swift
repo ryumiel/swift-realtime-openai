@@ -15,6 +15,10 @@ import Foundation
 @_spi(AirbridgeQualification) public enum WebRTCConnectorQualificationMediaMode: Sendable, Equatable {
 	/// Preserve the production connector's local microphone track and ordinary playout.
 	case production
+	/// Negotiate an inactive audio section with no local track or device playout.
+	case inactiveAudioEvidence
+	/// Negotiate send/receive audio with no local track and suppress device playout.
+	case sendReceiveAudioEvidence
 	/// Negotiate receive-only audio, create no local track, and suppress device playout.
 	case receiveOnlyAudioEvidence
 }
