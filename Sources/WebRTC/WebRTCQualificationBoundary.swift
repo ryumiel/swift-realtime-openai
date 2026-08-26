@@ -689,7 +689,7 @@ public struct WebRTCInboundEventDecoder: Sendable {
 					return nil
 				case "response.content_part.added" where permitsKnownAudioLifecycleEvents,
 					"response.content_part.done" where permitsKnownAudioLifecycleEvents:
-					guard envelope.part?.type == "output_audio" else { throw WebRTCTransportFailure.unsupportedEvent }
+					guard envelope.part?.isOutputAudio == true else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				default: throw WebRTCTransportFailure.unsupportedEvent
 			}
@@ -765,7 +765,8 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		}
 
 		var isOutputAudioMessage: Bool {
-			type == "message" && role == "assistant" && hasOnlyContent(type: "output_audio")
+			type == "message" && role == "assistant"
+				&& hasOnlyContent(types: ["audio", "output_audio"])
 		}
 
 		var isOutputAudioMessageStart: Bool {
@@ -773,12 +774,22 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		}
 
 		private func hasOnlyContent(type expectedType: String) -> Bool {
+			hasOnlyContent(types: [expectedType])
+		}
+
+		private func hasOnlyContent(types expectedTypes: Set<String>) -> Bool {
 			guard let content, !content.isEmpty else { return false }
-			return content.allSatisfy { $0.type == expectedType }
+			return content.allSatisfy { expectedTypes.contains($0.type) }
 		}
 	}
 
-	private struct ContentEnvelope: Decodable { let type: String }
+	private struct ContentEnvelope: Decodable {
+		let type: String
+
+		var isOutputAudio: Bool {
+			type == "audio" || type == "output_audio"
+		}
+	}
 	private struct ResponseEnvelope: Decodable {
 		let output: [ItemEnvelope]?
 		let status: String?

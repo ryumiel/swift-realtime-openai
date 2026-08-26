@@ -411,14 +411,21 @@ final class WebRTCQualificationTests: XCTestCase {
 			Data(#"{"type":"response.created","response":{"output":[]}}"#.utf8),
 			Data(#"{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[]}}"#.utf8),
 			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_audio","transcript":"ignored"}]}}"#.utf8),
+			Data(#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"audio","transcript":"ignored"}]}}"#.utf8),
 			Data(#"{"type":"response.content_part.added","part":{"type":"output_audio"}}"#.utf8),
 			Data(#"{"type":"response.content_part.done","part":{"type":"output_audio","transcript":"ignored"}}"#.utf8),
+			Data(#"{"type":"response.content_part.added","part":{"type":"audio"}}"#.utf8),
+			Data(#"{"type":"response.content_part.done","part":{"type":"audio","transcript":"ignored"}}"#.utf8),
 		]
 		for payload in audioLifecyclePayloads {
 			XCTAssertNil(try decoder.decodeForConnector(payload))
 		}
 		XCTAssertEqual(
 			try decoder.decodeForConnector(Data(#"{"type":"response.done","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}]}}"#.utf8)),
+			.responseFinished
+		)
+		XCTAssertEqual(
+			try decoder.decodeForConnector(Data(#"{"type":"response.done","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"audio"}]}]}}"#.utf8)),
 			.responseFinished
 		)
 
