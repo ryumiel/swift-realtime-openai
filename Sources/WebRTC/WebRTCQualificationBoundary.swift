@@ -316,6 +316,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 
 	public enum EventType: String, Equatable, Sendable {
 		case conversationItemAdded = "conversation.item.added"
+		case conversationItemCreated = "conversation.item.created"
 		case conversationItemDone = "conversation.item.done"
 		case responseCreated = "response.created"
 		case responseOutputItemAdded = "response.output_item.added"
@@ -323,6 +324,9 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 		case responseContentPartAdded = "response.content_part.added"
 		case responseContentPartDone = "response.content_part.done"
 		case responseOutputAudioTranscriptDone = "response.output_audio_transcript.done"
+		case responseAudioDelta = "response.audio.delta"
+		case responseOutputTextDelta = "response.output_text.delta"
+		case responseOutputTextDone = "response.output_text.done"
 		case responseDone = "response.done"
 		case unknown
 	}
@@ -711,7 +715,8 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "error": return .providerError
 				case let type where permitsKnownAudioLifecycleEvents && Self.knownSimpleAudioLifecycleEventTypes.contains(type):
 					return nil
-				case "conversation.item.added" where permitsKnownAudioLifecycleEvents:
+				case "conversation.item.added" where permitsKnownAudioLifecycleEvents,
+					"conversation.item.created" where permitsKnownAudioLifecycleEvents:
 					guard envelope.item?.isInputAudioMessage == true
 						|| envelope.item?.isOutputAudioMessageStart == true
 						|| envelope.item?.isOutputAudioMessage == true
@@ -758,7 +763,10 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		"conversation.item.input_audio_transcription.delta",
 		"conversation.item.input_audio_transcription.segment",
 		"response.output_audio_transcript.delta",
+		"response.output_text.delta",
+		"response.output_text.done",
 		"response.output_audio.delta",
+		"response.audio.delta",
 		"response.output_audio.done",
 		"rate_limits.updated",
 	]

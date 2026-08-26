@@ -411,7 +411,10 @@ final class WebRTCQualificationTests: XCTestCase {
 			"conversation.item.input_audio_transcription.delta",
 			"conversation.item.input_audio_transcription.segment",
 			"response.output_audio_transcript.delta",
+			"response.output_text.delta",
+			"response.output_text.done",
 			"response.output_audio.delta",
+			"response.audio.delta",
 			"response.output_audio.done",
 			"rate_limits.updated",
 		]
@@ -424,6 +427,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		let audioLifecyclePayloads = [
 			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"user","content":[{"type":"input_audio","transcript":"ignored"}]}}"#.utf8),
 			Data(#"{"type":"conversation.item.added","item":{"type":"message","role":"assistant","content":[]}}"#.utf8),
+			Data(#"{"type":"conversation.item.created","item":{"type":"message","role":"assistant","content":[]}}"#.utf8),
 			Data(#"{"type":"conversation.item.done","item":{"type":"message","role":"user","content":[{"type":"input_audio"}]}}"#.utf8),
 			Data(#"{"type":"conversation.item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_audio"}]}}"#.utf8),
 			Data(#"{"type":"response.created","response":{"output":[]}}"#.utf8),
