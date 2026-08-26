@@ -228,6 +228,128 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(response["max_output_tokens"] as? Int, 256)
 	}
 
+	func testOpenAIQualificationFunctionRequestIsOneFixedNoArgumentTool() throws {
+		let object = try XCTUnwrap(JSONSerialization.jsonObject(
+			with: OpenAIWebRTCQualificationFunctionRequest().encoded()
+		) as? [String: Any])
+		XCTAssertEqual(Set(object.keys), ["event_id", "type", "response"])
+		XCTAssertEqual(
+			object["event_id"] as? String,
+			OpenAIWebRTCQualificationFunctionRequest.eventID
+		)
+		XCTAssertEqual(object["type"] as? String, "response.create")
+		let response = try XCTUnwrap(object["response"] as? [String: Any])
+		XCTAssertEqual(Set(response.keys), [
+			"conversation", "input", "instructions", "output_modalities", "tools",
+			"tool_choice", "max_output_tokens",
+		])
+		XCTAssertEqual(response["conversation"] as? String, "auto")
+		XCTAssertEqual(response["tool_choice"] as? String, "required")
+		XCTAssertEqual(response["output_modalities"] as? [String], ["audio"])
+		XCTAssertEqual(response["max_output_tokens"] as? Int, 256)
+		let tools = try XCTUnwrap(response["tools"] as? [[String: Any]])
+		XCTAssertEqual(tools.count, 1)
+		XCTAssertEqual(tools[0]["type"] as? String, "function")
+		XCTAssertEqual(
+			tools[0]["name"] as? String,
+			OpenAIWebRTCQualificationFunctionRequest.functionName
+		)
+		let parameters = try XCTUnwrap(tools[0]["parameters"] as? [String: Any])
+		XCTAssertEqual(parameters["type"] as? String, "object")
+		XCTAssertEqual((parameters["properties"] as? [String: Any])?.count, 0)
+		XCTAssertEqual((parameters["required"] as? [String])?.count, 0)
+		XCTAssertEqual(parameters["additionalProperties"] as? Bool, false)
+	}
+
+	func testOpenAIQualificationFunctionOutputAndFinalResponseAreFixedAndBounded() throws {
+		let callID = "call_qualification"
+		let outputObject = try XCTUnwrap(JSONSerialization.jsonObject(
+			with: OpenAIWebRTCQualificationFunctionOutput(callID: callID).encoded()
+		) as? [String: Any])
+		XCTAssertEqual(Set(outputObject.keys), ["event_id", "type", "item"])
+		XCTAssertEqual(
+			outputObject["event_id"] as? String,
+			OpenAIWebRTCQualificationFunctionOutput.eventID
+		)
+		let item = try XCTUnwrap(outputObject["item"] as? [String: Any])
+		XCTAssertEqual(item["type"] as? String, "function_call_output")
+		XCTAssertEqual(item["call_id"] as? String, callID)
+		XCTAssertEqual(
+			item["output"] as? String,
+			OpenAIWebRTCQualificationFunctionOutput.fixedOutput
+		)
+		XCTAssertThrowsError(
+			try OpenAIWebRTCQualificationFunctionOutput(callID: "bad call id")
+		)
+
+		let finalObject = try XCTUnwrap(JSONSerialization.jsonObject(
+			with: OpenAIWebRTCQualificationFunctionFinalResponse().encoded()
+		) as? [String: Any])
+		let response = try XCTUnwrap(finalObject["response"] as? [String: Any])
+		XCTAssertEqual(response["instructions"] as? String, "Say exactly the single word ready.")
+		XCTAssertEqual(response["tools"] as? [String], [])
+		XCTAssertEqual(response["tool_choice"] as? String, "none")
+		XCTAssertEqual(response["output_modalities"] as? [String], ["audio"])
+		XCTAssertEqual(response["max_output_tokens"] as? Int, 256)
+	}
+
+	func testQualificationFunctionDecoderAcceptsOnlyExactCallAndFixedResult() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		let call = try XCTUnwrap(decoder.qualificationFunctionCallEvidenceForConnector(Data(
+			#"{"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","status":"completed","name":"airbridge_qualification_value","call_id":"call_qualification","arguments":"{}"}]}}"#.utf8
+		)))
+		XCTAssertEqual(call.callID, "call_qualification")
+		XCTAssertNil(try decoder.qualificationFunctionCallEvidenceForConnector(Data(
+			#"{"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","status":"completed","name":"other","call_id":"call_qualification","arguments":"{}"}]}}"#.utf8
+		)))
+		XCTAssertNil(try decoder.qualificationFunctionCallEvidenceForConnector(Data(
+			#"{"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","status":"completed","name":"airbridge_qualification_value","call_id":"call_qualification","arguments":"{\"private\":true}"}]}}"#.utf8
+		)))
+
+		let output = try XCTUnwrap(decoder.qualificationFunctionOutputEvidenceForConnector(Data(
+			#"{"type":"conversation.item.created","item":{"type":"function_call_output","call_id":"call_qualification","output":"{\"value\":\"ready\"}"}}"#.utf8
+		)))
+		XCTAssertEqual(output.callID, call.callID)
+		XCTAssertNil(try decoder.qualificationFunctionOutputEvidenceForConnector(Data(
+			#"{"type":"conversation.item.created","item":{"type":"function_call_output","call_id":"call_qualification","output":"private"}}"#.utf8
+		)))
+	}
+
+	@MainActor
+	func testQualificationEmitsBoundedFunctionCallAndOutputAcknowledgement() async throws {
+		let connector = try WebRTCConnector.createQualification(
+			session: StubSession(response: .init(
+				data: Data(), statusCode: 201, contentType: "application/sdp"
+			)),
+			mediaMode: .sendReceiveAudioEvidence
+		)
+		let events = connector.qualificationEvents
+		let reader = Task { @MainActor in
+			var iterator = events.makeAsyncIterator()
+			return [
+				try await iterator.next(),
+				try await iterator.next(),
+				try await iterator.next(),
+			]
+		}
+
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		connector.receiveInbound(Data(
+			#"{"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","status":"completed","name":"airbridge_qualification_value","call_id":"call_qualification","arguments":"{}"}]}}"#.utf8
+		))
+		connector.receiveInbound(Data(
+			#"{"type":"conversation.item.created","item":{"type":"function_call_output","call_id":"call_qualification","output":"{\"value\":\"ready\"}"}}"#.utf8
+		))
+		let call = try WebRTCQualificationFunctionCallEvidence(callID: "call_qualification")
+		let output = try WebRTCQualificationFunctionOutputEvidence(callID: "call_qualification")
+		let received = try await reader.value
+		XCTAssertEqual(
+			received,
+			[.connected, .functionCall(call), .functionOutputCreated(output)]
+		)
+		await connector.closeAndSettle()
+	}
+
 	func testProviderErrorEvidenceRetainsOnlyAllowlistedContentFreeFields() throws {
 		let decoder = WebRTCInboundEventDecoder()
 		let evidence = try XCTUnwrap(decoder.providerErrorEvidenceForConnector(Data(
@@ -693,6 +815,7 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(evidence.receivedByteCount, 12)
 		XCTAssertEqual(evidence.receivedSampleCount, 34)
 		XCTAssertTrue(evidence.hasReceivedAudio)
+		XCTAssertFalse(evidence.hasDecodedNonSilentAudio)
 		XCTAssertFalse(evidence.limitExceeded)
 
 		let capped = WebRTCConnector.audioEvidence(from: [
@@ -711,6 +834,28 @@ final class WebRTCQualificationTests: XCTestCase {
 			WebRTCConnectorQualificationAudioEvidence.maximumReportedSampleCount
 		)
 		XCTAssertTrue(capped.limitExceeded)
+	}
+
+	func testDecodedAudioEvidenceCountsOnlyCappedContentFreeFacts() {
+		let counter = WebRTCQualificationDecodedAudioCounter()
+		counter.observe(frameCount: 12, nonZeroByteCount: 3)
+		var evidence = counter.evidence()
+		XCTAssertEqual(evidence.decodedFrameCount, 12)
+		XCTAssertEqual(evidence.nonZeroDecodedByteCount, 3)
+		XCTAssertTrue(evidence.hasDecodedNonSilentAudio)
+		XCTAssertFalse(evidence.limitExceeded)
+
+		counter.observe(frameCount: UInt64.max, nonZeroByteCount: UInt64.max)
+		evidence = counter.evidence()
+		XCTAssertEqual(
+			evidence.decodedFrameCount,
+			WebRTCConnectorQualificationAudioEvidence.maximumDecodedFrameCount
+		)
+		XCTAssertEqual(
+			evidence.nonZeroDecodedByteCount,
+			WebRTCConnectorQualificationAudioEvidence.maximumNonZeroDecodedByteCount
+		)
+		XCTAssertTrue(evidence.limitExceeded)
 	}
 
 	@MainActor

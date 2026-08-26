@@ -34,9 +34,11 @@ import LiveKitWebRTC
 final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceModuleDelegate, @unchecked Sendable {
 	private static let outputSampleRate = 48_000.0
 	private let renderer: Renderer
+	private let decodedAudioCounter = WebRTCQualificationDecodedAudioCounter()
 	private let sourceFormat: AVAudioFormat
 	private weak var configuredEngine: AVAudioEngine?
 	private var sourceNode: AVAudioSourceNode?
+	private var sinkNode: AVAudioSinkNode?
 
 	init(audio: WebRTCConnectorQualificationSyntheticAudio) throws {
 		guard let sourceFormat = AVAudioFormat(
@@ -56,6 +58,10 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 
 	func evidence() -> WebRTCConnectorQualificationSyntheticAudioEvidence {
 		renderer.evidence()
+	}
+
+	func decodedAudioEvidence() -> WebRTCConnectorQualificationAudioEvidence {
+		decodedAudioCounter.evidence()
 	}
 
 	func stop() {
@@ -89,12 +95,28 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 
 	func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
-		engine _: AVAudioEngine,
-		configureOutputFromSource _: AVAudioNode,
-		toDestination _: AVAudioNode?,
-		format _: AVAudioFormat,
+		engine: AVAudioEngine,
+		configureOutputFromSource source: AVAudioNode,
+		toDestination destination: AVAudioNode?,
+		format: AVAudioFormat,
 		context _: [AnyHashable: Any]
-	) -> Int { 0 }
+	) -> Int {
+		guard destination == nil, engine.isInManualRenderingMode else { return -1 }
+		if let sinkNode {
+			engine.disconnectNodeInput(sinkNode)
+			engine.detach(sinkNode)
+		}
+		let decodedAudioCounter = decodedAudioCounter
+		let sinkNode = AVAudioSinkNode { _, frameCount, audioData in
+			decodedAudioCounter.observe(frameCount: frameCount, audioData: audioData)
+			return noErr
+		}
+		engine.attach(sinkNode)
+		engine.connect(source, to: sinkNode, format: format)
+		self.sinkNode = sinkNode
+		configuredEngine = engine
+		return 0
+	}
 
 	func audioDeviceModule(
 		_: LKRTCAudioDeviceModule,
@@ -127,8 +149,17 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 		isPlayoutEnabled _: Bool,
 		isRecordingEnabled _: Bool
 	) -> Int { 0 }
-	func audioDeviceModule(_: LKRTCAudioDeviceModule, willReleaseEngine _: AVAudioEngine) -> Int {
+	func audioDeviceModule(_: LKRTCAudioDeviceModule, willReleaseEngine engine: AVAudioEngine) -> Int {
+		if let sourceNode {
+			engine.disconnectNodeOutput(sourceNode)
+			engine.detach(sourceNode)
+		}
+		if let sinkNode {
+			engine.disconnectNodeInput(sinkNode)
+			engine.detach(sinkNode)
+		}
 		sourceNode = nil
+		sinkNode = nil
 		configuredEngine = nil
 		return 0
 	}
@@ -207,6 +238,83 @@ final class WebRTCQualificationSyntheticAudioSource: NSObject, LKRTCAudioDeviceM
 			}
 			buffers[0].mDataByteSize = UInt32(frameCount * MemoryLayout<Float>.size)
 			return noErr
+		}
+	}
+}
+
+/// Counts only capped, content-free facts from decoded PCM delivered by the
+/// manual audio graph. It never retains sample buffers or individual values.
+package final class WebRTCQualificationDecodedAudioCounter: @unchecked Sendable {
+	private let lock = NSLock()
+	private var decodedFrameCount: UInt64 = 0
+	private var nonZeroDecodedByteCount: UInt64 = 0
+	private var limitExceeded = false
+
+	package init() {}
+
+	package func observe(
+		frameCount: AVAudioFrameCount,
+		audioData: UnsafePointer<AudioBufferList>
+	) {
+		var observedNonZeroBytes: UInt64 = 0
+		let mutableAudioData = UnsafeMutablePointer(mutating: audioData)
+		for buffer in UnsafeMutableAudioBufferListPointer(mutableAudioData) {
+			guard let data = buffer.mData else { continue }
+			let bytes = UnsafeRawBufferPointer(
+				start: data,
+				count: Int(buffer.mDataByteSize)
+			)
+			for byte in bytes where byte != 0 {
+				observedNonZeroBytes += 1
+			}
+		}
+		observe(
+			frameCount: UInt64(frameCount),
+			nonZeroByteCount: observedNonZeroBytes
+		)
+	}
+
+	package func observe(frameCount: UInt64, nonZeroByteCount: UInt64) {
+		lock.lock()
+		defer { lock.unlock() }
+		Self.addCapped(
+			frameCount,
+			to: &decodedFrameCount,
+			limit: WebRTCConnectorQualificationAudioEvidence.maximumDecodedFrameCount,
+			limitExceeded: &limitExceeded
+		)
+		Self.addCapped(
+			nonZeroByteCount,
+			to: &nonZeroDecodedByteCount,
+			limit: WebRTCConnectorQualificationAudioEvidence.maximumNonZeroDecodedByteCount,
+			limitExceeded: &limitExceeded
+		)
+	}
+
+	package func evidence() -> WebRTCConnectorQualificationAudioEvidence {
+		lock.lock()
+		defer { lock.unlock() }
+		return .init(
+			receivedByteCount: 0,
+			receivedSampleCount: 0,
+			decodedFrameCount: decodedFrameCount,
+			nonZeroDecodedByteCount: nonZeroDecodedByteCount,
+			limitExceeded: limitExceeded
+		)
+	}
+
+	private static func addCapped(
+		_ value: UInt64,
+		to total: inout UInt64,
+		limit: UInt64,
+		limitExceeded: inout Bool
+	) {
+		let remaining = limit - total
+		if value > remaining {
+			total = limit
+			limitExceeded = true
+		} else {
+			total += value
 		}
 	}
 }

@@ -230,6 +230,121 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	}
 }
 
+/// One fixed, side-effect-free function request used only by Airbridge's
+/// qualification spike. The function accepts no arguments so provider content
+/// never crosses into an application capability.
+@_spi(AirbridgeQualification) public struct OpenAIWebRTCQualificationFunctionRequest: Equatable, Sendable {
+	public static let eventID = "airbridge-qualification-function-request"
+	public static let functionName = "airbridge_qualification_value"
+
+	public init() {}
+
+	public func encoded() throws -> Data {
+		try JSONSerialization.data(withJSONObject: [
+			"event_id": Self.eventID,
+			"type": "response.create",
+			"response": [
+				"conversation": "auto",
+				"input": [[
+					"type": "message",
+					"role": "user",
+					"content": [[
+						"type": "input_text",
+						"text": "Call the qualification function now.",
+					]],
+				]],
+				"instructions": "Call airbridge_qualification_value exactly once. Do not speak before receiving its result.",
+				"output_modalities": ["audio"],
+				"tools": [[
+					"type": "function",
+					"name": Self.functionName,
+					"description": "Return the fixed Airbridge qualification value.",
+					"parameters": [
+						"type": "object",
+						"properties": [:],
+						"required": [],
+						"additionalProperties": false,
+					],
+				]],
+				"tool_choice": "required",
+				"max_output_tokens": 256,
+			],
+		])
+	}
+}
+
+/// Fixed Airbridge-owned result for the one qualification function.
+@_spi(AirbridgeQualification) public struct OpenAIWebRTCQualificationFunctionOutput: Equatable, Sendable {
+	public static let eventID = "airbridge-qualification-function-output"
+	public static let fixedOutput = #"{"value":"ready"}"#
+	public let callID: String
+
+	public init(callID: String) throws {
+		guard OpenAIWebRTCQualificationFunctionContract.isValidCallID(callID) else {
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		self.callID = callID
+	}
+
+	public func encoded() throws -> Data {
+		try JSONSerialization.data(withJSONObject: [
+			"event_id": Self.eventID,
+			"type": "conversation.item.create",
+			"item": [
+				"type": "function_call_output",
+				"call_id": callID,
+				"output": Self.fixedOutput,
+			],
+		])
+	}
+}
+
+/// Final bounded spoken response after the fixed result is acknowledged.
+@_spi(AirbridgeQualification) public struct OpenAIWebRTCQualificationFunctionFinalResponse: Equatable, Sendable {
+	public static let eventID = "airbridge-qualification-function-final-response"
+
+	public init() {}
+
+	public func encoded() throws -> Data {
+		try JSONSerialization.data(withJSONObject: [
+			"event_id": Self.eventID,
+			"type": "response.create",
+			"response": [
+				"instructions": "Say exactly the single word ready.",
+				"output_modalities": ["audio"],
+				"tools": [],
+				"tool_choice": "none",
+				"max_output_tokens": 256,
+			],
+		])
+	}
+}
+
+package enum OpenAIWebRTCQualificationFunctionContract {
+	static let maximumCallIDBytes = 128
+	static let maximumArgumentBytes = 64
+
+	static func isValidCallID(_ callID: String) -> Bool {
+		guard (1...maximumCallIDBytes).contains(callID.utf8.count) else { return false }
+		return callID.utf8.allSatisfy {
+			(48...57).contains($0)
+				|| (65...90).contains($0)
+				|| (97...122).contains($0)
+				|| $0 == 45
+				|| $0 == 95
+		}
+	}
+
+	static func hasExactEmptyArguments(_ arguments: String) -> Bool {
+		guard arguments.utf8.count <= maximumArgumentBytes,
+			let data = arguments.data(using: .utf8),
+			let object = try? JSONSerialization.jsonObject(with: data),
+			let dictionary = object as? [String: Any]
+		else { return false }
+		return dictionary.isEmpty
+	}
+}
+
 /// Content-free classifications retained from a provider `error` event.
 ///
 /// Raw provider strings and messages never cross this boundary. Only exact,
@@ -271,6 +386,9 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 		case inputAudioCommit = "input_audio_buffer.commit"
 		case responseCreate = "response.create"
 		case outputControl = "output-control response.create"
+		case functionRequest = "function response.create"
+		case functionOutput = "function_call_output conversation.item.create"
+		case functionFinalResponse = "function final response.create"
 		case none
 		case unknown
 	}
@@ -307,6 +425,31 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	}
 }
 
+/// Operation-local identifier from the one allowlisted qualification call.
+/// The fixed name and empty arguments are validated before this crosses SPI.
+@_spi(AirbridgeQualification) public struct WebRTCQualificationFunctionCallEvidence: Equatable, Sendable {
+	public let callID: String
+
+	public init(callID: String) throws {
+		guard OpenAIWebRTCQualificationFunctionContract.isValidCallID(callID) else {
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		self.callID = callID
+	}
+}
+
+/// Acknowledgement that the fixed result was added with the same bounded ID.
+@_spi(AirbridgeQualification) public struct WebRTCQualificationFunctionOutputEvidence: Equatable, Sendable {
+	public let callID: String
+
+	public init(callID: String) throws {
+		guard OpenAIWebRTCQualificationFunctionContract.isValidCallID(callID) else {
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		self.callID = callID
+	}
+}
+
 /// Allowlisted, content-free evidence for a qualification decoder failure.
 @_spi(AirbridgeQualification) public struct WebRTCProtocolFailureEvidence: Equatable, Sendable {
 	public enum Kind: String, Equatable, Sendable {
@@ -327,6 +470,8 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 		case responseAudioDelta = "response.audio.delta"
 		case responseOutputTextDelta = "response.output_text.delta"
 		case responseOutputTextDone = "response.output_text.done"
+		case responseFunctionCallArgumentsDelta = "response.function_call_arguments.delta"
+		case responseFunctionCallArgumentsDone = "response.function_call_arguments.done"
 		case outputAudioBufferStarted = "output_audio_buffer.started"
 		case outputAudioBufferStopped = "output_audio_buffer.stopped"
 		case outputAudioBufferCleared = "output_audio_buffer.cleared"
@@ -601,6 +746,10 @@ public struct WebRTCInboundEventDecoder: Sendable {
 			case "airbridge-qualification-input-audio-commit": trigger = .inputAudioCommit
 			case OpenAIWebRTCQualificationResponseCreate.eventID: trigger = .responseCreate
 			case OpenAIWebRTCQualificationOutputControl.eventID: trigger = .outputControl
+			case OpenAIWebRTCQualificationFunctionRequest.eventID: trigger = .functionRequest
+			case OpenAIWebRTCQualificationFunctionOutput.eventID: trigger = .functionOutput
+			case OpenAIWebRTCQualificationFunctionFinalResponse.eventID:
+				trigger = .functionFinalResponse
 			case nil: trigger = .none
 			default: trigger = .unknown
 			}
@@ -650,6 +799,48 @@ public struct WebRTCInboundEventDecoder: Sendable {
 			default: code = .unknown
 			}
 			return .init(status: status, code: code)
+		} catch let failure as WebRTCTransportFailure {
+			throw failure
+		} catch {
+			throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
+	package func qualificationFunctionCallEvidenceForConnector(
+		_ data: Data
+	) throws -> WebRTCQualificationFunctionCallEvidence? {
+		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
+			throw WebRTCTransportFailure.eventTooLarge
+		}
+		do {
+			let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+			guard envelope.type == "response.done",
+				let response = envelope.response,
+				response.status == "completed",
+				let output = response.output,
+				output.count == 1,
+				let evidence = try output[0].qualificationFunctionCallEvidence()
+			else { return nil }
+			return evidence
+		} catch let failure as WebRTCTransportFailure {
+			throw failure
+		} catch {
+			throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
+	package func qualificationFunctionOutputEvidenceForConnector(
+		_ data: Data
+	) throws -> WebRTCQualificationFunctionOutputEvidence? {
+		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
+			throw WebRTCTransportFailure.eventTooLarge
+		}
+		do {
+			let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+			guard envelope.type == "conversation.item.created",
+				let evidence = try envelope.item?.qualificationFunctionOutputEvidence()
+			else { return nil }
+			return evidence
 		} catch let failure as WebRTCTransportFailure {
 			throw failure
 		} catch {
@@ -710,9 +901,14 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "response.done":
 					if permitsKnownAudioLifecycleEvents {
 						guard let response = envelope.response,
-							let output = response.output,
-							output.allSatisfy(\.isOutputAudioMessage)
+							let output = response.output
 						else { throw WebRTCTransportFailure.unsupportedEvent }
+						let isFunctionCall = output.count == 1
+							? (try output[0].qualificationFunctionCallEvidence()) != nil
+							: false
+						guard output.allSatisfy(\.isOutputAudioMessage) || isFunctionCall else {
+							throw WebRTCTransportFailure.unsupportedEvent
+						}
 					}
 					return .responseFinished
 				case "error": return .providerError
@@ -720,14 +916,22 @@ public struct WebRTCInboundEventDecoder: Sendable {
 					return nil
 				case "conversation.item.added" where permitsKnownAudioLifecycleEvents,
 					"conversation.item.created" where permitsKnownAudioLifecycleEvents:
+					let isFunctionOutput = try envelope.item?
+						.qualificationFunctionOutputEvidence() != nil
 					guard envelope.item?.isInputAudioMessage == true
 						|| envelope.item?.isOutputAudioMessageStart == true
 						|| envelope.item?.isOutputAudioMessage == true
+						|| envelope.item?.isQualificationFunctionCall == true
+						|| isFunctionOutput
 					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "conversation.item.done" where permitsKnownAudioLifecycleEvents:
+					let isFunctionOutput = try envelope.item?
+						.qualificationFunctionOutputEvidence() != nil
 					guard envelope.item?.isInputAudioMessage == true
 						|| envelope.item?.isOutputAudioMessage == true
+						|| envelope.item?.isQualificationFunctionCall == true
+						|| isFunctionOutput
 					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "response.created" where permitsKnownAudioLifecycleEvents:
@@ -738,10 +942,28 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "response.output_item.added" where permitsKnownAudioLifecycleEvents:
 					guard envelope.item?.isOutputAudioMessageStart == true
 						|| envelope.item?.isOutputAudioMessage == true
+						|| envelope.item?.isQualificationFunctionCallStart == true
+						|| envelope.item?.isQualificationFunctionCall == true
 					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "response.output_item.done" where permitsKnownAudioLifecycleEvents:
-					guard envelope.item?.isOutputAudioMessage == true else { throw WebRTCTransportFailure.unsupportedEvent }
+					guard envelope.item?.isOutputAudioMessage == true
+						|| envelope.item?.isQualificationFunctionCall == true
+					else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
+				case "response.function_call_arguments.delta" where permitsKnownAudioLifecycleEvents:
+					guard let callID = envelope.callID,
+						OpenAIWebRTCQualificationFunctionContract.isValidCallID(callID),
+						let delta = envelope.delta,
+						delta.utf8.count <= OpenAIWebRTCQualificationFunctionContract.maximumArgumentBytes
+					else { throw WebRTCTransportFailure.unsupportedEvent }
+					return nil
+				case "response.function_call_arguments.done" where permitsKnownAudioLifecycleEvents:
+					guard let callID = envelope.callID,
+						OpenAIWebRTCQualificationFunctionContract.isValidCallID(callID),
+						let arguments = envelope.arguments,
+						OpenAIWebRTCQualificationFunctionContract.hasExactEmptyArguments(arguments)
+					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "response.content_part.added" where permitsKnownAudioLifecycleEvents,
 					"response.content_part.done" where permitsKnownAudioLifecycleEvents:
@@ -780,11 +1002,27 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	private struct Envelope: Decodable {
 		let type: String
 		let transcript: String?
+		let callID: String?
+		let arguments: String?
+		let delta: String?
 		let error: ErrorEnvelope?
 		let item: ItemEnvelope?
 		let part: ContentEnvelope?
 		let response: ResponseEnvelope?
 		let session: SessionEnvelope?
+
+		private enum CodingKeys: String, CodingKey {
+			case type
+			case transcript
+			case callID = "call_id"
+			case arguments
+			case delta
+			case error
+			case item
+			case part
+			case response
+			case session
+		}
 	}
 
 	private struct ErrorEnvelope: Decodable {
@@ -820,7 +1058,23 @@ public struct WebRTCInboundEventDecoder: Sendable {
 	private struct ItemEnvelope: Decodable {
 		let type: String
 		let role: String?
+		let status: String?
+		let name: String?
+		let callID: String?
+		let arguments: String?
+		let output: String?
 		let content: [ContentEnvelope]?
+
+		private enum CodingKeys: String, CodingKey {
+			case type
+			case role
+			case status
+			case name
+			case callID = "call_id"
+			case arguments
+			case output
+			case content
+		}
 
 		var isInputAudioMessage: Bool {
 			type == "message" && role == "user" && hasOnlyContent(type: "input_audio")
@@ -833,6 +1087,41 @@ public struct WebRTCInboundEventDecoder: Sendable {
 
 		var isOutputAudioMessageStart: Bool {
 			type == "message" && role == "assistant" && content?.isEmpty == true
+		}
+
+		var isQualificationFunctionCallStart: Bool {
+			type == "function_call"
+				&& status == "in_progress"
+				&& name == OpenAIWebRTCQualificationFunctionRequest.functionName
+				&& callID.map(OpenAIWebRTCQualificationFunctionContract.isValidCallID) == true
+				&& (arguments == nil || arguments == "")
+		}
+
+		var isQualificationFunctionCall: Bool {
+			(try? qualificationFunctionCallEvidence()) != nil
+		}
+
+		func qualificationFunctionCallEvidence() throws
+			-> WebRTCQualificationFunctionCallEvidence?
+		{
+			guard type == "function_call",
+				status == "completed",
+				name == OpenAIWebRTCQualificationFunctionRequest.functionName,
+				let callID,
+				let arguments,
+				OpenAIWebRTCQualificationFunctionContract.hasExactEmptyArguments(arguments)
+			else { return nil }
+			return try .init(callID: callID)
+		}
+
+		func qualificationFunctionOutputEvidence() throws
+			-> WebRTCQualificationFunctionOutputEvidence?
+		{
+			guard type == "function_call_output",
+				let callID,
+				output == OpenAIWebRTCQualificationFunctionOutput.fixedOutput
+			else { return nil }
+			return try .init(callID: callID)
 		}
 
 		private func hasOnlyContent(type expectedType: String) -> Bool {

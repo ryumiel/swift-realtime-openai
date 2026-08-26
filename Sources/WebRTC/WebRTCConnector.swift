@@ -576,6 +576,32 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
 	}
 
+	@_spi(AirbridgeQualification) public func requestOpenAIQualificationFunction() throws {
+		guard qualificationMediaMode != .production,
+			isCurrentAndAcceptingProgression(), dataChannel.readyState == .open
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let event = OpenAIWebRTCQualificationFunctionRequest()
+		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
+	}
+
+	@_spi(AirbridgeQualification) public func sendOpenAIQualificationFunctionOutput(
+		callID: String
+	) throws {
+		guard qualificationMediaMode != .production,
+			isCurrentAndAcceptingProgression(), dataChannel.readyState == .open
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let event = try OpenAIWebRTCQualificationFunctionOutput(callID: callID)
+		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
+	}
+
+	@_spi(AirbridgeQualification) public func sendOpenAIQualificationFunctionFinalResponse() throws {
+		guard qualificationMediaMode != .production,
+			isCurrentAndAcceptingProgression(), dataChannel.readyState == .open
+		else { throw WebRTCTransportFailure.invalidRequest }
+		let event = OpenAIWebRTCQualificationFunctionFinalResponse()
+		try dataChannel.sendData(LKRTCDataBuffer(data: event.encoded(), isBinary: false))
+	}
+
 	public func disconnect() {
 		requestTerminal()
 	}
@@ -652,7 +678,7 @@ import FoundationNetworking
 		guard lifecycle.isCurrent(generation),
 			qualificationMediaMode != .production
 		else { throw WebRTCTransportFailure.invalidRequest }
-		let evidence = await withCheckedContinuation { continuation in
+		let transportEvidence = await withCheckedContinuation { continuation in
 			connection.statistics { report in
 				continuation.resume(returning: Self.audioEvidence(
 					from: report.statistics.values.map { statistic in
@@ -664,7 +690,15 @@ import FoundationNetworking
 		guard lifecycle.isCurrent(generation) else {
 			throw WebRTCTransportFailure.cancelled
 		}
-		return evidence
+		let decodedEvidence = qualificationSyntheticAudioSource?.decodedAudioEvidence()
+		return .init(
+			receivedByteCount: transportEvidence.receivedByteCount,
+			receivedSampleCount: transportEvidence.receivedSampleCount,
+			decodedFrameCount: decodedEvidence?.decodedFrameCount ?? 0,
+			nonZeroDecodedByteCount: decodedEvidence?.nonZeroDecodedByteCount ?? 0,
+			limitExceeded: transportEvidence.limitExceeded
+				|| decodedEvidence?.limitExceeded == true
+		)
 	}
 
 	@_spi(AirbridgeQualification) public func clearOpenAIQualificationInputAudio() async throws {
@@ -1182,10 +1216,26 @@ extension WebRTCConnector {
 			}
 			if deliveryMode == .qualification,
 				qualificationMediaMode != .production,
+				let evidence = try inboundEventDecoder
+					.qualificationFunctionOutputEvidenceForConnector(data)
+			{
+				yieldQualification(.functionOutputCreated(evidence), fromAcceptedIngress: true)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
 				let evidence = try inboundEventDecoder.providerErrorEvidenceForConnector(data)
 			{
 				yieldQualification(.providerError(evidence), fromAcceptedIngress: true)
 				requestTerminalFromAcceptedIngress(WebRTCTransportFailure.providerError)
+				return
+			}
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				let evidence = try inboundEventDecoder
+					.qualificationFunctionCallEvidenceForConnector(data)
+			{
+				yieldQualification(.functionCall(evidence), fromAcceptedIngress: true)
 				return
 			}
 			if deliveryMode == .qualification,
