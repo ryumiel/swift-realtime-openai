@@ -804,18 +804,21 @@ final class WebRTCQualificationTests: XCTestCase {
 			(type: "inbound-rtp", values: [
 				"kind": NSString(string: "video"),
 				"bytesReceived": NSNumber(value: 999),
+				"totalAudioEnergy": NSNumber(value: 999),
 			]),
 			(type: "inbound-rtp", values: [
 				"mediaType": NSString(string: "audio"),
 				"bytesReceived": NSNumber(value: 12),
 				"totalSamplesReceived": NSNumber(value: 34),
+				"totalAudioEnergy": NSNumber(value: 0.125),
 			]),
 		])
 
 		XCTAssertEqual(evidence.receivedByteCount, 12)
 		XCTAssertEqual(evidence.receivedSampleCount, 34)
+		XCTAssertEqual(evidence.totalAudioEnergy, 0.125)
 		XCTAssertTrue(evidence.hasReceivedAudio)
-		XCTAssertFalse(evidence.hasDecodedNonSilentAudio)
+		XCTAssertTrue(evidence.hasDecodedNonSilentAudio)
 		XCTAssertFalse(evidence.limitExceeded)
 
 		let capped = WebRTCConnector.audioEvidence(from: [
@@ -823,6 +826,7 @@ final class WebRTCQualificationTests: XCTestCase {
 				"kind": NSString(string: "audio"),
 				"bytesReceived": NSNumber(value: UInt64.max),
 				"totalSamplesReceived": NSNumber(value: UInt64.max),
+				"totalAudioEnergy": NSNumber(value: Double.greatestFiniteMagnitude),
 			]),
 		])
 		XCTAssertEqual(
@@ -833,7 +837,24 @@ final class WebRTCQualificationTests: XCTestCase {
 			capped.receivedSampleCount,
 			WebRTCConnectorQualificationAudioEvidence.maximumReportedSampleCount
 		)
+		XCTAssertEqual(
+			capped.totalAudioEnergy,
+			WebRTCConnectorQualificationAudioEvidence.maximumTotalAudioEnergy
+		)
 		XCTAssertTrue(capped.limitExceeded)
+	}
+
+	func testQualificationAudioEvidenceRejectsInvalidEnergy() {
+		for value in [Double.nan, Double.infinity, -1] {
+			let evidence = WebRTCConnector.audioEvidence(from: [
+				(type: "inbound-rtp", values: [
+					"kind": NSString(string: "audio"),
+					"totalAudioEnergy": NSNumber(value: value),
+				]),
+			])
+			XCTAssertEqual(evidence.totalAudioEnergy, 0)
+			XCTAssertTrue(evidence.limitExceeded)
+		}
 	}
 
 	func testDecodedAudioEvidenceCountsOnlyCappedContentFreeFacts() {

@@ -38,11 +38,13 @@ import Foundation
 @_spi(AirbridgeQualification) public struct WebRTCConnectorQualificationAudioEvidence: Sendable, Equatable {
 	public static let maximumReportedByteCount: UInt64 = 16 * 1024 * 1024
 	public static let maximumReportedSampleCount: UInt64 = 1_000_000
+	public static let maximumTotalAudioEnergy: Double = 1_000_000
 	public static let maximumDecodedFrameCount: UInt64 = 1_000_000
 	public static let maximumNonZeroDecodedByteCount: UInt64 = 16 * 1024 * 1024
 
 	public let receivedByteCount: UInt64
 	public let receivedSampleCount: UInt64
+	public let totalAudioEnergy: Double
 	public let decodedFrameCount: UInt64
 	public let nonZeroDecodedByteCount: UInt64
 	public let limitExceeded: Bool
@@ -52,18 +54,25 @@ import Foundation
 	}
 
 	public var hasDecodedNonSilentAudio: Bool {
-		decodedFrameCount > 0 && nonZeroDecodedByteCount > 0
+		(receivedSampleCount > 0 && totalAudioEnergy > 0)
+			|| (decodedFrameCount > 0 && nonZeroDecodedByteCount > 0)
 	}
 
 	public init(
 		receivedByteCount: UInt64,
 		receivedSampleCount: UInt64,
+		totalAudioEnergy: Double = 0,
 		decodedFrameCount: UInt64 = 0,
 		nonZeroDecodedByteCount: UInt64 = 0,
 		limitExceeded: Bool
 	) {
 		self.receivedByteCount = min(receivedByteCount, Self.maximumReportedByteCount)
 		self.receivedSampleCount = min(receivedSampleCount, Self.maximumReportedSampleCount)
+		if totalAudioEnergy.isFinite, totalAudioEnergy >= 0 {
+			self.totalAudioEnergy = min(totalAudioEnergy, Self.maximumTotalAudioEnergy)
+		} else {
+			self.totalAudioEnergy = 0
+		}
 		self.decodedFrameCount = min(decodedFrameCount, Self.maximumDecodedFrameCount)
 		self.nonZeroDecodedByteCount = min(
 			nonZeroDecodedByteCount,
@@ -72,6 +81,9 @@ import Foundation
 		self.limitExceeded = limitExceeded
 			|| receivedByteCount > Self.maximumReportedByteCount
 			|| receivedSampleCount > Self.maximumReportedSampleCount
+			|| !totalAudioEnergy.isFinite
+			|| totalAudioEnergy < 0
+			|| totalAudioEnergy > Self.maximumTotalAudioEnergy
 			|| decodedFrameCount > Self.maximumDecodedFrameCount
 			|| nonZeroDecodedByteCount > Self.maximumNonZeroDecodedByteCount
 	}

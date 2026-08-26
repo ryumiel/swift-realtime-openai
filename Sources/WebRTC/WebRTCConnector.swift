@@ -697,6 +697,7 @@ import FoundationNetworking
 		return .init(
 			receivedByteCount: transportEvidence.receivedByteCount,
 			receivedSampleCount: transportEvidence.receivedSampleCount,
+			totalAudioEnergy: transportEvidence.totalAudioEnergy,
 			decodedFrameCount: decodedEvidence?.decodedFrameCount ?? 0,
 			nonZeroDecodedByteCount: decodedEvidence?.nonZeroDecodedByteCount ?? 0,
 			limitExceeded: transportEvidence.limitExceeded
@@ -735,6 +736,7 @@ import FoundationNetworking
 	) -> WebRTCConnectorQualificationAudioEvidence {
 		var byteCount: UInt64 = 0
 		var sampleCount: UInt64 = 0
+		var totalAudioEnergy: Double = 0
 		var limitExceeded = false
 		for statistic in statistics where statistic.type == "inbound-rtp" {
 			let kind = statistic.values["kind"] as? String
@@ -752,10 +754,22 @@ import FoundationNetworking
 				limit: WebRTCConnectorQualificationAudioEvidence.maximumReportedSampleCount,
 				limitExceeded: &limitExceeded
 			)
+			if let reportedEnergy = statistic.values["totalAudioEnergy"] {
+				Self.addCapped(
+					Self.nonnegativeDoubleValue(
+						reportedEnergy,
+						limitExceeded: &limitExceeded
+					),
+					to: &totalAudioEnergy,
+					limit: WebRTCConnectorQualificationAudioEvidence.maximumTotalAudioEnergy,
+					limitExceeded: &limitExceeded
+				)
+			}
 		}
 		return WebRTCConnectorQualificationAudioEvidence(
 			receivedByteCount: byteCount,
 			receivedSampleCount: sampleCount,
+			totalAudioEnergy: totalAudioEnergy,
 			limitExceeded: limitExceeded
 		)
 	}
@@ -767,10 +781,40 @@ import FoundationNetworking
 		return number.uint64Value
 	}
 
+	nonisolated private static func nonnegativeDoubleValue(
+		_ value: NSObject,
+		limitExceeded: inout Bool
+	) -> Double {
+		guard let number = value as? NSNumber else {
+			limitExceeded = true
+			return 0
+		}
+		let result = number.doubleValue
+		guard result.isFinite, result >= 0 else {
+			limitExceeded = true
+			return 0
+		}
+		return result
+	}
+
 	nonisolated private static func addCapped(
 		_ value: UInt64,
 		to total: inout UInt64,
 		limit: UInt64,
+		limitExceeded: inout Bool
+	) {
+		guard value <= limit - total else {
+			total = limit
+			limitExceeded = true
+			return
+		}
+		total += value
+	}
+
+	nonisolated private static func addCapped(
+		_ value: Double,
+		to total: inout Double,
+		limit: Double,
 		limitExceeded: inout Bool
 	) {
 		guard value <= limit - total else {
