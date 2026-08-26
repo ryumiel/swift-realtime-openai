@@ -524,6 +524,9 @@ import FoundationNetworking
 		do { try await connection.setRemoteDescription(LKRTCSessionDescription(type: .answer, sdp: answer)) }
 		catch { throw WebRTCError.failedToSetRemoteDescription(error) }
 		guard acceptProgression(.remoteDescriptionInstalled) else { throw WebRTCTransportFailure.cancelled }
+		attachQualificationAudioRenderer(to: connection.receivers.compactMap {
+			$0.track as? LKRTCAudioTrack
+		})
 		if qualificationMediaMode == .production {
 			Self.configureAudioSession()
 		}
