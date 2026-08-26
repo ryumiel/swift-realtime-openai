@@ -669,6 +669,7 @@ public struct WebRTCInboundEventDecoder: Sendable {
 				case "conversation.item.added" where permitsKnownAudioLifecycleEvents:
 					guard envelope.item?.isInputAudioMessage == true
 						|| envelope.item?.isOutputAudioMessageStart == true
+						|| envelope.item?.isOutputAudioMessage == true
 					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "conversation.item.done" where permitsKnownAudioLifecycleEvents:
@@ -682,7 +683,9 @@ public struct WebRTCInboundEventDecoder: Sendable {
 					}
 					return nil
 				case "response.output_item.added" where permitsKnownAudioLifecycleEvents:
-					guard envelope.item?.isOutputAudioMessageStart == true else { throw WebRTCTransportFailure.unsupportedEvent }
+					guard envelope.item?.isOutputAudioMessageStart == true
+						|| envelope.item?.isOutputAudioMessage == true
+					else { throw WebRTCTransportFailure.unsupportedEvent }
 					return nil
 				case "response.output_item.done" where permitsKnownAudioLifecycleEvents:
 					guard envelope.item?.isOutputAudioMessage == true else { throw WebRTCTransportFailure.unsupportedEvent }
