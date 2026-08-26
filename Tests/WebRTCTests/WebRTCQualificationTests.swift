@@ -261,6 +261,24 @@ final class WebRTCQualificationTests: XCTestCase {
 		XCTAssertEqual(failed, .init(status: .failed, code: .insufficientQuota))
 	}
 
+	func testProtocolFailureEvidenceRetainsOnlyAllowlistedEventTypes() throws {
+		let decoder = WebRTCInboundEventDecoder()
+		XCTAssertEqual(
+			decoder.protocolFailureEvidenceForConnector(
+				Data(#"{"type":"response.content_part.added","private":"detail"}"#.utf8),
+				failure: .unsupportedEvent
+			),
+			.init(kind: .unsupportedEvent, eventType: .responseContentPartAdded)
+		)
+		XCTAssertEqual(
+			decoder.protocolFailureEvidenceForConnector(
+				Data(#"{"type":"private.event","private":"detail"}"#.utf8),
+				failure: .malformedEvent
+			),
+			.init(kind: .malformedEvent, eventType: .unknown)
+		)
+	}
+
 	@MainActor
 	func testQualificationEmitsStructuredProviderErrorBeforeTerminal() async throws {
 		let connector = try WebRTCConnector.createQualification(

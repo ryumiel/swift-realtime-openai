@@ -307,6 +307,35 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	}
 }
 
+/// Allowlisted, content-free evidence for a qualification decoder failure.
+@_spi(AirbridgeQualification) public struct WebRTCProtocolFailureEvidence: Equatable, Sendable {
+	public enum Kind: String, Equatable, Sendable {
+		case malformedEvent = "malformed_event"
+		case unsupportedEvent = "unsupported_event"
+	}
+
+	public enum EventType: String, Equatable, Sendable {
+		case conversationItemAdded = "conversation.item.added"
+		case conversationItemDone = "conversation.item.done"
+		case responseCreated = "response.created"
+		case responseOutputItemAdded = "response.output_item.added"
+		case responseOutputItemDone = "response.output_item.done"
+		case responseContentPartAdded = "response.content_part.added"
+		case responseContentPartDone = "response.content_part.done"
+		case responseOutputAudioTranscriptDone = "response.output_audio_transcript.done"
+		case responseDone = "response.done"
+		case unknown
+	}
+
+	public let kind: Kind
+	public let eventType: EventType
+
+	public init(kind: Kind, eventType: EventType) {
+		self.kind = kind
+		self.eventType = eventType
+	}
+}
+
 public struct WebRTCSignalingRequest: Sendable {
 	public let endpoint: URL
 	public let model: String
@@ -619,6 +648,22 @@ public struct WebRTCInboundEventDecoder: Sendable {
 		} catch {
 			throw WebRTCTransportFailure.malformedEvent
 		}
+	}
+
+	package func protocolFailureEvidenceForConnector(
+		_ data: Data,
+		failure: WebRTCTransportFailure
+	) -> WebRTCProtocolFailureEvidence? {
+		let kind: WebRTCProtocolFailureEvidence.Kind
+		switch failure {
+		case .malformedEvent: kind = .malformedEvent
+		case .unsupportedEvent: kind = .unsupportedEvent
+		default: return nil
+		}
+		let rawType = (try? JSONDecoder().decode(EventTypeEnvelope.self, from: data))?.type
+		let eventType = rawType.flatMap(WebRTCProtocolFailureEvidence.EventType.init(rawValue:))
+			?? .unknown
+		return .init(kind: kind, eventType: eventType)
 	}
 
 	private func hasEventType(_ expectedType: String, data: Data) throws -> Bool {

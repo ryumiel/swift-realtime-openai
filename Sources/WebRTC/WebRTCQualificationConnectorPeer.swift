@@ -13,6 +13,7 @@ import Foundation
 	case responseCreated
 	case responseDone(WebRTCResponseCompletionEvidence)
 	case providerError(WebRTCProviderErrorEvidence)
+	case protocolFailure(WebRTCProtocolFailureEvidence)
 	case inbound(WebRTCInboundEvent)
 	case terminal
 }

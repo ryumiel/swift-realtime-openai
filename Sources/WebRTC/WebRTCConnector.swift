@@ -1215,6 +1215,15 @@ extension WebRTCConnector {
 			yieldInbound(inboundEvent)
 		}
 		catch let failure as WebRTCTransportFailure {
+			if deliveryMode == .qualification,
+				qualificationMediaMode != .production,
+				let evidence = inboundEventDecoder.protocolFailureEvidenceForConnector(
+					data,
+					failure: failure
+				)
+			{
+				yieldQualification(.protocolFailure(evidence), fromAcceptedIngress: true)
+			}
 			requestTerminalFromAcceptedIngress(failure)
 		} catch {
 			requestTerminalFromAcceptedIngress(WebRTCTransportFailure.malformedEvent)
