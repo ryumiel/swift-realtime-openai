@@ -43,6 +43,38 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	func closeAndJoin() async
 }
 
+/// Synchronously records whether caller cancellation beat terminal selection.
+/// Normal close remains a normal close, but a cancellation selected before any
+/// actor hop is preserved until settlement installs its public terminal.
+private final class ProductionTerminalSelection: @unchecked Sendable {
+	private enum State { case open, cancellation, selected }
+	private let lock = NSLock()
+	private var state: State = .open
+
+	func selectCancellation() -> Bool {
+		lock.withLock {
+			if case .open = state { state = .cancellation }
+			return state == .cancellation
+		}
+	}
+
+	func cancellationWins() -> Bool { lock.withLock { state == .cancellation } }
+
+	func failureForSettlement(_ failure: WebRTCTransportFailure?) -> WebRTCTransportFailure? {
+		lock.withLock {
+			switch state {
+			case .open:
+				state = failure == .cancelled ? .cancellation : .selected
+				return failure
+			case .cancellation:
+				return .cancelled
+			case .selected:
+				return failure == .cancelled ? nil : failure
+			}
+		}
+	}
+}
+
 /// Package-only deterministic test seam. It is not visible to normal imports.
 package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	case ready
@@ -91,6 +123,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	package let events: AsyncThrowingStream<WebRTCConnectorEvent, any Error>
 	private let stream: AsyncThrowingStream<WebRTCConnectorEvent, any Error>.Continuation
 	private let backing: any WebRTCConnectorPeerBacking
+	private let terminalSelection = ProductionTerminalSelection()
 	private var settlementTask: Task<Void, Never>?
 	private var offerOperation: Task<String, Error>?
 	private var answerOperation: Task<Void, Error>?
@@ -127,22 +160,25 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			let operation = Task { @MainActor [backing] in try await backing.makeOffer() }
 			offerOperation = operation
 			defer { offerOperation = nil }
+			let terminalSelection = terminalSelection
 			let offer = try await withTaskCancellationHandler {
 				try Task.checkCancellation()
 				let offer = try await operation.value
 				try Task.checkCancellation()
 				return offer
-			} onCancel: { [weak self] in
+			} onCancel: { [weak self, terminalSelection] in
 				operation.cancel()
-				Task { @MainActor [weak self] in await self?.beginSettlement(failure: .cancelled) }
+				let cancellationWins = terminalSelection.selectCancellation()
+				Task { @MainActor [weak self] in await self?.beginSettlement(failure: cancellationWins ? .cancelled : nil) }
 			}
 			guard !terminal else { throw WebRTCTransportFailure.cancelled }
 			guard !offer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WebRTCTransportFailure.invalidSDP }
 			offerMade = true
 			return offer
 		} catch {
-			if Task.isCancelled || (terminal && terminalFailure == .cancelled) {
-				await beginSettlement(failure: nil)
+			let cancellationWins = selectCallerCancellationIfNeeded()
+			if cancellationWins || (terminal && terminalFailure == nil) {
+				await beginSettlement(failure: cancellationWins ? .cancelled : nil)
 				throw WebRTCTransportFailure.cancelled
 			}
 			let failure = Self.contentFree(error)
@@ -162,13 +198,15 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			let operation = Task { @MainActor [backing] in try await backing.apply(answer: remoteAnswer) }
 			answerOperation = operation
 			defer { answerOperation = nil }
+			let terminalSelection = terminalSelection
 			try await withTaskCancellationHandler {
 				try Task.checkCancellation()
 				try await operation.value
 				try Task.checkCancellation()
-			} onCancel: { [weak self] in
+			} onCancel: { [weak self, terminalSelection] in
 				operation.cancel()
-				Task { @MainActor [weak self] in await self?.beginSettlement(failure: .cancelled) }
+				let cancellationWins = terminalSelection.selectCancellation()
+				Task { @MainActor [weak self] in await self?.beginSettlement(failure: cancellationWins ? .cancelled : nil) }
 			}
 			guard !terminal else { throw WebRTCTransportFailure.cancelled }
 			answerApplied = true
@@ -177,8 +215,9 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 				guard admitReady() else { throw WebRTCTransportFailure.malformedEvent }
 			}
 		} catch {
-			if Task.isCancelled || (terminal && terminalFailure == .cancelled) {
-				await beginSettlement(failure: nil)
+			let cancellationWins = selectCallerCancellationIfNeeded()
+			if cancellationWins || (terminal && terminalFailure == nil) {
+				await beginSettlement(failure: cancellationWins ? .cancelled : nil)
 				throw WebRTCTransportFailure.cancelled
 			}
 			let failure = Self.contentFree(error)
@@ -285,6 +324,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 
 	private func beginSettlement(failure: WebRTCTransportFailure?) async { await startSettlement(failure: failure).value }
 	@discardableResult private func startSettlement(failure: WebRTCTransportFailure?) -> Task<Void, Never> {
+		let failure = terminalSelection.failureForSettlement(failure)
 		if let settlementTask {
 			if terminalFailure == nil, let failure { terminalFailure = failure }
 			return settlementTask
@@ -315,6 +355,12 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		}
 		settlementTask = task
 		return task
+	}
+
+	private func selectCallerCancellationIfNeeded() -> Bool {
+		if terminalSelection.cancellationWins() { return true }
+		guard !terminal, Task.isCancelled else { return false }
+		return terminalSelection.selectCancellation()
 	}
 
 	fileprivate static func contentFree(_ error: any Error) -> WebRTCTransportFailure {

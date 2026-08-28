@@ -566,14 +566,14 @@ import FoundationNetworking
 		}
 		enqueueDiagnostic(.teardownBegan)
 		status = .disconnected
+		audioTrack.isEnabled = false
+		terminalObserver.disableAudio()
 		terminalObserver.cancelSignaling()
 		lifecycle.cancelSignalingTask()
 		dataChannel.close()
 		terminalObserver.closeData()
 		connection.close()
 		terminalObserver.closePeer()
-		audioTrack.isEnabled = false
-		terminalObserver.disableAudio()
 		Self.deactivateAudioSession()
 		preReadyInboundEvents.removeAll()
 		ingressStream.finish(throwing: failure)
