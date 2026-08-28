@@ -532,6 +532,40 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(backing.closeCount, 1)
 	}
 
+	@MainActor func testSuspendedExplicitCloseRejectsLaterCallerGuardsWithoutRewritingClosedTerminal() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		var iterator = peer.events.makeAsyncIterator()
+		let closeStarted = expectation(description: "explicit close selected before later caller guards")
+		backing.didStartClose = { closeStarted.fulfill() }
+		let close = Task { @MainActor [peer] in await peer.closeAndJoin() }
+		await fulfillment(of: [closeStarted], timeout: 0.1)
+
+		do {
+			_ = try await peer.makeOffer()
+			XCTFail("Later offer must remain method-local")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
+		do {
+			try await peer.apply(remoteAnswer: "answer")
+			XCTFail("Later answer must remain method-local")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidSDP)
+		}
+		XCTAssertThrowsError(try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
+		XCTAssertThrowsError(try peer.createResponse()) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
+
+		backing.resumeClose()
+		await close.value
+		let terminal = try await iterator.next()
+		XCTAssertEqual(terminal, .closed)
+	}
+
 	@MainActor func testMismatchedAndDuplicateAcknowledgementsFailClosedWithoutAnotherConnected() async throws {
 		let mismatchedBacking = FakeProductionBacking()
 		let mismatchedPeer = try WebRTCConnectorPeerFactory(makePeer: { mismatchedBacking }).makePeer()
