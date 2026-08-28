@@ -1,51 +1,35 @@
 import Core
 import Foundation
 
-/// The initial local-audio gate for an ordinary WebRTC peer.
-public enum WebRTCLocalAudioState: Sendable, Equatable {
-	case enabled
-	case disabled
-}
+public enum WebRTCLocalAudioState: Sendable, Equatable { case enabled, disabled }
 
-/// A validated initial provider session configuration.
+/// A validated LocalAI initial session configuration. OpenAI policy is added by
+/// the later provider-specific task; it is intentionally not constructible yet.
 public struct WebRTCSessionConfiguration: Sendable, Equatable {
-	fileprivate enum Provider: Sendable, Equatable {
-		case localAI(voice: String, language: String)
-		case openAI(language: String)
-	}
+	fileprivate let voice: String
+	fileprivate let language: String
 
-	fileprivate let provider: Provider
-
-	private init(provider: Provider) {
-		self.provider = provider
+	private init(voice: String, language: String) {
+		self.voice = voice
+		self.language = language
 	}
 
 	public static func localAI(voice: String, language: String) throws -> Self {
 		let update = try WebRTCSessionUpdate(voice: voice, language: language)
-		return Self(provider: .localAI(voice: update.voice, language: update.language))
-	}
-
-	/// The OpenAI case is reserved for the later provider-specific state machine.
-	public static func openAI(language: String) throws -> Self {
-		guard ["en", "ko", "ja"].contains(language) else {
-			throw WebRTCTransportFailure.invalidRequest
-		}
-		return Self(provider: .openAI(language: language))
+		return Self(voice: update.voice, language: update.language)
 	}
 }
 
-/// Content-safe events from an ordinary production peer.
 public enum WebRTCConnectorEvent: Sendable, Equatable {
-	case connected
+	case ready
 	case localAISessionConfigured(voice: String, language: String)
+	case connected
 	case userTranscript(String)
 	case assistantTranscript(String)
 	case responseFinished
 	case closed
 }
 
-/// The bounded production WebRTC lifecycle. It deliberately has no raw-provider
-/// event, injected-media, diagnostic, renderer, or statistics operation.
 @MainActor public protocol WebRTCConnectorPeer: Sendable {
 	var events: AsyncThrowingStream<WebRTCConnectorEvent, any Error> { get }
 	func makeOffer() async throws -> String
@@ -59,202 +43,209 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	func closeAndJoin() async
 }
 
-/// Creates exactly one real-media production peer with an explicit initial
-/// audio state. It intentionally offers no injected-peer construction.
+/// Package-only deterministic test seam. It is not visible to normal imports.
+package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
+	case ready
+	case inbound(WebRTCInboundEvent)
+}
+
+@MainActor package protocol WebRTCConnectorPeerBacking: Sendable {
+	var productionEvents: AsyncThrowingStream<WebRTCConnectorPeerBackingEvent, any Error> { get }
+	func makeOffer() async throws -> String
+	func apply(answer: String) async throws
+	func sendSessionUpdate(voice: String, language: String) throws
+	func sendProductionCommand(_ command: ProductionCommand) throws
+	func setLocalAudioState(_ state: WebRTCLocalAudioState)
+	func closeAndSettle() async
+}
+
 @MainActor public struct WebRTCConnectorPeerFactory: Sendable {
-	private let initialAudioState: WebRTCLocalAudioState
+	private let makePeerClosure: @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking
 
 	public init(initialAudioState: WebRTCLocalAudioState) {
-		self.initialAudioState = initialAudioState
+		makePeerClosure = { try WebRTCConnector.createProduction(initialAudioState: initialAudioState) }
+	}
+
+	package init(makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking) {
+		makePeerClosure = makePeer
 	}
 
 	public func makePeer() throws -> any WebRTCConnectorPeer {
-		try ProductionWebRTCConnectorPeer(
-			connector: WebRTCConnector.createProduction(initialAudioState: initialAudioState)
-		)
+		try ProductionWebRTCConnectorPeer(backing: makePeerClosure())
 	}
 }
 
-@MainActor private final class ProductionWebRTCConnectorPeer: WebRTCConnectorPeer, @unchecked Sendable {
-	let events: AsyncThrowingStream<WebRTCConnectorEvent, any Error>
+@MainActor package final class ProductionWebRTCConnectorPeer: WebRTCConnectorPeer, @unchecked Sendable {
+	package let events: AsyncThrowingStream<WebRTCConnectorEvent, any Error>
 	private let stream: AsyncThrowingStream<WebRTCConnectorEvent, any Error>.Continuation
-	private let connector: WebRTCConnector
+	private let backing: any WebRTCConnectorPeerBacking
 	private var forwardingTask: Task<Void, Never>?
+	private var settlementTask: Task<Void, Never>?
+	private var offerMade = false
+	private var answerApplied = false
+	private var ready = false
 	private var configuration: WebRTCSessionConfiguration?
 	private var connected = false
-	private var isClosed = false
+	private var terminal = false
 
-	init(connector: WebRTCConnector) {
-		self.connector = connector
-		(events, stream) = AsyncThrowingStream.makeStream(
-			of: WebRTCConnectorEvent.self,
-			bufferingPolicy: .bufferingOldest(2)
-		)
-		let inboundEvents = connector.events
-		forwardingTask = Task { [weak self, inboundEvents] in
+	init(backing: any WebRTCConnectorPeerBacking) {
+		self.backing = backing
+		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorEvent.self, bufferingPolicy: .bufferingOldest(2))
+		let source = backing.productionEvents
+		forwardingTask = Task { [weak self, source] in
 			do {
-				for try await event in inboundEvents {
-					guard !Task.isCancelled else { return }
-					await self?.receive(event)
+				for try await event in source {
+					guard !Task.isCancelled, await self?.receive(event) != false else { break }
 				}
-				self?.finish()
+				await self?.forwardingFinished(failure: nil)
 			} catch {
-				self?.finish(throwing: error)
+				await self?.forwardingFinished(failure: Self.contentFree(error))
 			}
 		}
 	}
 
-	func makeOffer() async throws -> String {
-		guard !isClosed else { throw WebRTCTransportFailure.cancelled }
-		return try await connector.makeOffer()
+	package func makeOffer() async throws -> String {
+		guard !terminal, !offerMade else {
+			await beginSettlement(failure: .invalidRequest)
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		do {
+			let offer = try await backing.makeOffer()
+			guard !offer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WebRTCTransportFailure.invalidSDP }
+			offerMade = true
+			return offer
+		} catch {
+			let failure = Self.contentFree(error)
+			await beginSettlement(failure: failure)
+			throw failure
+		}
 	}
 
-	func apply(remoteAnswer: String) async throws {
-		guard !isClosed, !remoteAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+	package func apply(remoteAnswer: String) async throws {
+		guard !terminal, offerMade, !answerApplied, !remoteAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+			await beginSettlement(failure: .invalidSDP)
 			throw WebRTCTransportFailure.invalidSDP
 		}
-		try await connector.apply(answer: remoteAnswer)
+		do {
+			try await backing.apply(answer: remoteAnswer)
+			answerApplied = true
+		} catch {
+			let failure = Self.contentFree(error)
+			await beginSettlement(failure: failure)
+			throw failure
+		}
 	}
 
-	func configure(_ configuration: WebRTCSessionConfiguration) throws {
-		guard !isClosed, self.configuration == nil else { throw WebRTCTransportFailure.invalidRequest }
-		switch configuration.provider {
-		case let .localAI(voice, language):
-			try connector.sendSessionUpdate(voice: voice, language: language)
+	package func configure(_ configuration: WebRTCSessionConfiguration) throws {
+		guard !terminal, offerMade, answerApplied, ready, self.configuration == nil else {
+			beginSettlement(failure: .invalidRequest)
+			throw WebRTCTransportFailure.invalidRequest
+		}
+		do {
+			try backing.sendSessionUpdate(voice: configuration.voice, language: configuration.language)
 			self.configuration = configuration
-		case .openAI:
-			throw WebRTCTransportFailure.unsupportedEvent
+		} catch {
+			let failure = Self.contentFree(error)
+			beginSettlement(failure: failure)
+			throw failure
 		}
 	}
 
-	func sendUserText(_ text: String) throws {
-		guard isReadyForCommands, Self.isValidText(text) else { throw WebRTCTransportFailure.invalidRequest }
-		try connector.sendProductionCommand(.userText(text))
+	package func sendUserText(_ text: String) throws {
+		guard isConnected, Self.isValidText(text) else { throw WebRTCTransportFailure.invalidRequest }
+		try backing.sendProductionCommand(.userText(text))
+	}
+	package func createResponse() throws { guard isConnected else { throw WebRTCTransportFailure.invalidRequest }; try backing.sendProductionCommand(.createResponse) }
+	package func cancelResponse() throws { guard isConnected else { throw WebRTCTransportFailure.invalidRequest }; try backing.sendProductionCommand(.cancelResponse) }
+	package func clearOutputAudio() throws { guard isConnected else { throw WebRTCTransportFailure.invalidRequest }; try backing.sendProductionCommand(.clearOutputAudio) }
+
+	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
+		guard !terminal, state == .disabled || connected else { return }
+		backing.setLocalAudioState(state)
 	}
 
-	func createResponse() throws {
-		guard isReadyForCommands else { throw WebRTCTransportFailure.invalidRequest }
-		try connector.sendProductionCommand(.createResponse)
-	}
+	package func closeAndJoin() async { await beginSettlement(failure: nil) }
+	private var isConnected: Bool { !terminal && connected }
 
-	func cancelResponse() throws {
-		guard isReadyForCommands else { throw WebRTCTransportFailure.invalidRequest }
-		try connector.sendProductionCommand(.cancelResponse)
-	}
-
-	func clearOutputAudio() throws {
-		guard isReadyForCommands else { throw WebRTCTransportFailure.invalidRequest }
-		try connector.sendProductionCommand(.clearOutputAudio)
-	}
-
-	func setLocalAudioState(_ state: WebRTCLocalAudioState) {
-		guard !isClosed else { return }
-		connector.setLocalAudioState(state)
-	}
-
-	func closeAndJoin() async {
-		guard !isClosed else {
-			await forwardingTask?.value
-			return
-		}
-		isClosed = true
-		connector.setLocalAudioState(.disabled)
-		await connector.closeAndSettle()
-		_ = stream.yield(.closed)
-		stream.finish()
-		forwardingTask?.cancel()
-		await forwardingTask?.value
-	}
-
-	private var isReadyForCommands: Bool {
-		!isClosed && connected && configuration != nil
-	}
-
-	private func receive(_ event: WebRTCInboundEvent) async {
-		guard !isClosed else { return }
+	private func receive(_ event: WebRTCConnectorPeerBackingEvent) async -> Bool {
+		guard !terminal else { return false }
 		switch event {
-		case let .sessionUpdated(voice, language):
-			guard case let .localAI(expectedVoice, expectedLanguage)? = configuration?.provider,
-				expectedVoice == voice, expectedLanguage == language
-			else {
-				await failClosed(.malformedEvent)
-				return
+		case .ready:
+			guard answerApplied, !ready, yield(.ready) else { await beginSettlement(failure: .malformedEvent); return false }
+			ready = true
+			return true
+		case let .inbound(inbound):
+			switch inbound {
+			case let .sessionUpdated(voice, language):
+				guard ready, let configuration, configuration.voice == voice, configuration.language == language,
+					yield(.localAISessionConfigured(voice: voice, language: language)), yield(.connected)
+				else { await beginSettlement(failure: .malformedEvent); return false }
+				connected = true
+				return true
+			case let .userTranscript(text): guard connected, yield(.userTranscript(text)) else { await beginSettlement(failure: .malformedEvent); return false }; return true
+			case let .assistantTranscript(text): guard connected, yield(.assistantTranscript(text)) else { await beginSettlement(failure: .malformedEvent); return false }; return true
+			case .responseFinished: guard connected, yield(.responseFinished) else { await beginSettlement(failure: .malformedEvent); return false }; return true
+			case .providerError: await beginSettlement(failure: .providerError); return false
 			}
-			guard yield(.localAISessionConfigured(voice: voice, language: language)) else { return }
-			connected = true
-			_ = yield(.connected)
-		case let .userTranscript(transcript):
-			guard connected else { await failClosed(.malformedEvent); return }
-			_ = yield(.userTranscript(transcript))
-		case let .assistantTranscript(transcript):
-			guard connected else { await failClosed(.malformedEvent); return }
-			_ = yield(.assistantTranscript(transcript))
-		case .responseFinished:
-			guard connected else { await failClosed(.malformedEvent); return }
-			_ = yield(.responseFinished)
-		case .providerError:
-			await failClosed(.providerError)
 		}
 	}
 
 	private func yield(_ event: WebRTCConnectorEvent) -> Bool {
 		switch stream.yield(event) {
 		case .enqueued: return true
-		case .dropped, .terminated:
-			Task { @MainActor [weak self] in await self?.failClosed(.ingressOverloaded) }
-			return false
-		@unknown default:
-			Task { @MainActor [weak self] in await self?.failClosed(.ingressOverloaded) }
-			return false
+		case .dropped, .terminated: beginSettlement(failure: .ingressOverloaded); return false
+		@unknown default: beginSettlement(failure: .ingressOverloaded); return false
 		}
 	}
 
-	private func failClosed(_ failure: WebRTCTransportFailure) async {
-		guard !isClosed else { return }
-		isClosed = true
-		connector.setLocalAudioState(.disabled)
-		await connector.closeAndSettle()
-		stream.finish(throwing: failure)
+	private func beginSettlement(failure: WebRTCTransportFailure?) async { await beginSettlement(failure: failure).value }
+	private func forwardingFinished(failure: WebRTCTransportFailure?) async {
+		guard !terminal else { return }
+		let _: Task<Void, Never> = beginSettlement(failure: failure)
 	}
-
-	private func finish(throwing error: (any Error)? = nil) {
-		guard !isClosed else { return }
-		isClosed = true
-		if let error { stream.finish(throwing: error) }
-		else {
-			_ = yield(.closed)
-			stream.finish()
+	@discardableResult private func beginSettlement(failure: WebRTCTransportFailure?) -> Task<Void, Never> {
+		if let settlementTask { return settlementTask }
+		terminal = true
+		let task = Task { @MainActor [weak self] in
+			guard let self else { return }
+			self.backing.setLocalAudioState(.disabled)
+			await self.backing.closeAndSettle()
+			self.forwardingTask?.cancel()
+			await self.forwardingTask?.value
+			if let failure { self.stream.finish(throwing: failure) }
+			else {
+				switch self.stream.yield(.closed) {
+				case .enqueued: self.stream.finish()
+				case .dropped, .terminated: self.stream.finish(throwing: WebRTCTransportFailure.ingressOverloaded)
+				@unknown default: self.stream.finish(throwing: WebRTCTransportFailure.ingressOverloaded)
+				}
+			}
 		}
+		settlementTask = task
+		return task
 	}
 
+	private static func contentFree(_ error: any Error) -> WebRTCTransportFailure { (error as? WebRTCTransportFailure) ?? .requestFailed }
 	private static func isValidText(_ text: String) -> Bool {
-		text == text.trimmingCharacters(in: .whitespacesAndNewlines)
-			&& !text.isEmpty
-			&& text.utf8.count <= 8 * 1024
+		text == text.trimmingCharacters(in: .whitespacesAndNewlines) && !text.isEmpty && text.utf8.count <= 8 * 1024
 			&& text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
 	}
 }
 
 package enum ProductionCommand: Encodable {
 	case userText(String)
-	case createResponse
-	case cancelResponse
-	case clearOutputAudio
-
+	case createResponse, cancelResponse, clearOutputAudio
 	func encoded() throws -> Data {
 		switch self {
-		case let .userText(text):
-			return try JSONEncoder().encode(UserTextEvent(type: "conversation.item.create", item: .init(
-				type: "message", role: "user", content: [.init(type: "input_text", text: text)]
-			)))
+		case let .userText(text): return try JSONEncoder().encode(UserTextEvent(type: "conversation.item.create", item: .init(id: Self.itemID(), type: "message", role: "user", status: "completed", content: [.init(type: "input_text", text: text)])))
 		case .createResponse: return try JSONEncoder().encode(TypeEvent(type: "response.create"))
 		case .cancelResponse: return try JSONEncoder().encode(TypeEvent(type: "response.cancel"))
 		case .clearOutputAudio: return try JSONEncoder().encode(TypeEvent(type: "output_audio_buffer.clear"))
 		}
 	}
-
+	private static func itemID() -> String { "item_" + UUID().uuidString.lowercased() }
 	private struct TypeEvent: Encodable { let type: String }
 	private struct UserTextEvent: Encodable { let type: String; let item: Item }
-	private struct Item: Encodable { let type: String; let role: String; let content: [Content] }
+	private struct Item: Encodable { let id: String; let type: String; let role: String; let status: String; let content: [Content] }
 	private struct Content: Encodable { let type: String; let text: String }
 }

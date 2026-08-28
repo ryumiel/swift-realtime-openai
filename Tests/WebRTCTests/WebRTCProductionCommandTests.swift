@@ -17,6 +17,13 @@ final class WebRTCProductionCommandTests: XCTestCase {
 			if expectedType == "conversation.item.create" {
 				let item = try XCTUnwrap(object["item"] as? [String: Any])
 				XCTAssertEqual(item["role"] as? String, "user")
+				XCTAssertEqual(item["type"] as? String, "message")
+				XCTAssertEqual(item["status"] as? String, "completed")
+				let identifier = try XCTUnwrap(item["id"] as? String)
+				XCTAssertTrue(identifier.hasPrefix("item_"))
+				XCTAssertLessThanOrEqual(identifier.utf8.count, 64)
+				let content = try XCTUnwrap(item["content"] as? [[String: String]])
+				XCTAssertEqual(content, [["type": "input_text", "text": "hello"]])
 			}
 		}
 	}

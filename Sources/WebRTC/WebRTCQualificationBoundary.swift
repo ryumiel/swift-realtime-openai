@@ -5,7 +5,7 @@ import FoundationNetworking
 #endif
 
 /// Limits untrusted provider bodies before decoding or retaining them.
-public enum WebRTCTransportLimits {
+@_spi(AirbridgeQualification) public enum WebRTCTransportLimits {
 	public static let maximumPayloadBytes = 256 * 1024
 }
 
@@ -77,7 +77,7 @@ public enum WebRTCTransportFailure: Error, Equatable, Sendable {
 	private struct Output: Encodable { let voice: String }
 }
 
-public struct WebRTCSignalingRequest: Sendable {
+@_spi(AirbridgeQualification) public struct WebRTCSignalingRequest: Sendable {
 	public let endpoint: URL
 	public let model: String
 	public let bearerToken: String?
@@ -112,7 +112,7 @@ public struct WebRTCSignalingRequest: Sendable {
 	}
 }
 
-public struct WebRTCSignalingHTTPResponse: Sendable {
+@_spi(AirbridgeQualification) public struct WebRTCSignalingHTTPResponse: Sendable {
 	public let data: Data
 	public let statusCode: Int
 	public let contentType: String?
@@ -124,12 +124,12 @@ public struct WebRTCSignalingHTTPResponse: Sendable {
 	}
 }
 
-public protocol WebRTCSignalingSession: Sendable {
+@_spi(AirbridgeQualification) public protocol WebRTCSignalingSession: Sendable {
 	func data(for request: URLRequest) async throws -> WebRTCSignalingHTTPResponse
 }
 
 /// The dedicated session never shares cookies, caches, credentials, or redirects.
-public final class URLSessionWebRTCSignalingSession: NSObject, WebRTCSignalingSession, @unchecked Sendable {
+@_spi(AirbridgeQualification) public final class URLSessionWebRTCSignalingSession: NSObject, WebRTCSignalingSession, @unchecked Sendable {
 	// URLSession delegate callbacks are serialized by Foundation; this wrapper only forwards
 	// immutable request/response values and rejects every redirect before it can be followed.
 	public static func configuration() -> URLSessionConfiguration {
@@ -185,12 +185,12 @@ public final class URLSessionWebRTCSignalingSession: NSObject, WebRTCSignalingSe
 	}
 }
 
-public struct WebRTCSignalingAnswer: Equatable, Sendable {
+@_spi(AirbridgeQualification) public struct WebRTCSignalingAnswer: Equatable, Sendable {
 	public let sdp: String
 	let sessionID: String
 }
 
-public struct WebRTCSignalingClient: Sendable {
+@_spi(AirbridgeQualification) public struct WebRTCSignalingClient: Sendable {
 	private let session: any WebRTCSignalingSession
 
 	public init(session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) {
@@ -244,7 +244,7 @@ public struct WebRTCSignalingClient: Sendable {
 	}
 }
 
-public struct WebRTCInboundEventDecoder: Sendable {
+@_spi(AirbridgeQualification) public struct WebRTCInboundEventDecoder: Sendable {
 	public init() {}
 
 	public func decode(_ data: Data) throws -> WebRTCInboundEvent {
@@ -380,7 +380,7 @@ public struct WebRTCInboundEventDecoder: Sendable {
 }
 
 /// Main-actor lifecycle identity and one terminal cleanup for the private connector.
-@MainActor public final class WebRTCLifecycle {
+@_spi(AirbridgeQualification) @MainActor public final class WebRTCLifecycle {
 	// The connector and every resource callback enter MainActor before touching this
 	// state. The signaling task never leaves this boundary; terminal cleanup is inline.
 	private var generation = 0
