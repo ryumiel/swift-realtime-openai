@@ -141,6 +141,10 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			offerMade = true
 			return offer
 		} catch {
+			if Task.isCancelled || (terminal && terminalFailure == .cancelled) {
+				await beginSettlement(failure: nil)
+				throw WebRTCTransportFailure.cancelled
+			}
 			let failure = Self.contentFree(error)
 			await beginSettlement(failure: failure)
 			throw failure
@@ -173,6 +177,10 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 				guard admitReady() else { throw WebRTCTransportFailure.malformedEvent }
 			}
 		} catch {
+			if Task.isCancelled || (terminal && terminalFailure == .cancelled) {
+				await beginSettlement(failure: nil)
+				throw WebRTCTransportFailure.cancelled
+			}
 			let failure = Self.contentFree(error)
 			await beginSettlement(failure: failure)
 			throw failure
