@@ -20,8 +20,8 @@ final class WebRTCProductionCommandTests: XCTestCase {
 				XCTAssertEqual(item["type"] as? String, "message")
 				XCTAssertEqual(item["status"] as? String, "completed")
 				let identifier = try XCTUnwrap(item["id"] as? String)
-				XCTAssertTrue(identifier.hasPrefix("item_"))
-				XCTAssertLessThanOrEqual(identifier.utf8.count, 64)
+				XCTAssertEqual(identifier.utf8.count, 36)
+				XCTAssertNotNil(UUID(uuidString: identifier))
 				let content = try XCTUnwrap(item["content"] as? [[String: String]])
 				XCTAssertEqual(content, [["type": "input_text", "text": "hello"]])
 			}

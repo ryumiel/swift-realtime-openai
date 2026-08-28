@@ -81,16 +81,24 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	private let backing: any WebRTCConnectorPeerBacking
 	private var forwardingTask: Task<Void, Never>?
 	private var settlementTask: Task<Void, Never>?
+	private var terminalFailure: WebRTCTransportFailure?
 	private var offerMade = false
+	private var offerInFlight = false
 	private var answerApplied = false
+	private var answerInFlight = false
+	private var pendingReady = false
 	private var ready = false
 	private var configuration: WebRTCSessionConfiguration?
+	private var configurationAcknowledgementPending = false
 	private var connected = false
 	private var terminal = false
 
 	init(backing: any WebRTCConnectorPeerBacking) {
 		self.backing = backing
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorEvent.self, bufferingPolicy: .bufferingOldest(2))
+		stream.onTermination = { [weak self] _ in
+			Task { @MainActor in _ = self?.startSettlement(failure: nil) }
+		}
 		let source = backing.productionEvents
 		forwardingTask = Task { [weak self, source] in
 			do {
@@ -105,12 +113,15 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	}
 
 	package func makeOffer() async throws -> String {
-		guard !terminal, !offerMade else {
+		guard !terminal, !offerMade, !offerInFlight else {
 			await beginSettlement(failure: .invalidRequest)
 			throw WebRTCTransportFailure.invalidRequest
 		}
+		offerInFlight = true
+		defer { offerInFlight = false }
 		do {
 			let offer = try await backing.makeOffer()
+			guard !terminal else { throw WebRTCTransportFailure.cancelled }
 			guard !offer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WebRTCTransportFailure.invalidSDP }
 			offerMade = true
 			return offer
@@ -122,13 +133,20 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	}
 
 	package func apply(remoteAnswer: String) async throws {
-		guard !terminal, offerMade, !answerApplied, !remoteAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+		guard !terminal, offerMade, !answerApplied, !answerInFlight, !remoteAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
 			await beginSettlement(failure: .invalidSDP)
 			throw WebRTCTransportFailure.invalidSDP
 		}
+		answerInFlight = true
+		defer { answerInFlight = false }
 		do {
 			try await backing.apply(answer: remoteAnswer)
+			guard !terminal else { throw WebRTCTransportFailure.cancelled }
 			answerApplied = true
+			if pendingReady {
+				pendingReady = false
+				guard admitReady() else { throw WebRTCTransportFailure.malformedEvent }
+			}
 		} catch {
 			let failure = Self.contentFree(error)
 			await beginSettlement(failure: failure)
@@ -138,26 +156,27 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 
 	package func configure(_ configuration: WebRTCSessionConfiguration) throws {
 		guard !terminal, offerMade, answerApplied, ready, self.configuration == nil else {
-			beginSettlement(failure: .invalidRequest)
+			startSettlement(failure: .invalidRequest)
 			throw WebRTCTransportFailure.invalidRequest
 		}
 		do {
 			try backing.sendSessionUpdate(voice: configuration.voice, language: configuration.language)
 			self.configuration = configuration
+			configurationAcknowledgementPending = true
 		} catch {
 			let failure = Self.contentFree(error)
-			beginSettlement(failure: failure)
+			startSettlement(failure: failure)
 			throw failure
 		}
 	}
 
 	package func sendUserText(_ text: String) throws {
-		guard isConnected, Self.isValidText(text) else { throw WebRTCTransportFailure.invalidRequest }
-		try backing.sendProductionCommand(.userText(text))
+		guard Self.isValidText(text) else { try rejectCommand() }
+		try sendCommand(.userText(text))
 	}
-	package func createResponse() throws { guard isConnected else { throw WebRTCTransportFailure.invalidRequest }; try backing.sendProductionCommand(.createResponse) }
-	package func cancelResponse() throws { guard isConnected else { throw WebRTCTransportFailure.invalidRequest }; try backing.sendProductionCommand(.cancelResponse) }
-	package func clearOutputAudio() throws { guard isConnected else { throw WebRTCTransportFailure.invalidRequest }; try backing.sendProductionCommand(.clearOutputAudio) }
+	package func createResponse() throws { try sendCommand(.createResponse) }
+	package func cancelResponse() throws { try sendCommand(.cancelResponse) }
+	package func clearOutputAudio() throws { try sendCommand(.clearOutputAudio) }
 
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard !terminal, state == .disabled || connected else { return }
@@ -171,21 +190,23 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		guard !terminal else { return false }
 		switch event {
 		case .ready:
-			guard answerApplied, !ready, yield(.ready) else { await beginSettlement(failure: .malformedEvent); return false }
-			ready = true
+			guard !ready else { startSettlement(failure: .malformedEvent); return false }
+			if answerInFlight { pendingReady = true; return true }
+			guard admitReady() else { startSettlement(failure: .malformedEvent); return false }
 			return true
 		case let .inbound(inbound):
 			switch inbound {
 			case let .sessionUpdated(voice, language):
-				guard ready, let configuration, configuration.voice == voice, configuration.language == language,
+				guard ready, configurationAcknowledgementPending, let configuration, configuration.voice == voice, configuration.language == language,
 					yield(.localAISessionConfigured(voice: voice, language: language)), yield(.connected)
-				else { await beginSettlement(failure: .malformedEvent); return false }
+				else { startSettlement(failure: .malformedEvent); return false }
+				configurationAcknowledgementPending = false
 				connected = true
 				return true
-			case let .userTranscript(text): guard connected, yield(.userTranscript(text)) else { await beginSettlement(failure: .malformedEvent); return false }; return true
-			case let .assistantTranscript(text): guard connected, yield(.assistantTranscript(text)) else { await beginSettlement(failure: .malformedEvent); return false }; return true
-			case .responseFinished: guard connected, yield(.responseFinished) else { await beginSettlement(failure: .malformedEvent); return false }; return true
-			case .providerError: await beginSettlement(failure: .providerError); return false
+			case let .userTranscript(text): guard connected, yield(.userTranscript(text)) else { startSettlement(failure: .malformedEvent); return false }; return true
+			case let .assistantTranscript(text): guard connected, yield(.assistantTranscript(text)) else { startSettlement(failure: .malformedEvent); return false }; return true
+			case .responseFinished: guard connected, yield(.responseFinished) else { startSettlement(failure: .malformedEvent); return false }; return true
+			case .providerError: startSettlement(failure: .providerError); return false
 			}
 		}
 	}
@@ -193,26 +214,54 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	private func yield(_ event: WebRTCConnectorEvent) -> Bool {
 		switch stream.yield(event) {
 		case .enqueued: return true
-		case .dropped, .terminated: beginSettlement(failure: .ingressOverloaded); return false
-		@unknown default: beginSettlement(failure: .ingressOverloaded); return false
+		case .dropped, .terminated: startSettlement(failure: .ingressOverloaded); return false
+		@unknown default: startSettlement(failure: .ingressOverloaded); return false
 		}
 	}
 
-	private func beginSettlement(failure: WebRTCTransportFailure?) async { await beginSettlement(failure: failure).value }
-	private func forwardingFinished(failure: WebRTCTransportFailure?) async {
-		guard !terminal else { return }
-		let _: Task<Void, Never> = beginSettlement(failure: failure)
+	private func admitReady() -> Bool {
+		guard answerApplied, !ready, yield(.ready) else { return false }
+		ready = true
+		return true
 	}
-	@discardableResult private func beginSettlement(failure: WebRTCTransportFailure?) -> Task<Void, Never> {
-		if let settlementTask { return settlementTask }
+
+	private func sendCommand(_ command: ProductionCommand) throws {
+		guard isConnected else { try rejectCommand() }
+		do { try backing.sendProductionCommand(command) }
+		catch {
+			let failure = Self.contentFree(error)
+			startSettlement(failure: failure)
+			throw failure
+		}
+	}
+
+	private func rejectCommand() throws -> Never {
+		startSettlement(failure: .invalidRequest)
+		throw WebRTCTransportFailure.invalidRequest
+	}
+
+	private func beginSettlement(failure: WebRTCTransportFailure?) async { await startSettlement(failure: failure).value }
+	private func forwardingFinished(failure: WebRTCTransportFailure?) async {
+		if terminal {
+			if let failure { startSettlement(failure: failure) }
+			return
+		}
+		startSettlement(failure: failure)
+	}
+	@discardableResult private func startSettlement(failure: WebRTCTransportFailure?) -> Task<Void, Never> {
+		if let settlementTask {
+			if terminalFailure == nil, let failure { terminalFailure = failure }
+			return settlementTask
+		}
 		terminal = true
+		terminalFailure = failure
 		let task = Task { @MainActor [weak self] in
 			guard let self else { return }
 			self.backing.setLocalAudioState(.disabled)
 			await self.backing.closeAndSettle()
 			self.forwardingTask?.cancel()
 			await self.forwardingTask?.value
-			if let failure { self.stream.finish(throwing: failure) }
+			if let failure = self.terminalFailure { self.stream.finish(throwing: failure) }
 			else {
 				switch self.stream.yield(.closed) {
 				case .enqueued: self.stream.finish()
@@ -227,8 +276,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 
 	private static func contentFree(_ error: any Error) -> WebRTCTransportFailure { (error as? WebRTCTransportFailure) ?? .requestFailed }
 	private static func isValidText(_ text: String) -> Bool {
-		text == text.trimmingCharacters(in: .whitespacesAndNewlines) && !text.isEmpty && text.utf8.count <= 8 * 1024
-			&& text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+		!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.utf8.count <= 8 * 1024
 	}
 }
 
@@ -243,7 +291,7 @@ package enum ProductionCommand: Encodable {
 		case .clearOutputAudio: return try JSONEncoder().encode(TypeEvent(type: "output_audio_buffer.clear"))
 		}
 	}
-	private static func itemID() -> String { "item_" + UUID().uuidString.lowercased() }
+	private static func itemID() -> String { UUID().uuidString }
 	private struct TypeEvent: Encodable { let type: String }
 	private struct UserTextEvent: Encodable { let type: String; let item: Item }
 	private struct Item: Encodable { let id: String; let type: String; let role: String; let status: String; let content: [Content] }

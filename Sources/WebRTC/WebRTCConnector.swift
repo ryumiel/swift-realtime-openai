@@ -423,7 +423,7 @@ import FoundationNetworking
 		generation = lifecycle.begin()
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self, bufferingPolicy: .bufferingOldest(0))
 		(productionEvents, productionStream) = AsyncThrowingStream.makeStream(
-			of: WebRTCConnectorPeerBackingEvent.self, bufferingPolicy: .bufferingOldest(2)
+			of: WebRTCConnectorPeerBackingEvent.self, bufferingPolicy: .bufferingOldest(0)
 		)
 		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorQualificationEvent.self, bufferingPolicy: .bufferingOldest(2))
 		(ingressEvents, ingressStream) = AsyncThrowingStream.makeStream(

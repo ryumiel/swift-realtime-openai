@@ -32,5 +32,6 @@ let package = Package(
 		]),
 		.target(name: "WebRTC", dependencies: ["Core", .product(name: "LiveKitWebRTC", package: "webrtc-xcframework")]),
 		.testTarget(name: "WebRTCTests", dependencies: ["WebRTC"]),
+		.testTarget(name: "ExternalProductionImportProof", dependencies: ["WebRTC"]),
 	]
 )

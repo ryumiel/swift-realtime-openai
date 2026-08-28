@@ -87,7 +87,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
 		backing.emit(.inbound(.sessionUpdated(voice: "Ono_Anna", language: "ja")))
 		for _ in 0..<5 { backing.emit(.inbound(.userTranscript("late"))) }
-		try await Task.sleep(for: .milliseconds(20))
+		await backing.waitForClose()
 		XCTAssertThrowsError(try peer.createResponse())
 		XCTAssertEqual(backing.closeCount, 1)
 	}
@@ -115,10 +115,11 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	private(set) var commandTypes: [String] = []
 	private(set) var audioStates: [WebRTCLocalAudioState] = []
 	private(set) var closeCount = 0
+	private var closeWaiter: CheckedContinuation<Void, Never>?
 
 	init() {
 		(productionEvents, continuation) = AsyncThrowingStream.makeStream(
-			of: WebRTCConnectorPeerBackingEvent.self, bufferingPolicy: .bufferingOldest(2)
+			of: WebRTCConnectorPeerBackingEvent.self, bufferingPolicy: .unbounded
 		)
 	}
 
@@ -132,5 +133,14 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		commandTypes.append(object?["type"] as? String ?? "")
 	}
 	func setLocalAudioState(_ state: WebRTCLocalAudioState) { audioStates.append(state) }
-	func closeAndSettle() async { closeCount += 1; continuation.finish() }
+	func closeAndSettle() async {
+		closeCount += 1
+		continuation.finish()
+		closeWaiter?.resume()
+		closeWaiter = nil
+	}
+	func waitForClose() async {
+		guard closeCount == 0 else { return }
+		await withCheckedContinuation { closeWaiter = $0 }
+	}
 }
