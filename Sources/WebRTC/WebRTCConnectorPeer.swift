@@ -212,7 +212,14 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	private var isConnected: Bool { !terminal && connected }
 
 	private func receive(_ result: Result<WebRTCConnectorPeerBackingEvent, any Error>) {
-		guard !terminal else { return }
+		if terminal {
+			switch result {
+			case let .failure(error): startSettlement(failure: Self.contentFree(error))
+			case let .success(.terminal(failure)): startSettlement(failure: failure)
+			case .success: break
+			}
+			return
+		}
 		guard case let .success(event) = result else {
 			if case let .failure(error) = result { startSettlement(failure: Self.contentFree(error)) }
 			return
@@ -277,16 +284,17 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		guard !terminal else { return Task {} }
 		terminal = true
 		terminalFailure = failure
-		let task = Task { @MainActor [weak self] in
-			guard let self else { return }
+		let task = Task { @MainActor [self] in
 			self.backing.setLocalAudioState(.disabled)
 			let offerOperation = self.offerOperation
 			let answerOperation = self.answerOperation
 			offerOperation?.cancel()
 			answerOperation?.cancel()
+			let backing = self.backing
+			let backingClose = Task { @MainActor [backing] in await backing.closeAndSettle() }
+			await backingClose.value
 			_ = await offerOperation?.result
 			_ = await answerOperation?.result
-			await self.backing.closeAndSettle()
 			if let failure = self.terminalFailure { self.stream.finish(throwing: failure) }
 			else {
 				switch self.stream.yield(.closed) {

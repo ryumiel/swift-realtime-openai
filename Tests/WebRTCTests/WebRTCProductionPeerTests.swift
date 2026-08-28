@@ -120,8 +120,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 		let second = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForDisable()
-		XCTAssertEqual(backing.closeCount, 0)
-		backing.resumeOffer()
+		await backing.waitForClose()
+		XCTAssertEqual(backing.closeCount, 1)
 		switch await second.result {
 		case .success: XCTFail("Concurrent offer must be rejected")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
@@ -139,10 +139,12 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
+		let didClose = expectation(description: "close releases held offer")
+		backing.didClose = { didClose.fulfill() }
 		let close = Task { @MainActor in await peer.closeAndJoin() }
-		await backing.waitForDisable()
-		XCTAssertEqual(backing.closeCount, 0)
-		backing.resumeOffer()
+		await fulfillment(of: [didClose], timeout: 0.1)
+		guard backing.closeCount == 1 else { return }
+		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
 		await close.value
 		switch await offer.result {
 		case .success: XCTFail("Closing an in-flight offer must prevent a late success")
@@ -158,8 +160,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await backing.waitForOfferStart()
 		offer.cancel()
 		await backing.waitForDisable()
-		XCTAssertEqual(backing.closeCount, 0)
-		backing.resumeOffer()
+		await backing.waitForClose()
+		XCTAssertEqual(backing.closeCount, 1)
 		switch await offer.result {
 		case .success: XCTFail("Cancelled offer must not publish success")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
@@ -192,8 +194,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await backing.waitForAnswerStart()
 		let second = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
 		await backing.waitForDisable()
-		XCTAssertEqual(backing.closeCount, 0)
-		backing.resumeAnswer()
+		await backing.waitForClose()
+		XCTAssertEqual(backing.closeCount, 1)
 		switch await second.result {
 		case .success: XCTFail("Concurrent answer must be rejected")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .invalidSDP)
@@ -212,10 +214,12 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
 		await backing.waitForAnswerStart()
+		let didClose = expectation(description: "close releases held answer")
+		backing.didClose = { didClose.fulfill() }
 		let close = Task { @MainActor in await peer.closeAndJoin() }
-		await backing.waitForDisable()
-		XCTAssertEqual(backing.closeCount, 0)
-		backing.resumeAnswer()
+		await fulfillment(of: [didClose], timeout: 0.1)
+		guard backing.closeCount == 1 else { return }
+		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
 		await close.value
 		switch await answer.result {
 		case .success: XCTFail("Closing an in-flight answer must prevent a late success")
@@ -232,8 +236,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await backing.waitForAnswerStart()
 		answer.cancel()
 		await backing.waitForDisable()
-		XCTAssertEqual(backing.closeCount, 0)
-		backing.resumeAnswer()
+		await backing.waitForClose()
+		XCTAssertEqual(backing.closeCount, 1)
 		switch await answer.result {
 		case .success: XCTFail("Cancelled answer must not publish success")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
@@ -334,6 +338,51 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(backing.closeCount, 1)
 		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
 		XCTAssertNotNil(weakPeer.value)
+	}
+
+	@MainActor func testSynchronousFailureRetainsPeerThroughSettlementThenReleases() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let weakPeer = WeakPeerBox(peer as AnyObject)
+		var iterator = peer!.events.makeAsyncIterator()
+		let closeStarted = expectation(description: "settlement owns peer through close")
+		backing.didStartClose = { closeStarted.fulfill() }
+
+		backing.finishEvents(throwing: FakeProductionBacking.ArbitraryError())
+		peer = nil
+		await fulfillment(of: [closeStarted], timeout: 0.1)
+		guard backing.closeCount == 1 else { return }
+		XCTAssertNotNil(weakPeer.value)
+		backing.resumeClose()
+		do {
+			_ = try await iterator.next()
+			XCTFail("The synchronous backing failure must terminate the retained stream")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .requestFailed)
+		}
+		for _ in 0..<16 where weakPeer.value != nil { await Task.yield() }
+		XCTAssertNil(weakPeer.value)
+	}
+
+	@MainActor func testBackingFailureUpgradesNormalCloseBeforeTerminalCompletion() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		var iterator = peer.events.makeAsyncIterator()
+		let closeStarted = expectation(description: "normal close entered backing settlement")
+		backing.didStartClose = { closeStarted.fulfill() }
+		let close = Task { @MainActor [peer] in await peer.closeAndJoin() }
+		await fulfillment(of: [closeStarted], timeout: 0.1)
+
+		backing.finishEvents(throwing: FakeProductionBacking.ArbitraryError())
+		backing.resumeClose()
+		do {
+			_ = try await iterator.next()
+			XCTFail("A racing backing failure must replace normal closure")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .requestFailed)
+		}
+		await close.value
+		XCTAssertEqual(backing.closeCount, 1)
 	}
 
 	@MainActor func testMismatchedAndDuplicateAcknowledgementsFailClosedWithoutAnotherConnected() async throws {
@@ -512,16 +561,21 @@ private final class WeakPeerBox {
 	private var answerStartWaiter: CheckedContinuation<Void, Never>?
 	private var offerContinuation: CheckedContinuation<String, Never>?
 	private var answerContinuation: CheckedContinuation<Void, Never>?
+	private var closeContinuation: CheckedContinuation<Void, Never>?
 	private let suspendOffer: Bool
 	private let suspendAnswer: Bool
+	private let suspendClose: Bool
 	private let commandError: (any Error)?
 	private var closed = false
+	var didStartClose: (() -> Void)?
+	var didClose: (() -> Void)?
 
 	struct ArbitraryError: Error {}
 
-	init(suspendOffer: Bool = false, suspendAnswer: Bool = false, commandError: (any Error)? = nil) {
+	init(suspendOffer: Bool = false, suspendAnswer: Bool = false, suspendClose: Bool = false, commandError: (any Error)? = nil) {
 		self.suspendOffer = suspendOffer
 		self.suspendAnswer = suspendAnswer
+		self.suspendClose = suspendClose
 		self.commandError = commandError
 	}
 
@@ -553,6 +607,7 @@ private final class WeakPeerBox {
 	func waitForAnswerStart() async { await withCheckedContinuation { answerStartWaiter = $0 } }
 	func resumeOffer() { offerContinuation?.resume(returning: "offer"); offerContinuation = nil }
 	func resumeAnswer() { answerContinuation?.resume(); answerContinuation = nil }
+	func resumeClose() { closeContinuation?.resume(); closeContinuation = nil }
 	func sendSessionUpdate(voice: String, language: String) throws { sessionUpdates.append("\(voice)|\(language)") }
 	func sendProductionCommand(_ command: ProductionCommand) throws {
 		if let commandError { throw commandError }
@@ -568,9 +623,14 @@ private final class WeakPeerBox {
 	func closeAndSettle() async {
 		closeCount += 1
 		operationOrder.append("close")
+		didStartClose?()
+		if suspendClose { await withCheckedContinuation { closeContinuation = $0 } }
 		closed = true
+		resumeOffer()
+		resumeAnswer()
 		closeWaiter?.resume()
 		closeWaiter = nil
+		didClose?()
 	}
 	func waitForClose() async {
 		guard closeCount == 0 else { return }
