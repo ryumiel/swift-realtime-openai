@@ -1,2 +1,2 @@
 import WebRTC
-let _: any WebRTCConnectorPeerBacking.Type = WebRTCConnectorPeerBacking.self
+let _: (any WebRTCConnectorPeerBacking)? = nil

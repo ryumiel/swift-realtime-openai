@@ -1,2 +1,2 @@
 import WebRTC
-let _: WebRTCSignalingRequest.Type = WebRTCSignalingRequest.self
+let _: WebRTCSignalingRequest? = nil

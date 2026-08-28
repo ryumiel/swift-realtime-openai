@@ -110,7 +110,8 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		self.backing = backing
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorEvent.self, bufferingPolicy: .bufferingOldest(2))
 		stream.onTermination = { [weak self] _ in
-			Task { @MainActor in _ = self?.startSettlement(failure: nil) }
+			guard let self else { return }
+			Task { @MainActor [self] in await self.beginSettlement(failure: nil) }
 		}
 		backing.installProductionEventSink { [weak self] result in self?.receive(result) }
 	}
@@ -126,7 +127,15 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			let operation = Task { @MainActor [backing] in try await backing.makeOffer() }
 			offerOperation = operation
 			defer { offerOperation = nil }
-			let offer = try await operation.value
+			let offer = try await withTaskCancellationHandler {
+				try Task.checkCancellation()
+				let offer = try await operation.value
+				try Task.checkCancellation()
+				return offer
+			} onCancel: { [weak self] in
+				operation.cancel()
+				Task { @MainActor [weak self] in await self?.beginSettlement(failure: .cancelled) }
+			}
 			guard !terminal else { throw WebRTCTransportFailure.cancelled }
 			guard !offer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WebRTCTransportFailure.invalidSDP }
 			offerMade = true
@@ -149,7 +158,14 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			let operation = Task { @MainActor [backing] in try await backing.apply(answer: remoteAnswer) }
 			answerOperation = operation
 			defer { answerOperation = nil }
-			try await operation.value
+			try await withTaskCancellationHandler {
+				try Task.checkCancellation()
+				try await operation.value
+				try Task.checkCancellation()
+			} onCancel: { [weak self] in
+				operation.cancel()
+				Task { @MainActor [weak self] in await self?.beginSettlement(failure: .cancelled) }
+			}
 			guard !terminal else { throw WebRTCTransportFailure.cancelled }
 			answerApplied = true
 			if pendingReady {
@@ -258,6 +274,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			if terminalFailure == nil, let failure { terminalFailure = failure }
 			return settlementTask
 		}
+		guard !terminal else { return Task {} }
 		terminal = true
 		terminalFailure = failure
 		let task = Task { @MainActor [weak self] in
@@ -278,12 +295,16 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 				@unknown default: self.stream.finish(throwing: WebRTCTransportFailure.ingressOverloaded)
 				}
 			}
+			self.settlementTask = nil
 		}
 		settlementTask = task
 		return task
 	}
 
-	fileprivate static func contentFree(_ error: any Error) -> WebRTCTransportFailure { (error as? WebRTCTransportFailure) ?? .requestFailed }
+	fileprivate static func contentFree(_ error: any Error) -> WebRTCTransportFailure {
+		if error is CancellationError { return .cancelled }
+		return (error as? WebRTCTransportFailure) ?? .requestFailed
+	}
 	private static func isValidText(_ text: String) -> Bool {
 		!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.utf8.count <= 8 * 1024
 	}

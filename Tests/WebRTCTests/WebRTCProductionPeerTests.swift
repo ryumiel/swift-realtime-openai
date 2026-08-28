@@ -151,6 +151,24 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(backing.closeCount, 1)
 	}
 
+	@MainActor func testCallerCancellationOfSuspendedOfferSettlesAndReturnsCancelled() async throws {
+		let backing = FakeProductionBacking(suspendOffer: true)
+		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let offer = Task { @MainActor in try await peer.makeOffer() }
+		await backing.waitForOfferStart()
+		offer.cancel()
+		await backing.waitForDisable()
+		XCTAssertEqual(backing.closeCount, 0)
+		backing.resumeOffer()
+		switch await offer.result {
+		case .success: XCTFail("Cancelled offer must not publish success")
+		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
+		await backing.waitForClose()
+		await peer.closeAndJoin()
+		XCTAssertEqual(backing.closeCount, 1)
+	}
+
 	@MainActor func testReadinessRacingSuspendedAnswerIsAdmittedOnlyAfterAnswer() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true)
 		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
@@ -203,6 +221,25 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		case .success: XCTFail("Closing an in-flight answer must prevent a late success")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
 		}
+		XCTAssertEqual(backing.closeCount, 1)
+	}
+
+	@MainActor func testCallerCancellationOfSuspendedAnswerSettlesAndReturnsCancelled() async throws {
+		let backing = FakeProductionBacking(suspendAnswer: true)
+		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		_ = try await peer.makeOffer()
+		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
+		await backing.waitForAnswerStart()
+		answer.cancel()
+		await backing.waitForDisable()
+		XCTAssertEqual(backing.closeCount, 0)
+		backing.resumeAnswer()
+		switch await answer.result {
+		case .success: XCTFail("Cancelled answer must not publish success")
+		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
+		await backing.waitForClose()
+		await peer.closeAndJoin()
 		XCTAssertEqual(backing.closeCount, 1)
 	}
 
@@ -276,6 +313,27 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await peer.closeAndJoin()
 		XCTAssertEqual(backing.closeCount, 1)
 		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
+	}
+
+	@MainActor func testIteratorCancellationRetainsPeerUntilJoinedSettlementCompletes() async throws {
+		let backing = FakeProductionBacking()
+		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let weakPeer = WeakPeerBox(peer as AnyObject)
+		var reader: Task<WebRTCConnectorEvent?, any Error>?
+		if let peer {
+			reader = Task { @MainActor [peer] in
+			var iterator = peer.events.makeAsyncIterator()
+			return try await iterator.next()
+			}
+		}
+		peer = nil
+		reader?.cancel()
+		_ = try? await reader?.value
+		reader = nil
+		await backing.waitForClose()
+		XCTAssertEqual(backing.closeCount, 1)
+		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
+		XCTAssertNotNil(weakPeer.value)
 	}
 
 	@MainActor func testMismatchedAndDuplicateAcknowledgementsFailClosedWithoutAnotherConnected() async throws {
@@ -432,6 +490,11 @@ private struct ProductionStubSession: WebRTCSignalingSession {
 	func data(for _: URLRequest) async throws -> WebRTCSignalingHTTPResponse {
 		throw FakeProductionBacking.ArbitraryError()
 	}
+}
+
+private final class WeakPeerBox {
+	weak var value: AnyObject?
+	init(_ value: AnyObject) { self.value = value }
 }
 
 @MainActor private final class FakeProductionBacking: WebRTCConnectorPeerBacking, @unchecked Sendable {

@@ -2,7 +2,7 @@
 import PackageDescription
 import Foundation
 
-let forbidden = ["Backing", "Connector", "Signaling", "Decoder", "Qualification"]
+let forbidden = ["Backing", "Connector", "Signaling", "Decoder", "Lifecycle", "Qualification"]
 let forkPath = ProcessInfo.processInfo.environment["WEBRTC_FORK_PATH"] ?? "../.."
 let package = Package(
 	name: "ExternalNegativeConsumerProof",
