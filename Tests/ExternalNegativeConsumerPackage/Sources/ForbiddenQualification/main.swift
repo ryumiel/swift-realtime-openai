@@ -1,0 +1,2 @@
+import WebRTC
+let _: WebRTCConnectorQualificationPeerFactory.Type = WebRTCConnectorQualificationPeerFactory.self
