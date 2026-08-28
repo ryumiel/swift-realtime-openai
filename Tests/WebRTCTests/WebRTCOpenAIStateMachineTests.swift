@@ -79,6 +79,20 @@ struct WebRTCOpenAIStateMachineTests {
 		}
 	}
 
+	@Test("OpenAI construction requires initially disabled audio")
+	func openAIRejectsInitiallyEnabledAudio() async throws {
+		let backing = OpenAIBacking()
+		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		backing.emit(.ready)
+		#expect(throws: WebRTCTransportFailure.invalidRequest) { try peer.configure(.openAI(language: "en")) }
+		await peer.closeAndJoin()
+		#expect(backing.configurationPayloads.isEmpty)
+		#expect(backing.selectedSessions.isEmpty)
+		#expect(backing.audioStates == [.enabled, .disabled])
+	}
+
 	@Test("handshake preserves structural semantic and unsupported failure partitions")
 	func handshakeFailurePartitions() throws {
 		var premature = try OpenAIProductionStateMachine(language: "en")
@@ -104,10 +118,8 @@ struct WebRTCOpenAIStateMachineTests {
 		}
 
 		var nested = try OpenAIProductionStateMachine(language: "en")
-		let deeplyNested = #"{"type":"session.created","default":"# + String(repeating: "[", count: 65) + "null" + String(repeating: "]", count: 65) + "}"
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
-			_ = try nested.consume(Data(deeplyNested.utf8))
-		}
+		let deeplyNested = #"{"type":"session.created","default":"# + String(repeating: "[", count: 1_024) + "null" + String(repeating: "]", count: 1_024) + "}"
+		#expect(try nested.consume(Data(deeplyNested.utf8)) == .sessionCreated)
 
 		var provider = try OpenAIProductionStateMachine(language: "en")
 		#expect(throws: WebRTCTransportFailure.providerError) {
@@ -124,6 +136,36 @@ struct WebRTCOpenAIStateMachineTests {
 		_ = try longMismatch.consume(Data(#"{"type":"session.created"}"#.utf8))
 		#expect(throws: WebRTCTransportFailure.providerError) {
 			_ = try longMismatch.consume(Data(Self.acknowledgement(language: "not-the-selected-language").utf8))
+		}
+	}
+
+	@Test("flattened conflicts are event specific and done stages are strict")
+	func eventSpecificPathsAndDoneStages() throws {
+		var unrelated = try OpenAIProductionStateMachine(language: "en")
+		#expect(try unrelated.consume(Data(#"{"type":"session.created","response.id":"provider-default"}"#.utf8)) == .sessionCreated)
+		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+			_ = try unrelated.consume(Data((String(Self.acknowledgement(language: "en").dropLast()) + #", "session.audio":"conflict"}"#).utf8))
+		}
+
+		for json in [
+			#"{"type":"conversation.item.done","item":{"id":"a","type":"message","role":"assistant","content":[{"type":"audio"}]}}"#,
+			#"{"type":"conversation.item.done","item":{"id":"a","type":"message","role":"assistant","status":"in_progress","content":[{"type":"audio"}]}}"#,
+			#"{"type":"conversation.item.done","item":{"id":"a","type":"message","role":"assistant","status":"completed","content":[]}}"#
+		] {
+			var machine = try activeMachine()
+			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+		}
+		for json in [
+			#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","content":[{"type":"audio"}]}}"#,
+			#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"in_progress","content":[{"type":"audio"}]}}"#,
+			#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"completed","content":[]}}"#
+		] {
+			var machine = try activeResponseMachine()
+			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+		}
+		var rate = try activeMachine()
+		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+			_ = try rate.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":10,"remaining":9,"reset_seconds":1}],"rate_limits.remaining":9}"#.utf8))
 		}
 	}
 
@@ -199,6 +241,30 @@ struct WebRTCOpenAIStateMachineTests {
 		try peer.createResponse()
 		#expect(backing.commandTypes == ["response.cancel", "output_audio_buffer.clear", "response.create"])
 		await peer.closeAndJoin()
+	}
+
+	@Test("all OpenAI command send failures settle content free")
+	func openAICommandFailuresSettle() async throws {
+		for command in OpenAICommandCase.allCases {
+			let backing = OpenAIBacking(commandSendFails: true)
+			let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+			var events = peer.events.makeAsyncIterator()
+			_ = try await peer.makeOffer()
+			try await peer.apply(remoteAnswer: "answer")
+			backing.emit(.ready); _ = try await events.next()
+			try peer.configure(.openAI(language: "en"))
+			backing.emitRaw(#"{"type":"session.created"}"#); _ = try await events.next()
+			backing.emitRaw(Self.acknowledgement(language: "en")); _ = try await events.next()
+			if command == .cancel {
+				backing.emitRaw(#"{"type":"response.created","response":{"id":"r1"}}"#)
+				_ = try await events.next()
+			}
+			#expect(throws: WebRTCTransportFailure.requestFailed) { try command.invoke(peer) }
+			await peer.closeAndJoin()
+			do { _ = try await events.next(); Issue.record("failed command must terminate") }
+			catch { #expect(error as? WebRTCTransportFailure == .requestFailed) }
+			#expect(backing.closeCount == 1)
+		}
 	}
 
 	@Test("server VAD may open a response without an explicit create command")
@@ -294,19 +360,38 @@ struct WebRTCOpenAIStateMachineTests {
 	}
 }
 
+@MainActor private enum OpenAICommandCase: CaseIterable, Equatable {
+	case user, create, cancel, clear
+	func invoke(_ peer: any WebRTCConnectorPeer) throws {
+		switch self {
+		case .user: try peer.sendUserText("synthetic")
+		case .create: try peer.createResponse()
+		case .cancel: try peer.cancelResponse()
+		case .clear: try peer.clearOutputAudio()
+		}
+	}
+}
+
 @MainActor
 private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendable {
 	struct SyntheticError: Error {}
 	private var sink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
 	private let configurationSendFails: Bool
+	private let commandSendFails: Bool
 	var configurationPayloads: [Data] = []
 	var commandTypes: [String] = []
 	var audioStates: [WebRTCLocalAudioState] = []
-	init(configurationSendFails: Bool = false) { self.configurationSendFails = configurationSendFails }
+	var selectedSessions: [ProductionSessionSelection] = []
+	var closeCount = 0
+	init(configurationSendFails: Bool = false, commandSendFails: Bool = false) {
+		self.configurationSendFails = configurationSendFails
+		self.commandSendFails = commandSendFails
+	}
 
 	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void) { self.sink = sink }
 	func makeOffer() async throws -> String { "offer" }
 	func apply(answer _: String) async throws {}
+	func selectProductionSession(_ selection: ProductionSessionSelection) throws { selectedSessions.append(selection) }
 	func sendSessionConfiguration(_ data: Data) throws {
 		if configurationSendFails { throw SyntheticError() }
 		configurationPayloads.append(data)
@@ -314,9 +399,10 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	func sendProductionCommand(_ command: ProductionCommand) throws {
 		let root = try JSONSerialization.jsonObject(with: command.encoded()) as? [String: Any]
 		commandTypes.append(root?["type"] as? String ?? "")
+		if commandSendFails { throw SyntheticError() }
 	}
 	func setLocalAudioState(_ state: WebRTCLocalAudioState) { audioStates.append(state) }
-	func closeAndSettle() async {}
+	func closeAndSettle() async { closeCount += 1 }
 	func emit(_ event: WebRTCConnectorPeerBackingEvent) { sink?(.success(event)) }
 	func emitRaw(_ json: String) { emit(.rawInbound(Data(json.utf8))) }
 }

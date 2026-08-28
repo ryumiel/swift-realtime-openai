@@ -45,7 +45,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 		aggregateBytes += data.count
 		let root = try StrictJSON.parse(data).requiredObject()
 		let type = try root.requiredString("type", maximumBytes: 256 * 1024, nonempty: true)
-		guard !root.containsFlattenedConflict(namedPaths: Self.namedPaths) else { throw WebRTCTransportFailure.malformedEvent }
+		guard !root.containsFlattenedConflict(namedPaths: Self.namedPaths(for: type)) else { throw WebRTCTransportFailure.malformedEvent }
 		if type == "error" {
 			try validateProviderError(root)
 			throw WebRTCTransportFailure.providerError
@@ -230,9 +230,11 @@ package struct OpenAIProductionStateMachine: Sendable {
 		guard try item.requiredString("type", maximumBytes: 256 * 1024, nonempty: true) == "message" else { throw WebRTCTransportFailure.unsupportedEvent }
 		let role = try item.requiredString("role", maximumBytes: 256 * 1024, nonempty: true)
 		let status = try item.optionalBoundedString("status", maximumBytes: 256 * 1024)
-		guard status == nil || status == "in_progress" || status == "completed", !done || status == "completed" else { throw WebRTCTransportFailure.unsupportedEvent }
+		guard status == nil || status == "in_progress" || status == "completed" else { throw WebRTCTransportFailure.malformedEvent }
+		if done, status != "completed" { throw WebRTCTransportFailure.malformedEvent }
 		let content = try item.requiredArray("content")
 		guard role == "user" || role == "assistant", role == "assistant" || !content.isEmpty else { throw WebRTCTransportFailure.unsupportedEvent }
+		if done, role == "assistant", content.isEmpty { throw WebRTCTransportFailure.malformedEvent }
 		for value in content {
 			let object = try value.requiredObject()
 			let type = try object.requiredString("type", maximumBytes: 256 * 1024, nonempty: true)
@@ -246,8 +248,11 @@ package struct OpenAIProductionStateMachine: Sendable {
 			try item.requiredString("role", maximumBytes: 256 * 1024, nonempty: true) == "assistant"
 		else { throw WebRTCTransportFailure.unsupportedEvent }
 		let status = try item.optionalBoundedString("status", maximumBytes: 256 * 1024)
-		guard status == nil || status == "in_progress" || status == "completed", !done || status == "completed" else { throw WebRTCTransportFailure.unsupportedEvent }
-		for value in try item.requiredArray("content") { try validateAudioPart(value.requiredObject()) }
+		guard status == nil || status == "in_progress" || status == "completed" else { throw WebRTCTransportFailure.malformedEvent }
+		if done, status != "completed" { throw WebRTCTransportFailure.malformedEvent }
+		let content = try item.requiredArray("content")
+		if done, content.isEmpty { throw WebRTCTransportFailure.malformedEvent }
+		for value in content { try validateAudioPart(value.requiredObject()) }
 	}
 
 	private func validateAudioPart(_ part: [String: StrictJSON]) throws {
@@ -298,16 +303,33 @@ package struct OpenAIProductionStateMachine: Sendable {
 		"rate_limits.updated", "response.done"
 	]
 
-	private static let namedPaths: Set<String> = [
-		"session.type", "session.model", "session.audio.input.transcription.model", "session.audio.input.transcription.language",
-		"session.audio.input.turn_detection.type", "session.audio.input.turn_detection.threshold",
-		"session.audio.input.turn_detection.prefix_padding_ms", "session.audio.input.turn_detection.silence_duration_ms",
-		"session.audio.input.turn_detection.create_response", "session.audio.input.turn_detection.interrupt_response",
-		"session.audio.output.voice", "error.type", "error.code", "error.param", "error.event_id",
-		"item.id", "item.type", "item.status", "item.role", "item.content.type", "part.type",
-		"response.id", "response.status", "response.status_details.error.code",
-		"transcript", "item_id", "response_id", "output_index", "content_index", "delta", "rate_limits"
-	]
+	private static func namedPaths(for type: String) -> Set<String> {
+		let item = Set(["item.id", "item.type", "item.status", "item.role", "item.content", "item.content.type"])
+		let coordinates = Set(["response_id", "item_id", "output_index", "content_index"])
+		switch type {
+		case "session.updated": return Set([
+			"session.type", "session.model", "session.audio", "session.audio.input", "session.audio.output",
+			"session.audio.input.transcription", "session.audio.input.transcription.model", "session.audio.input.transcription.language",
+			"session.audio.input.turn_detection", "session.audio.input.turn_detection.type", "session.audio.input.turn_detection.threshold",
+			"session.audio.input.turn_detection.prefix_padding_ms", "session.audio.input.turn_detection.silence_duration_ms",
+			"session.audio.input.turn_detection.create_response", "session.audio.input.turn_detection.interrupt_response",
+			"session.audio.output.voice"
+		])
+		case "error": return Set(["error.type", "error.code", "error.param", "error.event_id"])
+		case "conversation.item.added", "conversation.item.created", "conversation.item.done": return item
+		case "conversation.item.input_audio_transcription.completed": return Set(["item_id", "content_index", "transcript"])
+		case "conversation.item.input_audio_transcription.delta": return Set(["item_id", "content_index", "delta"])
+		case "response.created": return Set(["response.id"])
+		case "response.output_item.added", "response.output_item.done": return coordinates.union(item)
+		case "response.content_part.added", "response.content_part.done": return coordinates.union(["part.type"])
+		case "response.output_audio.delta", "response.audio.delta", "response.output_audio_transcript.delta": return coordinates.union(["delta"])
+		case "response.output_audio_transcript.done": return coordinates.union(["transcript"])
+		case "response.output_audio.done": return coordinates
+		case "rate_limits.updated": return Set(["rate_limits", "rate_limits.name", "rate_limits.limit", "rate_limits.remaining", "rate_limits.reset_seconds"])
+		case "response.done": return Set(["response.id", "response.status", "response.status_details", "response.status_details.error", "response.status_details.error.code"])
+		default: return []
+		}
+	}
 }
 
 package enum StrictJSON: Sendable {
@@ -315,10 +337,7 @@ package enum StrictJSON: Sendable {
 
 	package static func parse(_ data: Data) throws -> StrictJSON {
 		var parser = Parser(bytes: Array(data))
-		let value = try parser.value(depth: 0)
-		parser.skipWhitespace()
-		guard parser.index == parser.bytes.count else { throw WebRTCTransportFailure.malformedEvent }
-		return value
+		return try parser.parse()
 	}
 
 	package func requiredObject() throws -> [String: StrictJSON] {
@@ -327,42 +346,82 @@ package enum StrictJSON: Sendable {
 	}
 
 	private struct Parser {
+		private enum ObjectState { case key(endAllowed: Bool), colon(String), value(String), commaOrEnd }
+		private enum ArrayState { case value(endAllowed: Bool), commaOrEnd }
+		private enum Frame { case object([String: StrictJSON], ObjectState), array([StrictJSON], ArrayState) }
 		let bytes: [UInt8]
 		var index = 0
 		mutating func skipWhitespace() { while index < bytes.count, [9, 10, 13, 32].contains(bytes[index]) { index += 1 } }
-		mutating func value(depth: Int) throws -> StrictJSON {
-			guard depth <= 64 else { throw WebRTCTransportFailure.malformedEvent }
+		mutating func parse() throws -> StrictJSON {
+			var frames: [Frame] = []
+			var root: StrictJSON?
+			func completed(_ value: StrictJSON, frames: inout [Frame], root: inout StrictJSON?) throws {
+				guard let frame = frames.popLast() else {
+					guard root == nil else { throw WebRTCTransportFailure.malformedEvent }
+					root = value
+					return
+				}
+				switch frame {
+				case .object(var values, .value(let key)):
+					values[key] = value
+					frames.append(.object(values, .commaOrEnd))
+				case .array(var values, .value):
+					values.append(value)
+					frames.append(.array(values, .commaOrEnd))
+				default: throw WebRTCTransportFailure.malformedEvent
+				}
+			}
+			while root == nil || !frames.isEmpty {
+				if frames.isEmpty {
+					if let value = try beginValue(frames: &frames) { try completed(value, frames: &frames, root: &root) }
+					continue
+				}
+				let frame = frames.removeLast()
+				switch frame {
+				case let .object(values, .key(endAllowed)):
+					skipWhitespace()
+					if endAllowed, consume(125) { try completed(.object(values), frames: &frames, root: &root); continue }
+					guard index < bytes.count, bytes[index] == 34 else { throw WebRTCTransportFailure.malformedEvent }
+					let key = try string()
+					guard values[key] == nil else { throw WebRTCTransportFailure.malformedEvent }
+					frames.append(.object(values, .colon(key)))
+				case let .object(values, .colon(key)):
+					skipWhitespace(); guard consume(58) else { throw WebRTCTransportFailure.malformedEvent }
+					frames.append(.object(values, .value(key)))
+				case .object(_, .value):
+					frames.append(frame)
+					if let value = try beginValue(frames: &frames) { try completed(value, frames: &frames, root: &root) }
+				case let .object(values, .commaOrEnd):
+					skipWhitespace()
+					if consume(125) { try completed(.object(values), frames: &frames, root: &root) }
+					else { guard consume(44) else { throw WebRTCTransportFailure.malformedEvent }; frames.append(.object(values, .key(endAllowed: false))) }
+				case let .array(values, .value(endAllowed)):
+					skipWhitespace()
+					if endAllowed, consume(93) { try completed(.array(values), frames: &frames, root: &root); continue }
+					frames.append(frame)
+					if let value = try beginValue(frames: &frames) { try completed(value, frames: &frames, root: &root) }
+				case let .array(values, .commaOrEnd):
+					skipWhitespace()
+					if consume(93) { try completed(.array(values), frames: &frames, root: &root) }
+					else { guard consume(44) else { throw WebRTCTransportFailure.malformedEvent }; frames.append(.array(values, .value(endAllowed: false))) }
+				}
+			}
+			skipWhitespace()
+			guard index == bytes.count, let root else { throw WebRTCTransportFailure.malformedEvent }
+			return root
+		}
+
+		private mutating func beginValue(frames: inout [Frame]) throws -> StrictJSON? {
 			skipWhitespace(); guard index < bytes.count else { throw WebRTCTransportFailure.malformedEvent }
 			switch bytes[index] {
-			case 123: return try object(depth: depth)
-			case 91: return try array(depth: depth)
+			case 123: index += 1; frames.append(.object([:], .key(endAllowed: true))); return nil
+			case 91: index += 1; frames.append(.array([], .value(endAllowed: true))); return nil
 			case 34: return .string(try string())
 			case 116: try literal("true"); return .bool(true)
 			case 102: try literal("false"); return .bool(false)
 			case 110: try literal("null"); return .null
 			case 45, 48...57: return .number(try number())
 			default: throw WebRTCTransportFailure.malformedEvent
-			}
-		}
-		mutating func object(depth: Int) throws -> StrictJSON {
-			index += 1; skipWhitespace(); var result: [String: StrictJSON] = [:]
-			if consume(125) { return .object(result) }
-			while true {
-				skipWhitespace(); guard index < bytes.count, bytes[index] == 34 else { throw WebRTCTransportFailure.malformedEvent }
-				let key = try string(); guard result[key] == nil else { throw WebRTCTransportFailure.malformedEvent }
-				skipWhitespace(); guard consume(58) else { throw WebRTCTransportFailure.malformedEvent }
-				result[key] = try value(depth: depth + 1); skipWhitespace()
-				if consume(125) { return .object(result) }
-				guard consume(44) else { throw WebRTCTransportFailure.malformedEvent }
-			}
-		}
-		mutating func array(depth: Int) throws -> StrictJSON {
-			index += 1; skipWhitespace(); var result: [StrictJSON] = []
-			if consume(93) { return .array(result) }
-			while true {
-				result.append(try value(depth: depth + 1)); skipWhitespace()
-				if consume(93) { return .array(result) }
-				guard consume(44) else { throw WebRTCTransportFailure.malformedEvent }
 			}
 		}
 		mutating func string() throws -> String {
@@ -411,9 +470,11 @@ package enum StrictJSON: Sendable {
 
 private extension Dictionary where Key == String, Value == StrictJSON {
 	func containsFlattenedConflict(namedPaths: Set<String>, prefix: String = "") -> Bool {
-		contains { key, value in
+		guard !namedPaths.isEmpty else { return false }
+		return contains { key, value in
 			let path = prefix.isEmpty ? key : "\(prefix).\(key)"
 			if key.contains("."), namedPaths.contains(path) { return true }
+			guard namedPaths.contains(where: { $0 == path || $0.hasPrefix("\(path).") }) else { return false }
 			switch value {
 			case let .object(object): return object.containsFlattenedConflict(namedPaths: namedPaths, prefix: path)
 			case let .array(values):
