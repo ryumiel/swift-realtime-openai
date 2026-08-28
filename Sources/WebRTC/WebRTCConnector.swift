@@ -6,6 +6,43 @@ import LiveKitWebRTC
 import FoundationNetworking
 #endif
 
+final class ProductionRemoteAudioAdmissionGate: @unchecked Sendable {
+	private let lock = NSLock()
+	private var enabled = true
+	private var closed = false
+	private var tracks: [LKRTCMediaStreamTrack] = []
+
+	func setEnabled(_ enabled: Bool) {
+		lock.withLock {
+			guard !closed else { return }
+			self.enabled = enabled
+			tracks.forEach { $0.isEnabled = enabled }
+		}
+	}
+
+	func register(_ candidates: [LKRTCMediaStreamTrack]) {
+		lock.withLock {
+			if closed {
+				candidates.filter { $0.kind == "audio" }.forEach { $0.isEnabled = false }
+				return
+			}
+			for track in candidates where track.kind == "audio" && !tracks.contains(where: { $0 === track }) {
+				track.isEnabled = enabled
+				tracks.append(track)
+			}
+		}
+	}
+
+	func close() {
+		lock.withLock {
+			closed = true
+			enabled = false
+			tracks.forEach { $0.isEnabled = false }
+			tracks.removeAll(keepingCapacity: false)
+		}
+	}
+}
+
 @_spi(AirbridgeQualification) @MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
 	private enum DeliveryMode { case ordinary, production, qualification }
 	/// Terminal states describe teardown progress and remain observable after a
@@ -369,6 +406,7 @@ import FoundationNetworking
 	private let audioTrack: LKRTCAudioTrack
 	private let dataChannel: LKRTCDataChannel
 	private let connection: LKRTCPeerConnection
+	nonisolated private let remoteAudioGate = ProductionRemoteAudioAdmissionGate()
 
 	private let stream: AsyncThrowingStream<WebRTCInboundEvent, Error>.Continuation
 	private var productionEventSink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
@@ -385,9 +423,9 @@ import FoundationNetworking
 	private var ingressDrainTask: Task<Void, Never>?
 	nonisolated private let terminalGate = TerminalGate()
 	package static let inboundMailboxCapacity = 32
-	private struct PreReadyInboundEvent {
-		let event: WebRTCInboundEvent
-		let retentionToken: AnyObject?
+	private enum PreReadyInboundEvent {
+		case decoded(WebRTCInboundEvent, retentionToken: AnyObject?)
+		case raw(Data, retentionToken: AnyObject?)
 	}
 	private var preReadyInboundEvents: [PreReadyInboundEvent] = []
 
@@ -520,6 +558,15 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: command.encoded(), isBinary: false))
 	}
 
+	package func sendSessionConfiguration(_ data: Data) throws {
+		guard isCurrentAndAcceptingProgression(), dataChannel.readyState == .open else {
+			throw WebRTCTransportFailure.cancelled
+		}
+		guard dataChannel.sendData(LKRTCDataBuffer(data: data, isBinary: false)) else {
+			throw WebRTCTransportFailure.requestFailed
+		}
+	}
+
 	package func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void) {
 		productionEventSink = sink
 	}
@@ -527,6 +574,7 @@ import FoundationNetworking
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard lifecycle.isCurrent(generation) else { return }
 		audioTrack.isEnabled = state == .enabled
+		remoteAudioGate.setEnabled(state == .enabled)
 	}
 
 	@_spi(AirbridgeQualification) public func sendSessionUpdate(
@@ -567,6 +615,7 @@ import FoundationNetworking
 		enqueueDiagnostic(.teardownBegan)
 		status = .disconnected
 		audioTrack.isEnabled = false
+		remoteAudioGate.close()
 		terminalObserver.disableAudio()
 		terminalObserver.cancelSignaling()
 		lifecycle.cancelSignalingTask()
@@ -809,7 +858,7 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 		reportRemoteAudioTrackIfPresent(in: [stream])
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didAdd receiver: LKRTCRtpReceiver, streams: [LKRTCMediaStream]) {
-		reportRemoteAudioTrackIfPresent(receiverTrackKind: receiver.track?.kind, streams: streams)
+		reportRemoteAudioTrackIfPresent(receiverTrack: receiver.track, streams: streams)
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
@@ -877,11 +926,13 @@ extension WebRTCConnector: LKRTCDataChannelDelegate {
 
 extension WebRTCConnector {
 	nonisolated private func reportRemoteAudioTrackIfPresent(in streams: [LKRTCMediaStream]) {
-		reportRemoteAudioTrackIfPresent(receiverTrackKind: nil, streams: streams)
+		reportRemoteAudioTrackIfPresent(receiverTrack: nil, streams: streams)
 	}
 
-	nonisolated private func reportRemoteAudioTrackIfPresent(receiverTrackKind: String?, streams: [LKRTCMediaStream]) {
-		guard Self.receiverOrStreamsContainAudioTrack(trackKind: receiverTrackKind, streams: streams) else { return }
+	nonisolated private func reportRemoteAudioTrackIfPresent(receiverTrack: LKRTCMediaStreamTrack?, streams: [LKRTCMediaStream]) {
+		let tracks: [LKRTCMediaStreamTrack] = streams.flatMap(\.audioTracks) + (receiverTrack.map { [$0] } ?? [])
+		remoteAudioGate.register(tracks)
+		guard Self.receiverOrStreamsContainAudioTrack(trackKind: receiverTrack?.kind, streams: streams) else { return }
 		enqueueDiagnosticFromDelegate(.remoteAudioTrackObserved)
 	}
 
@@ -933,6 +984,18 @@ extension WebRTCConnector {
 		guard terminalGate.shouldProcessAcceptedIngress() else { return }
 		guard lifecycle.isCurrent(generation) else { return }
 		terminalObserver.didDrainInbound()
+		if deliveryMode == .production {
+			guard status == .connected else {
+				guard preReadyInboundEvents.isEmpty else {
+					requestTerminalFromAcceptedIngress(WebRTCTransportFailure.malformedEvent)
+					return
+				}
+				preReadyInboundEvents = [.raw(data, retentionToken: terminalObserver.makePreReadyRetentionToken())]
+				return
+			}
+			yieldProduction(.rawInbound(data), fromAcceptedIngress: true)
+			return
+		}
 		do {
 			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }
 			if inboundEvent == .providerError {
@@ -945,10 +1008,7 @@ extension WebRTCConnector {
 					requestTerminalFromAcceptedIngress(WebRTCTransportFailure.malformedEvent)
 					return
 				}
-				preReadyInboundEvents = [PreReadyInboundEvent(
-					event: inboundEvent,
-					retentionToken: terminalObserver.makePreReadyRetentionToken()
-				)]
+				preReadyInboundEvents = [.decoded(inboundEvent, retentionToken: terminalObserver.makePreReadyRetentionToken())]
 				return
 			}
 			yieldInbound(inboundEvent)
@@ -984,7 +1044,12 @@ extension WebRTCConnector {
 			if fromAcceptedIngress, !terminalGate.shouldProcessAcceptedIngress() { return }
 			let bufferedEvents = preReadyInboundEvents
 			preReadyInboundEvents.removeAll()
-			bufferedEvents.forEach { yieldInbound($0.event) }
+			bufferedEvents.forEach {
+				switch $0 {
+				case let .decoded(event, _): yieldInbound(event)
+				case let .raw(data, _): yieldProduction(.rawInbound(data), fromAcceptedIngress: fromAcceptedIngress)
+				}
+			}
 		} else if isTerminal {
 			requestTerminal()
 		}

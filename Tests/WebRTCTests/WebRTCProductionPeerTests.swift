@@ -1,9 +1,29 @@
 import Core
 import Foundation
+import LiveKitWebRTC
 @_spi(AirbridgeQualification) @testable import WebRTC
 import XCTest
 
 final class WebRTCProductionPeerTests: XCTestCase {
+	func testRemoteAudioAdmissionDiscardsBeforeGateAndNeverReplaysAfterClose() {
+		let factory = LKRTCPeerConnectionFactory()
+		let source = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+		let track = factory.audioTrack(with: source, trackId: "synthetic-remote")
+		let gate = ProductionRemoteAudioAdmissionGate()
+		gate.setEnabled(false)
+		gate.register([track])
+		XCTAssertFalse(track.isEnabled)
+		gate.setEnabled(true)
+		XCTAssertTrue(track.isEnabled)
+		gate.close()
+		XCTAssertFalse(track.isEnabled)
+		gate.setEnabled(true)
+		XCTAssertFalse(track.isEnabled, "Closed tracks are released and cannot be replayed")
+		let lateTrack = factory.audioTrack(with: source, trackId: "synthetic-late-remote")
+		gate.register([lateTrack])
+		XCTAssertFalse(lateTrack.isEnabled, "Late current-generation callbacks cannot reopen remote media")
+	}
+
 	func testLocalAIConfigurationValidatesVoiceAndLanguageBeforePeerConstruction() throws {
 		let configuration = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
 		XCTAssertEqual(configuration, try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja"))
@@ -36,12 +56,13 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		)
 		let recorder = ProductionEventRecorder()
 		connector.installProductionEventSink { result in recorder.values.append(result) }
-		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
+		let raw = Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8)
+		connector.receiveInbound(raw)
 		await fulfillment(of: [drained], timeout: 1)
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
 		XCTAssertEqual(recorder.values.count, 2)
 		XCTAssertEqual(try recorder.values[0].get(), .ready)
-		XCTAssertEqual(try recorder.values[1].get(), .inbound(.responseFinished))
+		XCTAssertEqual(try recorder.values[1].get(), .rawInbound(raw))
 		await connector.closeAndSettle()
 	}
 
@@ -833,7 +854,18 @@ private final class WeakPeerBox {
 	func failOffer() { offerContinuation?.resume(throwing: ArbitraryError()); offerContinuation = nil }
 	func failAnswer() { answerContinuation?.resume(throwing: ArbitraryError()); answerContinuation = nil }
 	func resumeClose() { closeContinuation?.resume(); closeContinuation = nil }
-	func sendSessionUpdate(voice: String, language: String) throws { sessionUpdates.append("\(voice)|\(language)") }
+	func sendSessionConfiguration(_ data: Data) throws {
+		let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+		let session = root?["session"] as? [String: Any]
+		let audio = session?["audio"] as? [String: Any]
+		let input = audio?["input"] as? [String: Any]
+		let output = audio?["output"] as? [String: Any]
+		let transcription = input?["transcription"] as? [String: Any]
+		guard let voice = output?["voice"] as? String, let language = transcription?["language"] as? String else {
+			throw ArbitraryError()
+		}
+		sessionUpdates.append("\(voice)|\(language)")
+	}
 	func sendProductionCommand(_ command: ProductionCommand) throws {
 		if let commandError { throw commandError }
 		let object = try JSONSerialization.jsonObject(with: command.encoded()) as? [String: Any]

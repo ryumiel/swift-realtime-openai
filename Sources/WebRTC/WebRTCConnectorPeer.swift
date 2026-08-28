@@ -3,30 +3,46 @@ import Foundation
 
 public enum WebRTCLocalAudioState: Sendable, Equatable { case enabled, disabled }
 
-/// A validated LocalAI initial session configuration. OpenAI policy is added by
-/// the later provider-specific task; it is intentionally not constructible yet.
 public struct WebRTCSessionConfiguration: Sendable, Equatable {
-	fileprivate let voice: String
+	fileprivate enum Provider: Sendable, Equatable { case localAI(voice: String), openAI }
+	fileprivate let provider: Provider
 	fileprivate let language: String
 
-	private init(voice: String, language: String) {
-		self.voice = voice
+	private init(provider: Provider, language: String) {
+		self.provider = provider
 		self.language = language
 	}
 
 	public static func localAI(voice: String, language: String) throws -> Self {
 		let update = try WebRTCSessionUpdate(voice: voice, language: language)
-		return Self(voice: update.voice, language: update.language)
+		return Self(provider: .localAI(voice: update.voice), language: update.language)
+	}
+
+	public static func openAI(language: String) throws -> Self {
+		_ = try OpenAIProductionStateMachine(language: language)
+		return Self(provider: .openAI, language: language)
+	}
+
+	package func encoded() throws -> Data {
+		switch provider {
+		case let .localAI(voice): return try WebRTCSessionUpdate(voice: voice, language: language).encoded()
+		case .openAI:
+			return Data(#"{"type":"session.update","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"\#(language)"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8)
+		}
 	}
 }
 
 public enum WebRTCConnectorEvent: Sendable, Equatable {
 	case ready
 	case localAISessionConfigured(voice: String, language: String)
+	case openAISessionCreated
+	case openAISessionConfigured(language: String)
 	case connected
 	case userTranscript(String)
 	case assistantTranscript(String)
+	case responseStarted
 	case responseFinished
+	case responseCancellationTerminalObserved
 	case closed
 }
 
@@ -39,6 +55,7 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	func createResponse() throws
 	func cancelResponse() throws
 	func clearOutputAudio() throws
+	func settleCancelledResponse() throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
 	func closeAndJoin() async
 }
@@ -79,6 +96,7 @@ private final class ProductionTerminalSelection: @unchecked Sendable {
 package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	case ready
 	case inbound(WebRTCInboundEvent)
+	case rawInbound(Data)
 	case terminal(WebRTCTransportFailure?)
 }
 
@@ -86,7 +104,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)
 	func makeOffer() async throws -> String
 	func apply(answer: String) async throws
-	func sendSessionUpdate(voice: String, language: String) throws
+	func sendSessionConfiguration(_ data: Data) throws
 	func sendProductionCommand(_ command: ProductionCommand) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
 	func closeAndSettle() async
@@ -136,6 +154,8 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	private var pendingReady = false
 	private var ready = false
 	private var configuration: WebRTCSessionConfiguration?
+	private var openAIState: OpenAIProductionStateMachine?
+	private var pendingRawInbound: [Data] = []
 	private var configurationAcknowledgementPending = false
 	private var connected = false
 	private var terminal = false
@@ -235,9 +255,17 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			throw WebRTCTransportFailure.invalidRequest
 		}
 		do {
-			try backing.sendSessionUpdate(voice: configuration.voice, language: configuration.language)
 			self.configuration = configuration
-			configurationAcknowledgementPending = true
+			switch configuration.provider {
+			case .localAI:
+				try backing.sendSessionConfiguration(configuration.encoded())
+				configurationAcknowledgementPending = true
+			case .openAI:
+				openAIState = try OpenAIProductionStateMachine(language: configuration.language)
+			}
+			let pending = pendingRawInbound
+			pendingRawInbound.removeAll(keepingCapacity: false)
+			for data in pending { try receiveRaw(data) }
 		} catch {
 			let failure = Self.contentFree(error)
 			startSettlement(failure: failure, origin: .caller)
@@ -249,9 +277,20 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		guard Self.isValidText(text) else { try rejectCommand() }
 		try sendCommand(.userText(text))
 	}
-	package func createResponse() throws { try sendCommand(.createResponse) }
-	package func cancelResponse() throws { try sendCommand(.cancelResponse) }
+	package func createResponse() throws {
+		if openAIState != nil { do { try openAIState?.prepareCreateResponse() } catch { try rejectCommand() } }
+		try sendCommand(.createResponse)
+	}
+	package func cancelResponse() throws {
+		if openAIState != nil { do { try openAIState?.prepareCancelResponse() } catch { try rejectCommand() } }
+		try sendCommand(.cancelResponse)
+	}
 	package func clearOutputAudio() throws { try sendCommand(.clearOutputAudio) }
+	package func settleCancelledResponse() throws {
+		guard openAIState != nil else { try rejectCommand() }
+		do { try openAIState?.settleCancelledResponse() }
+		catch { try rejectCommand() }
+	}
 
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard !terminal, state == .disabled || connected else { return }
@@ -280,10 +319,16 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			guard !ready else { startSettlement(failure: .malformedEvent, origin: .backing); return }
 			if answerInFlight { pendingReady = true; return }
 			guard admitReady() else { startSettlement(failure: .malformedEvent, origin: .backing); return }
+		case let .rawInbound(data):
+			do { try receiveRaw(data) }
+			catch let failure as WebRTCTransportFailure { startSettlement(failure: failure, origin: .backing) }
+			catch { startSettlement(failure: Self.contentFree(error), origin: .backing) }
 		case let .inbound(inbound):
 			switch inbound {
 			case let .sessionUpdated(voice, language):
-				guard ready, configurationAcknowledgementPending, let configuration, configuration.voice == voice, configuration.language == language,
+				guard ready, configurationAcknowledgementPending, let configuration,
+					case let .localAI(expectedVoice) = configuration.provider,
+					expectedVoice == voice, configuration.language == language,
 					yield(.localAISessionConfigured(voice: voice, language: language)), yield(.connected)
 				else { startSettlement(failure: .malformedEvent, origin: .backing); return }
 				configurationAcknowledgementPending = false
@@ -292,6 +337,35 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			case let .assistantTranscript(text): guard connected, yield(.assistantTranscript(text)) else { startSettlement(failure: .malformedEvent, origin: .backing); return }; return
 			case .responseFinished: guard connected, yield(.responseFinished) else { startSettlement(failure: .malformedEvent, origin: .backing); return }; return
 			case .providerError: startSettlement(failure: .providerError, origin: .backing); return
+			}
+		}
+	}
+
+	private func receiveRaw(_ data: Data) throws {
+		guard ready else { throw WebRTCTransportFailure.malformedEvent }
+		guard let configuration else {
+			guard pendingRawInbound.count < WebRTCConnector.inboundMailboxCapacity else { throw WebRTCTransportFailure.ingressOverloaded }
+			pendingRawInbound.append(data)
+			return
+		}
+		switch configuration.provider {
+		case .localAI:
+			guard let inbound = try WebRTCInboundEventDecoder().decodeForConnector(data) else { return }
+			receive(.success(.inbound(inbound)))
+		case .openAI:
+			guard let event = try openAIState?.consume(data) else { return }
+			switch event {
+			case .sessionCreated:
+				guard yield(.openAISessionCreated) else { return }
+				try backing.sendSessionConfiguration(configuration.encoded())
+			case .sessionAcknowledged:
+				guard yield(.openAISessionConfigured(language: configuration.language)) else { return }
+				connected = true
+			case let .userTranscript(text): guard yield(.userTranscript(text)) else { return }
+			case let .assistantTranscript(text): guard yield(.assistantTranscript(text)) else { return }
+			case .responseStarted: guard yield(.responseStarted) else { return }
+			case .responseFinished: guard yield(.responseFinished) else { return }
+			case .cancellationTerminalObserved: guard yield(.responseCancellationTerminalObserved) else { return }
 			}
 		}
 	}
@@ -334,6 +408,8 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		}
 		guard !terminal else { return Task {} }
 		terminal = true
+		openAIState?.invalidate()
+		pendingRawInbound.removeAll(keepingCapacity: false)
 		terminalFailure = failure
 		let task = Task { @MainActor [self] in
 			self.backing.setLocalAudioState(.disabled)
