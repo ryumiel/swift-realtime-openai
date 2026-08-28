@@ -5,10 +5,12 @@ final class ExternalProductionImportProof: XCTestCase {
 	@MainActor func testExternalConsumerCompilesEveryProductionOperation() throws {
 		let factory = WebRTCConnectorPeerFactory(initialAudioState: .disabled)
 		let configuration = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
+		let openAIConfiguration = try WebRTCSessionConfiguration.openAI(language: "en")
 		let _: WebRTCConnectorEvent = .ready
 		let _: WebRTCLocalAudioState = .enabled
 		_ = factory
 		_ = configuration
+		_ = openAIConfiguration
 	}
 
 	@MainActor func exercise(_ peer: any WebRTCConnectorPeer, configuration: WebRTCSessionConfiguration) async throws {

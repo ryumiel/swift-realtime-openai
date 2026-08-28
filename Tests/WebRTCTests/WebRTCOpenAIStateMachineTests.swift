@@ -89,8 +89,21 @@ struct WebRTCOpenAIStateMachineTests {
 		#expect(throws: WebRTCTransportFailure.invalidRequest) { try peer.configure(.openAI(language: "en")) }
 		await peer.closeAndJoin()
 		#expect(backing.configurationPayloads.isEmpty)
-		#expect(backing.selectedSessions.isEmpty)
 		#expect(backing.audioStates == [.enabled, .disabled])
+	}
+
+	@Test("construction-bound provider rejects a LocalAI configuration on the OpenAI path")
+	func openAIConstructionRejectsLocalAIConfiguration() async throws {
+		let backing = OpenAIBacking()
+		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		backing.emit(.ready)
+		#expect(throws: WebRTCTransportFailure.invalidRequest) {
+			try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
+		}
+		await peer.closeAndJoin()
+		#expect(backing.configurationPayloads.isEmpty)
 	}
 
 	@Test("handshake preserves structural semantic and unsupported failure partitions")
@@ -341,6 +354,29 @@ struct WebRTCOpenAIStateMachineTests {
 		}
 	}
 
+	@Test("supported user item stages require nonempty audio content")
+	func rejectsEmptyUserAudioItemsAsMalformed() throws {
+		for json in [
+			#"{"type":"conversation.item.added","item":{"id":"u","type":"message","role":"user","status":"in_progress","content":[]}}"#,
+			#"{"type":"conversation.item.created","item":{"id":"u","type":"message","role":"user","content":[]}}"#,
+			#"{"type":"conversation.item.done","item":{"id":"u","type":"message","role":"user","status":"completed","content":[]}}"#
+		] {
+			var machine = try activeMachine()
+			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+		}
+	}
+
+	@Test("near-cap nesting has no semantic depth limit or recursive lifetime")
+	func nearCapNestingIsIterative() throws {
+		var machine = try OpenAIProductionStateMachine(language: "en")
+		let prefix = #"{"type":"session.created","default":"#
+		let suffix = "}"
+		let depth = (256 * 1024 - prefix.utf8.count - suffix.utf8.count - 4) / 2
+		let json = prefix + String(repeating: "[", count: depth) + "null" + String(repeating: "]", count: depth) + suffix
+		#expect(json.utf8.count <= 256 * 1024)
+		#expect(try machine.consume(Data(json.utf8)) == .sessionCreated)
+	}
+
 	private func activeMachine() throws -> OpenAIProductionStateMachine {
 		var machine = try OpenAIProductionStateMachine(language: "en")
 		_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
@@ -381,7 +417,6 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	var configurationPayloads: [Data] = []
 	var commandTypes: [String] = []
 	var audioStates: [WebRTCLocalAudioState] = []
-	var selectedSessions: [ProductionSessionSelection] = []
 	var closeCount = 0
 	init(configurationSendFails: Bool = false, commandSendFails: Bool = false) {
 		self.configurationSendFails = configurationSendFails
@@ -391,7 +426,6 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void) { self.sink = sink }
 	func makeOffer() async throws -> String { "offer" }
 	func apply(answer _: String) async throws {}
-	func selectProductionSession(_ selection: ProductionSessionSelection) throws { selectedSessions.append(selection) }
 	func sendSessionConfiguration(_ data: Data) throws {
 		if configurationSendFails { throw SyntheticError() }
 		configurationPayloads.append(data)

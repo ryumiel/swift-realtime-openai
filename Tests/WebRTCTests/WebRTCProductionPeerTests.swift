@@ -6,41 +6,83 @@ import LiveKitWebRTC
 import XCTest
 
 final class WebRTCProductionPeerTests: XCTestCase {
-	func testRemoteAudioAdmissionDiscardsBeforeGateAndNeverReplaysAfterClose() {
+	@MainActor func testRealOpenAIConnectorAndPeerGateRemotePCMFromConstructionThroughTerminal() async throws {
+		let frames = ProductionFrameCounter()
+		let connector = try WebRTCConnector.createProduction(
+			initialAudioState: .disabled,
+			session: ProductionStubSession(),
+			terminalObserver: .init(
+				cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {},
+				recordPermissionGranted: { true },
+				didAdmitRemoteAudioFrame: { frames.increment() }
+			)
+		)
 		let factory = LKRTCPeerConnectionFactory()
+		let remoteConnection = try XCTUnwrap(factory.peerConnection(
+			with: LKRTCConfiguration(),
+			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+			delegate: nil
+		))
 		let source = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
 		let track = factory.audioTrack(with: source, trackId: "synthetic-remote")
 		let overflowTrack = factory.audioTrack(with: source, trackId: "synthetic-overflow")
-		let frames = ProductionFrameCounter()
-		let gate = ProductionRemoteAudioAdmissionGate { frames.increment() }
+		let stream = factory.mediaStream(withStreamId: "openai-remote")
+		stream.addAudioTrack(track)
+		stream.addAudioTrack(overflowTrack)
+		connector.peerConnection(remoteConnection, didAdd: stream)
 		let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
 		let frame = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1)!
-		gate.setEnabled(false)
-		gate.register([track, overflowTrack])
-		gate.render(pcmBuffer: frame)
-		gate.render(pcmBuffer: frame)
+		connector.render(pcmBuffer: frame)
 		XCTAssertFalse(track.isEnabled)
 		XCTAssertFalse(overflowTrack.isEnabled)
-		XCTAssertEqual(frames.value, 0, "Pre-creation and between-creation-and-ack PCM callbacks are discarded")
-		gate.setEnabled(true)
+		XCTAssertEqual(frames.value, 0, "Pre-peer-construction PCM is discarded")
+
+		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { connector }).makePeer()
+		var events = peer.events.makeAsyncIterator()
+		let offer = try await peer.makeOffer()
+		try await remoteConnection.setRemoteDescription(LKRTCSessionDescription(type: .offer, sdp: offer))
+		let answer = try await remoteConnection.answer(for: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+		try await remoteConnection.setLocalDescription(answer)
+		for _ in 0..<500 where remoteConnection.iceGatheringState != .complete {
+			try await Task.sleep(for: .milliseconds(10))
+		}
+		let gatheredAnswer = try XCTUnwrap(remoteConnection.localDescription)
+		try await peer.apply(remoteAnswer: gatheredAnswer.sdp)
+		let ready = try await events.next()
+		XCTAssertEqual(ready, .ready)
+
+		XCTAssertFalse(track.isEnabled)
+		XCTAssertFalse(overflowTrack.isEnabled)
+		XCTAssertEqual(frames.value, 0, "Pre-creation PCM is discarded")
+
+		try peer.configure(.openAI(language: "en"))
+		connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+		let created = try await events.next()
+		XCTAssertEqual(created, .openAISessionCreated)
+		connector.render(pcmBuffer: frame)
+		XCTAssertEqual(frames.value, 0, "Creation-to-ack PCM is discarded")
+		connector.receiveInbound(Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8))
+		let configured = try await events.next()
+		XCTAssertEqual(configured, .openAISessionConfigured(language: "en"))
+		peer.setLocalAudioState(.enabled)
 		XCTAssertTrue(track.isEnabled)
-		XCTAssertFalse(overflowTrack.isEnabled, "Only the bounded retained remote track may be reopened")
-		XCTAssertEqual(frames.value, 0, "Discarded callbacks are never replayed on acknowledgement")
-		gate.render(pcmBuffer: frame)
-		XCTAssertEqual(frames.value, 1, "A fresh post-ack PCM callback is admitted")
-		gate.unregister([track])
-		gate.register([overflowTrack])
-		XCTAssertTrue(overflowTrack.isEnabled, "Removing the retained track admits one fresh bounded replacement")
-		gate.close()
-		XCTAssertFalse(track.isEnabled)
 		XCTAssertFalse(overflowTrack.isEnabled)
-		gate.setEnabled(true)
-		XCTAssertFalse(track.isEnabled, "Closed tracks are released and cannot be replayed")
+		XCTAssertEqual(frames.value, 0, "Discarded callbacks are never replayed")
+		connector.render(pcmBuffer: frame)
+		XCTAssertEqual(frames.value, 1, "A fresh post-ack PCM callback is admitted")
+
+		connector.receiveDataChannelState(isOpen: false, isTerminal: true)
+		XCTAssertFalse(track.isEnabled)
+		peer.setLocalAudioState(.enabled)
 		let lateTrack = factory.audioTrack(with: source, trackId: "synthetic-late-remote")
-		gate.register([lateTrack])
-		gate.render(pcmBuffer: frame)
-		XCTAssertFalse(lateTrack.isEnabled, "Late current-generation callbacks cannot reopen remote media")
+		let lateStream = factory.mediaStream(withStreamId: "openai-late-remote")
+		lateStream.addAudioTrack(lateTrack)
+		connector.peerConnection(remoteConnection, didAdd: lateStream)
+		XCTAssertFalse(lateTrack.isEnabled, "Post-invalidation tracks are neither retained nor opened")
+		connector.render(pcmBuffer: frame)
 		XCTAssertEqual(frames.value, 1, "Post-invalidation callbacks are discarded")
+		await peer.closeAndJoin()
+		remoteConnection.close()
 	}
 
 	func testLocalAIConfigurationValidatesVoiceAndLanguageBeforePeerConstruction() throws {
@@ -71,6 +113,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let drained = expectation(description: "pre-ready inbound drained")
 		let delivered = expectation(description: "configured raw inbound delivered")
 		let connector = try WebRTCConnector.createProduction(
+			initialAudioState: .disabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {}, didDrainInbound: { drained.fulfill() })
 		)
@@ -79,7 +122,6 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			recorder.values.append(result)
 			if case .success(.rawInbound) = result { delivered.fulfill() }
 		}
-		try connector.selectProductionSession(.openAI)
 		let raw = Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8)
 		connector.receiveInbound(raw)
 		await fulfillment(of: [drained], timeout: 1)
@@ -91,13 +133,16 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await connector.closeAndSettle()
 	}
 
-	@MainActor func testProductionMailboxWaitsForOpenAndConfigurationThenFailsAtThirtyTwoPlusOne() async throws {
-		let firstDrain = expectation(description: "first accepted event is held by the production gate")
-		firstDrain.assertForOverFulfill = false
+	@MainActor func testProductionMailboxFailsAtThirtyTwoPlusOneWhileDrainIsSuspended() async throws {
+		let drainGate = ProductionDrainGate()
 		let terminal = expectation(description: "mailbox overflow settles")
 		let connector = try WebRTCConnector.createProduction(
+			initialAudioState: .disabled,
 			session: ProductionStubSession(),
-			terminalObserver: .init(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {}, didDrainInbound: { firstDrain.fulfill() })
+			terminalObserver: .init(
+				cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {},
+				beforeDrainInbound: { await drainGate.hold() }
+			)
 		)
 		let recorder = ProductionEventRecorder()
 		connector.installProductionEventSink { result in
@@ -106,15 +151,16 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
 		connector.receiveInbound(Data(#"{"type":"input_audio_buffer.committed"}"#.utf8))
-		await fulfillment(of: [firstDrain], timeout: 1)
+		await drainGate.waitUntilHeld()
 		for _ in 0...32 { connector.receiveInbound(Data(#"{"type":"input_audio_buffer.committed"}"#.utf8)) }
+		await drainGate.release()
 		await fulfillment(of: [terminal], timeout: 1)
 		await connector.closeAndSettle()
 	}
 
-	@MainActor func testProductionMailboxHoldsOpenChannelInputUntilProviderSelection() async throws {
+	@MainActor func testProductionMailboxUsesConstructionBoundProviderOnOpenChannel() async throws {
 		let drained = expectation(description: "open-channel input reached the authoritative mailbox")
-		let delivered = expectation(description: "selection releases the held input")
+		let delivered = expectation(description: "construction-bound provider releases the input")
 		let connector = try WebRTCConnector.createProduction(
 			session: ProductionStubSession(),
 			terminalObserver: .init(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {}, didDrainInbound: { drained.fulfill() })
@@ -128,19 +174,16 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let raw = Data(#"{"type":"input_audio_buffer.committed"}"#.utf8)
 		connector.receiveInbound(raw)
 		await fulfillment(of: [drained], timeout: 1)
-		XCTAssertEqual(recorder.values.count, 1)
-		XCTAssertEqual(try recorder.values[0].get(), .ready)
-		try connector.selectProductionSession(.openAI)
 		await fulfillment(of: [delivered], timeout: 1)
+		XCTAssertEqual(try recorder.values[0].get(), .ready)
 		XCTAssertEqual(try recorder.values[1].get(), .rawInbound(raw))
 		await connector.closeAndSettle()
 	}
 
 	@MainActor func testRealProductionOversizeMappingIsProviderSpecific() async throws {
-		for (selection, expected) in [(ProductionSessionSelection.openAI, WebRTCTransportFailure.responseTooLarge), (.localAI, .eventTooLarge)] {
+		for (initialAudioState, expected) in [(WebRTCLocalAudioState.disabled, WebRTCTransportFailure.responseTooLarge), (.enabled, .eventTooLarge)] {
 			let terminal = expectation(description: "provider-specific terminal")
-			let connector = try WebRTCConnector.createProduction(session: ProductionStubSession())
-			try connector.selectProductionSession(selection)
+			let connector = try WebRTCConnector.createProduction(initialAudioState: initialAudioState)
 			connector.installProductionEventSink { result in
 				if case let .success(.terminal(failure)) = result {
 					XCTAssertEqual(failure, expected)
@@ -151,6 +194,26 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			await fulfillment(of: [terminal], timeout: 1)
 			await connector.closeAndSettle()
 		}
+	}
+
+	@MainActor func testLocalAIConstructionDoesNotApplyOpenAIRemoteTrackCustody() async throws {
+		let connector = try WebRTCConnector.createProduction(session: ProductionStubSession())
+		let factory = LKRTCPeerConnectionFactory()
+		let source = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+		let first = factory.audioTrack(with: source, trackId: "localai-first")
+		let second = factory.audioTrack(with: source, trackId: "localai-second")
+		let stream = factory.mediaStream(withStreamId: "localai-stream")
+		stream.addAudioTrack(first)
+		stream.addAudioTrack(second)
+		let observerConnection = try XCTUnwrap(factory.peerConnection(
+			with: LKRTCConfiguration(),
+			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+			delegate: nil
+		))
+		connector.peerConnection(observerConnection, didAdd: stream)
+		XCTAssertTrue(first.isEnabled)
+		XCTAssertTrue(second.isEnabled, "LocalAI keeps native multi-track behavior")
+		await connector.closeAndSettle()
 	}
 
 	@MainActor func testRealProductionTerminalDisablesAudioBeforeResourcesAndPublication() async throws {
@@ -167,6 +230,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		connector.installProductionEventSink { _ in order.append("terminal") }
 
 		connector.receiveDataChannelState(isOpen: false, isTerminal: true)
+		XCTAssertEqual(order, ["audio"], "Native terminal selection disables media synchronously")
+		XCTAssertTrue(connector.isMuted)
 		await connector.closeAndSettle()
 		XCTAssertEqual(order, ["audio", "data", "peer", "terminal"])
 	}
@@ -890,6 +955,30 @@ private final class ProductionFrameCounter: @unchecked Sendable {
 	var value: Int { lock.withLock { count } }
 }
 
+private actor ProductionDrainGate {
+	private var held = false
+	private var holdWaiters: [CheckedContinuation<Void, Never>] = []
+	private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+	func hold() async {
+		guard !held else { return }
+		held = true
+		holdWaiters.forEach { $0.resume() }
+		holdWaiters.removeAll()
+		await withCheckedContinuation { releaseContinuation = $0 }
+	}
+
+	func waitUntilHeld() async {
+		guard !held else { return }
+		await withCheckedContinuation { holdWaiters.append($0) }
+	}
+
+	func release() {
+		releaseContinuation?.resume()
+		releaseContinuation = nil
+	}
+}
+
 @MainActor private final class FakeProductionBacking: WebRTCConnectorPeerBacking, @unchecked Sendable {
 	private var eventSink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
 	private(set) var sessionUpdates: [String] = []
@@ -966,7 +1055,6 @@ private final class ProductionFrameCounter: @unchecked Sendable {
 			Task { @MainActor in self.failAnswer() }
 		}
 	}
-	func selectProductionSession(_: ProductionSessionSelection) throws {}
 	func waitForOfferStart() async { await withCheckedContinuation { offerStartWaiter = $0 } }
 	func waitForAnswerStart() async { await withCheckedContinuation { answerStartWaiter = $0 } }
 	func resumeOffer() { offerContinuation?.resume(returning: "offer"); offerContinuation = nil }

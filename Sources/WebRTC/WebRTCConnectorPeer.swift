@@ -99,13 +99,15 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	case rawInbound(Data)
 	case terminal(WebRTCTransportFailure?)
 }
-package enum ProductionSessionSelection: Sendable, Equatable { case localAI, openAI }
+package enum ProductionSessionSelection: Sendable, Equatable {
+	case localAI, openAI
+	init(initialAudioState: WebRTCLocalAudioState) { self = initialAudioState == .disabled ? .openAI : .localAI }
+}
 
 @MainActor package protocol WebRTCConnectorPeerBacking: Sendable {
 	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)
 	func makeOffer() async throws -> String
 	func apply(answer: String) async throws
-	func selectProductionSession(_ selection: ProductionSessionSelection) throws
 	func sendSessionConfiguration(_ data: Data) throws
 	func sendProductionCommand(_ command: ProductionCommand) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
@@ -149,6 +151,7 @@ package enum ProductionSessionSelection: Sendable, Equatable { case localAI, ope
 	private let stream: AsyncThrowingStream<WebRTCConnectorEvent, any Error>.Continuation
 	private let backing: any WebRTCConnectorPeerBacking
 	private let initialAudioState: WebRTCLocalAudioState
+	private let productionSession: ProductionSessionSelection
 	private let terminalSelection = ProductionTerminalSelection()
 	private var settlementTask: Task<Void, Never>?
 	private var offerOperation: Task<String, Error>?
@@ -170,6 +173,7 @@ package enum ProductionSessionSelection: Sendable, Equatable { case localAI, ope
 	init(backing: any WebRTCConnectorPeerBacking, initialAudioState: WebRTCLocalAudioState) {
 		self.backing = backing
 		self.initialAudioState = initialAudioState
+		productionSession = ProductionSessionSelection(initialAudioState: initialAudioState)
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorEvent.self, bufferingPolicy: .bufferingOldest(2))
 		stream.onTermination = { [weak self] _ in
 			guard let self else { return }
@@ -266,12 +270,11 @@ package enum ProductionSessionSelection: Sendable, Equatable { case localAI, ope
 			self.configuration = configuration
 			switch configuration.provider {
 			case .localAI:
-				try backing.selectProductionSession(.localAI)
+				guard productionSession == .localAI else { throw WebRTCTransportFailure.invalidRequest }
 				try backing.sendSessionConfiguration(configuration.encoded())
 				configurationAcknowledgementPending = true
 			case .openAI:
-				guard initialAudioState == .disabled else { throw WebRTCTransportFailure.invalidRequest }
-				try backing.selectProductionSession(.openAI)
+				guard productionSession == .openAI, initialAudioState == .disabled else { throw WebRTCTransportFailure.invalidRequest }
 				openAIState = try OpenAIProductionStateMachine(language: configuration.language)
 			}
 		} catch {

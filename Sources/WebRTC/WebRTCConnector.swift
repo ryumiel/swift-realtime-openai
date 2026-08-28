@@ -9,12 +9,15 @@ import FoundationNetworking
 final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
 	private static let trackCapacity = 1
 	private let lock = NSLock()
-	private var enabled = true
+	private var enabled: Bool
 	private var closed = false
 	private var tracks: [LKRTCMediaStreamTrack] = []
 	private let admittedFrame: @Sendable () -> Void
 
-	init(admittedFrame: @escaping @Sendable () -> Void = {}) { self.admittedFrame = admittedFrame }
+	init(initiallyEnabled: Bool, admittedFrame: @escaping @Sendable () -> Void = {}) {
+		enabled = initiallyEnabled
+		self.admittedFrame = admittedFrame
+	}
 
 	func setEnabled(_ enabled: Bool) {
 		lock.withLock {
@@ -70,17 +73,37 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 }
 
-private final class ProductionSessionSelectionGate: @unchecked Sendable {
+private final class ProductionMediaCloser: @unchecked Sendable {
 	private let lock = NSLock()
-	private var selection: ProductionSessionSelection?
-	func select(_ proposed: ProductionSessionSelection) -> Bool {
+	private let localTrack: LKRTCAudioTrack
+	private let remoteGate: ProductionRemoteAudioAdmissionGate?
+	private let didDisable: () -> Void
+	private var closed = false
+
+	init(localTrack: LKRTCAudioTrack, remoteGate: ProductionRemoteAudioAdmissionGate?, didDisable: @escaping () -> Void) {
+		self.localTrack = localTrack
+		self.remoteGate = remoteGate
+		self.didDisable = didDisable
+	}
+
+	func set(_ state: WebRTCLocalAudioState) {
 		lock.withLock {
-			guard selection == nil else { return false }
-			selection = proposed
-			return true
+			guard !closed else { return }
+			localTrack.isEnabled = state == .enabled
+			remoteGate?.setEnabled(state == .enabled)
 		}
 	}
-	var current: ProductionSessionSelection? { lock.withLock { selection } }
+
+	func close() {
+		let didClose = lock.withLock { () -> Bool in
+			guard !closed else { return false }
+			closed = true
+			localTrack.isEnabled = false
+			remoteGate?.close()
+			return true
+		}
+		if didClose { didDisable() }
+	}
 }
 
 @_spi(AirbridgeQualification) @MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
@@ -194,22 +217,22 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 			with continuation: AsyncThrowingStream<Data, Error>.Continuation,
 			connector: WebRTCConnector
 		) {
-			lock.withLock {
-				guard case let .open(acceptedIngress) = state else { return }
+			let overloaded = lock.withLock { () -> Bool in
+				guard case let .open(acceptedIngress) = state else { return false }
 				switch continuation.yield(data) {
 				case .enqueued:
 					state = .open(acceptedIngress: acceptedIngress + 1)
-					return
-				case .dropped, .terminated:
-					_ = requestLocked(.ingressOverloaded, acceptedFailureSelected: false, connector: connector)
-				@unknown default:
-					_ = requestLocked(.ingressOverloaded, acceptedFailureSelected: false, connector: connector)
+					return false
+				case .dropped, .terminated: return true
+				@unknown default: return true
 				}
 			}
+			if overloaded { _ = request(.ingressOverloaded, connector: connector) }
 		}
 
 		func request(_ failure: WebRTCTransportFailure?, connector: WebRTCConnector) -> Task<Void, Never>? {
-			lock.withLock { requestLocked(failure, acceptedFailureSelected: false, connector: connector) }
+			connector.closeProductionMediaSynchronously()
+			return lock.withLock { requestLocked(failure, acceptedFailureSelected: false, connector: connector) }
 		}
 
 		func acceptsProgression() -> Bool {
@@ -276,7 +299,8 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		}
 
 		func requestFromAcceptedIngress(_ failure: WebRTCTransportFailure, connector: WebRTCConnector) -> Task<Void, Never>? {
-			lock.withLock {
+			connector.closeProductionMediaSynchronously()
+			return lock.withLock {
 				switch state {
 				case let .closing(_, acceptedFailureSelected, acceptedIngress, task, waiter):
 					guard !acceptedFailureSelected else { return task }
@@ -395,6 +419,7 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		let didDrainInbound: () -> Void
 		let didRetireAcceptedIngress: () -> Void
 		let didSettle: () -> Void
+		let didAdmitRemoteAudioFrame: @Sendable () -> Void
 
 		package init(
 			cancelSignaling: @escaping () -> Void,
@@ -408,7 +433,8 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 			waitForLocalICEGathering: (@MainActor () async throws -> Void)? = nil,
 			didDrainInbound: @escaping () -> Void = {},
 			didRetireAcceptedIngress: @escaping () -> Void = {},
-			didSettle: @escaping () -> Void = {}
+			didSettle: @escaping () -> Void = {},
+			didAdmitRemoteAudioFrame: @escaping @Sendable () -> Void = {}
 		) {
 			self.cancelSignaling = cancelSignaling
 			self.closeData = closeData
@@ -422,6 +448,7 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 			self.didDrainInbound = didDrainInbound
 			self.didRetireAcceptedIngress = didRetireAcceptedIngress
 			self.didSettle = didSettle
+			self.didAdmitRemoteAudioFrame = didAdmitRemoteAudioFrame
 		}
 
 		static let none = Self(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {})
@@ -447,7 +474,9 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 	private let audioTrack: LKRTCAudioTrack
 	private let dataChannel: LKRTCDataChannel
 	private let connection: LKRTCPeerConnection
-	nonisolated private let remoteAudioGate = ProductionRemoteAudioAdmissionGate()
+	nonisolated private let remoteAudioGate: ProductionRemoteAudioAdmissionGate?
+	nonisolated private let productionMediaCloser: ProductionMediaCloser
+	nonisolated private let productionSession: ProductionSessionSelection?
 
 	private let stream: AsyncThrowingStream<WebRTCInboundEvent, Error>.Continuation
 	private var productionEventSink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
@@ -463,7 +492,6 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 	nonisolated private let ingressStream: AsyncThrowingStream<Data, Error>.Continuation
 	private var ingressDrainTask: Task<Void, Never>?
 	nonisolated private let terminalGate = TerminalGate()
-	nonisolated private let productionSessionGate = ProductionSessionSelectionGate()
 	private var productionReadinessWaiter: CheckedContinuation<Void, Never>?
 	private var productionDeliveryCancelled = false
 	package static let inboundMailboxCapacity = 32
@@ -491,6 +519,9 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		signalingClient: WebRTCSignalingClient,
 		terminalObserver: TerminalObserver,
 		deliveryMode: DeliveryMode,
+		productionSession: ProductionSessionSelection?,
+		remoteAudioGate: ProductionRemoteAudioAdmissionGate?,
+		productionMediaCloser: ProductionMediaCloser,
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void
 	) {
 		self.connection = connection
@@ -499,6 +530,9 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		self.signalingClient = signalingClient
 		self.terminalObserver = terminalObserver
 		self.deliveryMode = deliveryMode
+		self.productionSession = productionSession
+		self.remoteAudioGate = remoteAudioGate
+		self.productionMediaCloser = productionMediaCloser
 		diagnosticDispatcher = DiagnosticDispatcher(sink: diagnosticSink)
 		generation = lifecycle.begin()
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self, bufferingPolicy: .bufferingOldest(0))
@@ -603,13 +637,6 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		}
 	}
 
-	package func selectProductionSession(_ selection: ProductionSessionSelection) throws {
-		guard deliveryMode == .production, productionSessionGate.select(selection) else {
-			throw WebRTCTransportFailure.invalidRequest
-		}
-		resumeProductionReadinessIfPossible()
-	}
-
 	package func sendSessionConfiguration(_ data: Data) throws {
 		guard isCurrentAndAcceptingProgression(), dataChannel.readyState == .open else {
 			throw WebRTCTransportFailure.cancelled
@@ -625,8 +652,7 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard lifecycle.isCurrent(generation) else { return }
-		audioTrack.isEnabled = state == .enabled
-		remoteAudioGate.setEnabled(state == .enabled)
+		productionMediaCloser.set(state)
 	}
 
 	@_spi(AirbridgeQualification) public func sendSessionUpdate(
@@ -666,9 +692,6 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		}
 		enqueueDiagnostic(.teardownBegan)
 		status = .disconnected
-		audioTrack.isEnabled = false
-		remoteAudioGate.close()
-		terminalObserver.disableAudio()
 		terminalObserver.cancelSignaling()
 		lifecycle.cancelSignalingTask()
 		dataChannel.close()
@@ -702,6 +725,8 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 		diagnosticDispatcher.submitAndClose(.teardownCompleted)
 		terminalObserver.didSettle()
 	}
+
+	nonisolated private func closeProductionMediaSynchronously() { productionMediaCloser.close() }
 
 	public func toggleMute() {
 		guard lifecycle.isCurrent(generation) else { return }
@@ -752,19 +777,35 @@ private final class ProductionSessionSelectionGate: @unchecked Sendable {
 
 extension WebRTCConnector {
 	package static func createProduction(initialAudioState: WebRTCLocalAudioState) throws -> WebRTCConnector {
-		let connector = try create(
+		try create(
 			session: URLSessionWebRTCSignalingSession(), terminalObserver: .none,
-			deliveryMode: .production, diagnosticSink: { _ in }
+			deliveryMode: .production,
+			productionSession: ProductionSessionSelection(initialAudioState: initialAudioState),
+			initialAudioState: initialAudioState,
+			diagnosticSink: { _ in }
 		)
-		connector.setLocalAudioState(initialAudioState)
-		return connector
 	}
 
 	package static func createProduction(
 		session: any WebRTCSignalingSession,
 		terminalObserver: TerminalObserver = .none
 	) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .production, diagnosticSink: { _ in })
+		try create(
+			session: session, terminalObserver: terminalObserver, deliveryMode: .production,
+			productionSession: .localAI, initialAudioState: .enabled, diagnosticSink: { _ in }
+		)
+	}
+
+	package static func createProduction(
+		initialAudioState: WebRTCLocalAudioState,
+		session: any WebRTCSignalingSession,
+		terminalObserver: TerminalObserver = .none
+	) throws -> WebRTCConnector {
+		try create(
+			session: session, terminalObserver: terminalObserver, deliveryMode: .production,
+			productionSession: ProductionSessionSelection(initialAudioState: initialAudioState),
+			initialAudioState: initialAudioState, diagnosticSink: { _ in }
+		)
 	}
 
 	public static func create(connectingTo signaling: WebRTCSignalingRequest, session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) async throws -> WebRTCConnector {
@@ -774,14 +815,14 @@ extension WebRTCConnector {
 	}
 
 	package static func create(session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession(), terminalObserver: TerminalObserver = .none) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .ordinary, diagnosticSink: { _ in })
+		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .ordinary, productionSession: nil, initialAudioState: .enabled, diagnosticSink: { _ in })
 	}
 
 	@_spi(AirbridgeQualification) public static func createQualification(
 		session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession(),
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void = { _ in }
 	) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: .none, deliveryMode: .qualification, diagnosticSink: diagnosticSink)
+		try create(session: session, terminalObserver: .none, deliveryMode: .qualification, productionSession: nil, initialAudioState: .enabled, diagnosticSink: diagnosticSink)
 	}
 
 	package static func createQualification(
@@ -789,13 +830,15 @@ extension WebRTCConnector {
 		terminalObserver: TerminalObserver,
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void = { _ in }
 	) throws -> WebRTCConnector {
-		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .qualification, diagnosticSink: diagnosticSink)
+		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .qualification, productionSession: nil, initialAudioState: .enabled, diagnosticSink: diagnosticSink)
 	}
 
 	private static func create(
 		session: any WebRTCSignalingSession,
 		terminalObserver: TerminalObserver,
 		deliveryMode: DeliveryMode,
+		productionSession: ProductionSessionSelection?,
+		initialAudioState: WebRTCLocalAudioState,
 		diagnosticSink: @escaping @Sendable (WebRTCConnectorDiagnosticMilestone) -> Void
 	) throws -> WebRTCConnector {
 		guard let connection = factory.peerConnection(
@@ -804,7 +847,16 @@ extension WebRTCConnector {
 			delegate: nil
 		) else { throw WebRTCError.failedToCreatePeerConnection }
 
-		let audioTrack = Self.setupLocalAudio(for: connection)
+		let audioTrack = Self.setupLocalAudio(for: connection, initialAudioState: initialAudioState)
+		let remoteAudioGate = productionSession == .openAI
+			? ProductionRemoteAudioAdmissionGate(
+				initiallyEnabled: initialAudioState == .enabled,
+				admittedFrame: terminalObserver.didAdmitRemoteAudioFrame
+			)
+			: nil
+		let productionMediaCloser = ProductionMediaCloser(
+			localTrack: audioTrack, remoteGate: remoteAudioGate, didDisable: terminalObserver.disableAudio
+		)
 
 		guard let dataChannel = connection.dataChannel(forLabel: "oai-events", configuration: LKRTCDataChannelConfiguration()) else {
 			throw WebRTCError.failedToCreateDataChannel
@@ -817,6 +869,9 @@ extension WebRTCConnector {
 			signalingClient: WebRTCSignalingClient(session: session),
 			terminalObserver: terminalObserver,
 			deliveryMode: deliveryMode,
+			productionSession: productionSession,
+			remoteAudioGate: remoteAudioGate,
+			productionMediaCloser: productionMediaCloser,
 			diagnosticSink: diagnosticSink
 		)
 	}
@@ -849,7 +904,7 @@ extension WebRTCConnector {
 
 
 private extension WebRTCConnector {
-	static func setupLocalAudio(for connection: LKRTCPeerConnection) -> LKRTCAudioTrack {
+	static func setupLocalAudio(for connection: LKRTCPeerConnection, initialAudioState: WebRTCLocalAudioState) -> LKRTCAudioTrack {
 		let audioSource = factory.audioSource(with: LKRTCMediaConstraints(
 			mandatoryConstraints: [
 				"googNoiseSuppression": "true", "googHighpassFilter": "true",
@@ -859,6 +914,7 @@ private extension WebRTCConnector {
 		))
 
 		return tap(factory.audioTrack(with: audioSource, trackId: "local_audio")) { audioTrack in
+			audioTrack.isEnabled = initialAudioState == .enabled
 			connection.add(audioTrack, streamIds: ["local_stream"])
 		}
 	}
@@ -916,7 +972,7 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove stream: LKRTCMediaStream) {
-		remoteAudioGate.unregister(stream.audioTracks)
+		remoteAudioGate?.unregister(stream.audioTracks)
 	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCSignalingState) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didGenerate _: LKRTCIceCandidate) {}
@@ -987,9 +1043,11 @@ extension WebRTCConnector {
 
 	nonisolated private func reportRemoteAudioTrackIfPresent(receiverTrack: LKRTCMediaStreamTrack?, streams: [LKRTCMediaStream]) {
 		let tracks: [LKRTCMediaStreamTrack] = streams.flatMap(\.audioTracks) + (receiverTrack.map { [$0] } ?? [])
-		remoteAudioGate.register(tracks)
+		remoteAudioGate?.register(tracks)
 		guard Self.receiverOrStreamsContainAudioTrack(trackKind: receiverTrack?.kind, streams: streams) else { return }
-		remoteAudioGate.deliverIfAdmitted { enqueueDiagnosticFromDelegate(.remoteAudioTrackObserved) }
+		if let remoteAudioGate {
+			remoteAudioGate.deliverIfAdmitted { enqueueDiagnosticFromDelegate(.remoteAudioTrackObserved) }
+		} else { enqueueDiagnosticFromDelegate(.remoteAudioTrackObserved) }
 	}
 
 	nonisolated package static func remoteStreamsContainAudioTrack(_ streams: [LKRTCMediaStream]) -> Bool {
@@ -1023,7 +1081,7 @@ extension WebRTCConnector {
 
 	nonisolated package func receiveInbound(_ data: Data) {
 		guard data.count <= WebRTCTransportLimits.maximumPayloadBytes else {
-			let failure: WebRTCTransportFailure = productionSessionGate.current == .openAI ? .responseTooLarge : .eventTooLarge
+			let failure: WebRTCTransportFailure = productionSession == .openAI ? .responseTooLarge : .eventTooLarge
 			_ = terminalGate.request(failure, connector: self)
 			return
 		}
@@ -1072,14 +1130,14 @@ extension WebRTCConnector {
 	}
 
 	private func waitForProductionReadiness() async {
-		while status != .connected || productionSessionGate.current == nil {
+		while status != .connected {
 			guard !productionDeliveryCancelled, terminalGate.shouldProcessAcceptedIngress(), lifecycle.isCurrent(generation) else { return }
 			await withCheckedContinuation { productionReadinessWaiter = $0 }
 		}
 	}
 
 	private func resumeProductionReadinessIfPossible() {
-		guard status == .connected, productionSessionGate.current != nil else { return }
+		guard status == .connected else { return }
 		productionReadinessWaiter?.resume()
 		productionReadinessWaiter = nil
 	}
@@ -1165,3 +1223,7 @@ extension WebRTCConnector {
 }
 
 extension WebRTCConnector: WebRTCConnectorPeerBacking {}
+
+extension WebRTCConnector: LKRTCAudioRenderer {
+	nonisolated public func render(pcmBuffer: AVAudioPCMBuffer) { remoteAudioGate?.render(pcmBuffer: pcmBuffer) }
+}

@@ -233,7 +233,8 @@ package struct OpenAIProductionStateMachine: Sendable {
 		guard status == nil || status == "in_progress" || status == "completed" else { throw WebRTCTransportFailure.malformedEvent }
 		if done, status != "completed" { throw WebRTCTransportFailure.malformedEvent }
 		let content = try item.requiredArray("content")
-		guard role == "user" || role == "assistant", role == "assistant" || !content.isEmpty else { throw WebRTCTransportFailure.unsupportedEvent }
+		guard role == "user" || role == "assistant" else { throw WebRTCTransportFailure.unsupportedEvent }
+		if role == "user", content.isEmpty { throw WebRTCTransportFailure.malformedEvent }
 		if done, role == "assistant", content.isEmpty { throw WebRTCTransportFailure.malformedEvent }
 		for value in content {
 			let object = try value.requiredObject()
@@ -332,30 +333,45 @@ package struct OpenAIProductionStateMachine: Sendable {
 	}
 }
 
-package enum StrictJSON: Sendable {
-	case object([String: StrictJSON]), array([StrictJSON]), string(String), number(String), bool(Bool), null
+package struct StrictJSON: Sendable {
+	fileprivate enum Node: Sendable {
+		case object([String: Int]), array([Int]), string(String), number(String), bool(Bool), null
+	}
+	fileprivate final class Arena: @unchecked Sendable {
+		var nodes: [Node] = []
+		func append(_ node: Node) -> Int { nodes.append(node); return nodes.count - 1 }
+	}
+	fileprivate let arena: Arena
+	fileprivate let index: Int
+	fileprivate var node: Node { arena.nodes[index] }
 
 	package static func parse(_ data: Data) throws -> StrictJSON {
-		var parser = Parser(bytes: Array(data))
-		return try parser.parse()
+		let arena = Arena()
+		var parser = Parser(bytes: Array(data), arena: arena)
+		return StrictJSON(arena: arena, index: try parser.parse())
 	}
 
 	package func requiredObject() throws -> [String: StrictJSON] {
-		guard case let .object(value) = self else { throw WebRTCTransportFailure.malformedEvent }
-		return value
+		guard case let .object(value) = node else { throw WebRTCTransportFailure.malformedEvent }
+		return value.mapValues { StrictJSON(arena: arena, index: $0) }
+	}
+	fileprivate func requiredArrayValue() throws -> [StrictJSON] {
+		guard case let .array(value) = node else { throw WebRTCTransportFailure.malformedEvent }
+		return value.map { StrictJSON(arena: arena, index: $0) }
 	}
 
 	private struct Parser {
 		private enum ObjectState { case key(endAllowed: Bool), colon(String), value(String), commaOrEnd }
 		private enum ArrayState { case value(endAllowed: Bool), commaOrEnd }
-		private enum Frame { case object([String: StrictJSON], ObjectState), array([StrictJSON], ArrayState) }
+		private enum Frame { case object([String: Int], ObjectState), array([Int], ArrayState) }
 		let bytes: [UInt8]
+		let arena: Arena
 		var index = 0
 		mutating func skipWhitespace() { while index < bytes.count, [9, 10, 13, 32].contains(bytes[index]) { index += 1 } }
-		mutating func parse() throws -> StrictJSON {
+		mutating func parse() throws -> Int {
 			var frames: [Frame] = []
-			var root: StrictJSON?
-			func completed(_ value: StrictJSON, frames: inout [Frame], root: inout StrictJSON?) throws {
+			var root: Int?
+			func completed(_ value: Int, frames: inout [Frame], root: inout Int?) throws {
 				guard let frame = frames.popLast() else {
 					guard root == nil else { throw WebRTCTransportFailure.malformedEvent }
 					root = value
@@ -380,7 +396,7 @@ package enum StrictJSON: Sendable {
 				switch frame {
 				case let .object(values, .key(endAllowed)):
 					skipWhitespace()
-					if endAllowed, consume(125) { try completed(.object(values), frames: &frames, root: &root); continue }
+					if endAllowed, consume(125) { try completed(arena.append(.object(values)), frames: &frames, root: &root); continue }
 					guard index < bytes.count, bytes[index] == 34 else { throw WebRTCTransportFailure.malformedEvent }
 					let key = try string()
 					guard values[key] == nil else { throw WebRTCTransportFailure.malformedEvent }
@@ -393,16 +409,16 @@ package enum StrictJSON: Sendable {
 					if let value = try beginValue(frames: &frames) { try completed(value, frames: &frames, root: &root) }
 				case let .object(values, .commaOrEnd):
 					skipWhitespace()
-					if consume(125) { try completed(.object(values), frames: &frames, root: &root) }
+					if consume(125) { try completed(arena.append(.object(values)), frames: &frames, root: &root) }
 					else { guard consume(44) else { throw WebRTCTransportFailure.malformedEvent }; frames.append(.object(values, .key(endAllowed: false))) }
 				case let .array(values, .value(endAllowed)):
 					skipWhitespace()
-					if endAllowed, consume(93) { try completed(.array(values), frames: &frames, root: &root); continue }
+					if endAllowed, consume(93) { try completed(arena.append(.array(values)), frames: &frames, root: &root); continue }
 					frames.append(frame)
 					if let value = try beginValue(frames: &frames) { try completed(value, frames: &frames, root: &root) }
 				case let .array(values, .commaOrEnd):
 					skipWhitespace()
-					if consume(93) { try completed(.array(values), frames: &frames, root: &root) }
+					if consume(93) { try completed(arena.append(.array(values)), frames: &frames, root: &root) }
 					else { guard consume(44) else { throw WebRTCTransportFailure.malformedEvent }; frames.append(.array(values, .value(endAllowed: false))) }
 				}
 			}
@@ -411,16 +427,16 @@ package enum StrictJSON: Sendable {
 			return root
 		}
 
-		private mutating func beginValue(frames: inout [Frame]) throws -> StrictJSON? {
+		private mutating func beginValue(frames: inout [Frame]) throws -> Int? {
 			skipWhitespace(); guard index < bytes.count else { throw WebRTCTransportFailure.malformedEvent }
 			switch bytes[index] {
 			case 123: index += 1; frames.append(.object([:], .key(endAllowed: true))); return nil
 			case 91: index += 1; frames.append(.array([], .value(endAllowed: true))); return nil
-			case 34: return .string(try string())
-			case 116: try literal("true"); return .bool(true)
-			case 102: try literal("false"); return .bool(false)
-			case 110: try literal("null"); return .null
-			case 45, 48...57: return .number(try number())
+			case 34: return arena.append(.string(try string()))
+			case 116: try literal("true"); return arena.append(.bool(true))
+			case 102: try literal("false"); return arena.append(.bool(false))
+			case 110: try literal("null"); return arena.append(.null)
+			case 45, 48...57: return arena.append(.number(try number()))
 			default: throw WebRTCTransportFailure.malformedEvent
 			}
 		}
@@ -475,14 +491,12 @@ private extension Dictionary where Key == String, Value == StrictJSON {
 			let path = prefix.isEmpty ? key : "\(prefix).\(key)"
 			if key.contains("."), namedPaths.contains(path) { return true }
 			guard namedPaths.contains(where: { $0 == path || $0.hasPrefix("\(path).") }) else { return false }
-			switch value {
-			case let .object(object): return object.containsFlattenedConflict(namedPaths: namedPaths, prefix: path)
-			case let .array(values):
+			switch value.node {
+			case .object: return (try? value.requiredObject())?.containsFlattenedConflict(namedPaths: namedPaths, prefix: path) == true
+			case .array:
+				let values = (try? value.requiredArrayValue()) ?? []
 				return values.contains { value in
-					if case let .object(object) = value {
-						return object.containsFlattenedConflict(namedPaths: namedPaths, prefix: path)
-					}
-					return false
+					(try? value.requiredObject())?.containsFlattenedConflict(namedPaths: namedPaths, prefix: path) == true
 				}
 			case .string, .number, .bool, .null: return false
 			}
@@ -490,22 +504,22 @@ private extension Dictionary where Key == String, Value == StrictJSON {
 	}
 	func requiredObject(_ key: String) throws -> [String: StrictJSON] { guard let value = self[key] else { throw WebRTCTransportFailure.malformedEvent }; return try value.requiredObject() }
 	func optionalObject(_ key: String) throws -> [String: StrictJSON]? { guard let value = self[key] else { return nil }; return try value.requiredObject() }
-	func requiredArray(_ key: String) throws -> [StrictJSON] { guard case let .array(value)? = self[key] else { throw WebRTCTransportFailure.malformedEvent }; return value }
+	func requiredArray(_ key: String) throws -> [StrictJSON] { guard let value = self[key] else { throw WebRTCTransportFailure.malformedEvent }; return try value.requiredArrayValue() }
 	func requiredString(_ key: String, maximumBytes: Int, nonempty: Bool) throws -> String {
-		guard case let .string(value)? = self[key] else { throw WebRTCTransportFailure.malformedEvent }
+		guard let wrapped = self[key], case let .string(value) = wrapped.node else { throw WebRTCTransportFailure.malformedEvent }
 		guard value.utf8.count <= maximumBytes else { throw WebRTCTransportFailure.responseTooLarge }
 		guard !nonempty || !value.isEmpty else { throw WebRTCTransportFailure.malformedEvent }
 		return value
 	}
 	func optionalBoundedString(_ key: String, maximumBytes: Int) throws -> String? { guard self[key] != nil else { return nil }; return try requiredString(key, maximumBytes: maximumBytes, nonempty: true) }
-	func optionalNullableBoundedString(_ key: String, maximumBytes: Int, nonempty: Bool) throws -> String? { guard let value = self[key] else { return nil }; if case .null = value { return nil }; return try requiredString(key, maximumBytes: maximumBytes, nonempty: nonempty) }
+	func optionalNullableBoundedString(_ key: String, maximumBytes: Int, nonempty: Bool) throws -> String? { guard let value = self[key] else { return nil }; if case .null = value.node { return nil }; return try requiredString(key, maximumBytes: maximumBytes, nonempty: nonempty) }
 	func requiredIdentifier(_ key: String) throws -> String { try requiredString(key, maximumBytes: 128, nonempty: true) }
 	func requiredNonnegativeInteger(_ key: String) throws -> Int64 {
-		guard case let .number(token)? = self[key], !token.contains("."), !token.contains("e"), !token.contains("E"), let value = Int64(token), value >= 0 else { throw WebRTCTransportFailure.malformedEvent }
+		guard let wrapped = self[key], case let .number(token) = wrapped.node, !token.contains("."), !token.contains("e"), !token.contains("E"), let value = Int64(token), value >= 0 else { throw WebRTCTransportFailure.malformedEvent }
 		return value
 	}
-	func requiredFiniteNumber(_ key: String) throws -> Double { guard case let .number(token)? = self[key], let value = Double(token), value.isFinite else { throw WebRTCTransportFailure.malformedEvent }; return value }
-	func requiredBool(_ key: String) throws -> Bool { guard case let .bool(value)? = self[key] else { throw WebRTCTransportFailure.malformedEvent }; return value }
+	func requiredFiniteNumber(_ key: String) throws -> Double { guard let wrapped = self[key], case let .number(token) = wrapped.node, let value = Double(token), value.isFinite else { throw WebRTCTransportFailure.malformedEvent }; return value }
+	func requiredBool(_ key: String) throws -> Bool { guard let wrapped = self[key], case let .bool(value) = wrapped.node else { throw WebRTCTransportFailure.malformedEvent }; return value }
 }
 
 private extension Optional where Wrapped == [String: StrictJSON] {

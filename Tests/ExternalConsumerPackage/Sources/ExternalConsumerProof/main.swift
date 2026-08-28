@@ -18,6 +18,7 @@ func exercise(_ peer: any WebRTCConnectorPeer, configuration: WebRTCSessionConfi
 	static func main() throws {
 		_ = WebRTCConnectorPeerFactory(initialAudioState: .disabled)
 		_ = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
+		_ = try WebRTCSessionConfiguration.openAI(language: "en")
 		_ = WebRTCConnectorEvent.ready
 	}
 }
