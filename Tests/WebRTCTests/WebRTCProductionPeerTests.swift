@@ -566,6 +566,30 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(terminal, .closed)
 	}
 
+	@MainActor func testSuspendedBackingNormalTerminalRejectsCallerGuardsWithoutRewritingClosedTerminal() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		var iterator = peer.events.makeAsyncIterator()
+		let closeStarted = expectation(description: "backing normal terminal selected before caller guards")
+		backing.didStartClose = { closeStarted.fulfill() }
+		backing.finishEvents()
+		await fulfillment(of: [closeStarted], timeout: 0.1)
+
+		do {
+			_ = try await peer.makeOffer()
+			XCTFail("Later offer must remain method-local")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
+		XCTAssertThrowsError(try peer.createResponse()) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
+
+		backing.resumeClose()
+		let terminal = try await iterator.next()
+		XCTAssertEqual(terminal, .closed)
+	}
+
 	@MainActor func testMismatchedAndDuplicateAcknowledgementsFailClosedWithoutAnotherConnected() async throws {
 		let mismatchedBacking = FakeProductionBacking()
 		let mismatchedPeer = try WebRTCConnectorPeerFactory(makePeer: { mismatchedBacking }).makePeer()

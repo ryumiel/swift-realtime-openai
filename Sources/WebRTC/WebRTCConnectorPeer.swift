@@ -129,7 +129,6 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	private var offerOperation: Task<String, Error>?
 	private var answerOperation: Task<Void, Error>?
 	private var terminalFailure: WebRTCTransportFailure?
-	private var terminalOrigin: SettlementOrigin?
 	private var offerMade = false
 	private var offerInFlight = false
 	private var answerApplied = false
@@ -330,13 +329,12 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	@discardableResult private func startSettlement(failure: WebRTCTransportFailure?, origin: SettlementOrigin) -> Task<Void, Never> {
 		let failure = terminalSelection.failureForSettlement(failure)
 		if let settlementTask {
-			if terminalFailure == nil, let failure, terminalOrigin != .explicitClose || origin == .backing { terminalFailure = failure }
+			if terminalFailure == nil, let failure, origin == .backing { terminalFailure = failure }
 			return settlementTask
 		}
 		guard !terminal else { return Task {} }
 		terminal = true
 		terminalFailure = failure
-		terminalOrigin = origin
 		let task = Task { @MainActor [self] in
 			self.backing.setLocalAudioState(.disabled)
 			let offerOperation = self.offerOperation
