@@ -1,4 +1,6 @@
-@testable import WebRTC
+import Core
+import Foundation
+@_spi(AirbridgeQualification) @testable import WebRTC
 import XCTest
 
 final class WebRTCProductionPeerTests: XCTestCase {
@@ -9,11 +11,38 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertThrowsError(try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "JA"))
 	}
 
+	@MainActor func testFactoryConstructionFailureIsContentFree() throws {
+		let factory = WebRTCConnectorPeerFactory(makePeer: { () throws -> any WebRTCConnectorPeerBacking in
+			throw FakeProductionBacking.ArbitraryError()
+		})
+		XCTAssertThrowsError(try factory.makePeer()) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .requestFailed)
+			XCTAssertFalse(String(describing: error).contains("ArbitraryError"))
+		}
+	}
+
 	@MainActor func testProductionSurfaceHasExplicitAudioAndOnlyTypedCommands() {
 		let factory = WebRTCConnectorPeerFactory(initialAudioState: .disabled)
 		let _: WebRTCLocalAudioState = .enabled
 		let _: WebRTCConnectorEvent = .closed
 		_ = factory
+	}
+
+	@MainActor func testRealProductionConnectorDirectlyRetainsReadyAndPreReadyInboundInOrder() async throws {
+		let drained = expectation(description: "pre-ready inbound drained")
+		let connector = try WebRTCConnector.createProduction(
+			session: ProductionStubSession(),
+			terminalObserver: .init(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {}, didDrainInbound: { drained.fulfill() })
+		)
+		let recorder = ProductionEventRecorder()
+		connector.installProductionEventSink { result in recorder.values.append(result) }
+		connector.receiveInbound(Data(#"{"type":"response.done","response":{"output":[]}}"#.utf8))
+		await fulfillment(of: [drained], timeout: 1)
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		XCTAssertEqual(recorder.values.count, 2)
+		XCTAssertEqual(try recorder.values[0].get(), .ready)
+		XCTAssertEqual(try recorder.values[1].get(), .inbound(.responseFinished))
+		await connector.closeAndSettle()
 	}
 
 	@MainActor func testCloseAndJoinPublishesTerminalClosedEvent() async throws {
@@ -89,13 +118,14 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let first = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
 
-		do {
-			_ = try await peer.makeOffer()
-			XCTFail("Concurrent offer must be rejected")
-		} catch {
-			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
-		}
+		let second = Task { @MainActor in try await peer.makeOffer() }
+		await backing.waitForDisable()
+		XCTAssertEqual(backing.closeCount, 0)
 		backing.resumeOffer()
+		switch await second.result {
+		case .success: XCTFail("Concurrent offer must be rejected")
+		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
 		switch await first.result {
 		case .success: XCTFail("A settled in-flight offer must not succeed late")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
@@ -109,8 +139,11 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
-		await peer.closeAndJoin()
+		let close = Task { @MainActor in await peer.closeAndJoin() }
+		await backing.waitForDisable()
+		XCTAssertEqual(backing.closeCount, 0)
 		backing.resumeOffer()
+		await close.value
 		switch await offer.result {
 		case .success: XCTFail("Closing an in-flight offer must prevent a late success")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
@@ -139,18 +172,37 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		_ = try await peer.makeOffer()
 		let first = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
 		await backing.waitForAnswerStart()
-		do {
-			try await peer.apply(remoteAnswer: "answer")
-			XCTFail("Concurrent answer must be rejected")
-		} catch {
-			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidSDP)
-		}
+		let second = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
+		await backing.waitForDisable()
+		XCTAssertEqual(backing.closeCount, 0)
 		backing.resumeAnswer()
+		switch await second.result {
+		case .success: XCTFail("Concurrent answer must be rejected")
+		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .invalidSDP)
+		}
 		switch await first.result {
 		case .success: XCTFail("A settled in-flight answer must not succeed late")
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
 		}
 		await peer.closeAndJoin()
+		XCTAssertEqual(backing.closeCount, 1)
+	}
+
+	@MainActor func testCloseDuringSuspendedAnswerCannotPublishALateAnswer() async throws {
+		let backing = FakeProductionBacking(suspendAnswer: true)
+		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		_ = try await peer.makeOffer()
+		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
+		await backing.waitForAnswerStart()
+		let close = Task { @MainActor in await peer.closeAndJoin() }
+		await backing.waitForDisable()
+		XCTAssertEqual(backing.closeCount, 0)
+		backing.resumeAnswer()
+		await close.value
+		switch await answer.result {
+		case .success: XCTFail("Closing an in-flight answer must prevent a late success")
+		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
 		XCTAssertEqual(backing.closeCount, 1)
 	}
 
@@ -372,9 +424,18 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	}
 }
 
+@MainActor private final class ProductionEventRecorder {
+	var values: [Result<WebRTCConnectorPeerBackingEvent, any Error>] = []
+}
+
+private struct ProductionStubSession: WebRTCSignalingSession {
+	func data(for _: URLRequest) async throws -> WebRTCSignalingHTTPResponse {
+		throw FakeProductionBacking.ArbitraryError()
+	}
+}
+
 @MainActor private final class FakeProductionBacking: WebRTCConnectorPeerBacking, @unchecked Sendable {
-	let productionEvents: AsyncThrowingStream<WebRTCConnectorPeerBackingEvent, any Error>
-	private let continuation: AsyncThrowingStream<WebRTCConnectorPeerBackingEvent, any Error>.Continuation
+	private var eventSink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
 	private(set) var sessionUpdates: [String] = []
 	private(set) var commandTypes: [String] = []
 	private(set) var commandObjects: [[String: Any]] = []
@@ -383,6 +444,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	private(set) var operationOrder: [String] = []
 	private(set) var lastYieldWasTerminated = false
 	private var closeWaiter: CheckedContinuation<Void, Never>?
+	private var disableWaiter: CheckedContinuation<Void, Never>?
 	private var offerStartWaiter: CheckedContinuation<Void, Never>?
 	private var answerStartWaiter: CheckedContinuation<Void, Never>?
 	private var offerContinuation: CheckedContinuation<String, Never>?
@@ -390,6 +452,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	private let suspendOffer: Bool
 	private let suspendAnswer: Bool
 	private let commandError: (any Error)?
+	private var closed = false
 
 	struct ArbitraryError: Error {}
 
@@ -397,23 +460,19 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		self.suspendOffer = suspendOffer
 		self.suspendAnswer = suspendAnswer
 		self.commandError = commandError
-		(productionEvents, continuation) = AsyncThrowingStream.makeStream(
-			of: WebRTCConnectorPeerBackingEvent.self, bufferingPolicy: .bufferingOldest(0)
-		)
 	}
 
+	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void) { eventSink = sink }
 	func emit(_ event: WebRTCConnectorPeerBackingEvent) async {
-		for _ in 0..<64 {
-			switch continuation.yield(event) {
-			case .enqueued: return
-			case .terminated: lastYieldWasTerminated = true; return
-			case .dropped: await Task.yield()
-			@unknown default: await Task.yield()
-			}
-		}
-		XCTFail("The controlled rendezvous source had no awaiting consumer")
+		guard !closed else { lastYieldWasTerminated = true; return }
+		guard let eventSink else { return XCTFail("Production peer did not install its direct sink") }
+		eventSink(.success(event))
 	}
-	func finishEvents(throwing error: (any Error)? = nil) { continuation.finish(throwing: error) }
+	func finishEvents(throwing error: (any Error)? = nil) {
+		closed = true
+		if let error { eventSink?(.failure(error)) }
+		else { eventSink?(.success(.terminal(nil))) }
+	}
 	func makeOffer() async throws -> String {
 		offerStartWaiter?.resume()
 		offerStartWaiter = nil
@@ -438,16 +497,24 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		if let object { commandObjects.append(object) }
 		commandTypes.append(object?["type"] as? String ?? "")
 	}
-	func setLocalAudioState(_ state: WebRTCLocalAudioState) { audioStates.append(state); operationOrder.append("audio:\(state == .enabled ? "enabled" : "disabled")") }
+	func setLocalAudioState(_ state: WebRTCLocalAudioState) {
+		audioStates.append(state)
+		operationOrder.append("audio:\(state == .enabled ? "enabled" : "disabled")")
+		if state == .disabled { disableWaiter?.resume(); disableWaiter = nil }
+	}
 	func closeAndSettle() async {
 		closeCount += 1
 		operationOrder.append("close")
-		continuation.finish()
+		closed = true
 		closeWaiter?.resume()
 		closeWaiter = nil
 	}
 	func waitForClose() async {
 		guard closeCount == 0 else { return }
 		await withCheckedContinuation { closeWaiter = $0 }
+	}
+	func waitForDisable() async {
+		guard !audioStates.contains(.disabled) else { return }
+		await withCheckedContinuation { disableWaiter = $0 }
 	}
 }

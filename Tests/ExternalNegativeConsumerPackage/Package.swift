@@ -1,12 +1,14 @@
 // swift-tools-version: 6.0
 import PackageDescription
+import Foundation
 
 let forbidden = ["Backing", "Connector", "Signaling", "Decoder", "Qualification"]
+let forkPath = ProcessInfo.processInfo.environment["WEBRTC_FORK_PATH"] ?? "../.."
 let package = Package(
 	name: "ExternalNegativeConsumerProof",
 	platforms: [.macOS(.v14)],
-	dependencies: [.package(path: "../..")],
+	dependencies: [.package(name: "RealtimeWebRTCFork", path: forkPath)],
 	targets: forbidden.map {
-		.executableTarget(name: "Forbidden\($0)", dependencies: [.product(name: "RealtimeWebRTC", package: "airbridge-80-production-session-api")])
+		.executableTarget(name: "Forbidden\($0)", dependencies: [.product(name: "RealtimeWebRTC", package: "RealtimeWebRTCFork")])
 	}
 )

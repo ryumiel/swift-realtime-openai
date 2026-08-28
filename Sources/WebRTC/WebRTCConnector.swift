@@ -359,7 +359,6 @@ import FoundationNetworking
 	}
 
 	public let events: AsyncThrowingStream<WebRTCInboundEvent, Error>
-	package let productionEvents: AsyncThrowingStream<WebRTCConnectorPeerBackingEvent, any Error>
 	public private(set) var status = RealtimeAPI.Status.disconnected
 	@_spi(AirbridgeQualification) public let qualificationEvents: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>
 
@@ -372,7 +371,7 @@ import FoundationNetworking
 	private let connection: LKRTCPeerConnection
 
 	private let stream: AsyncThrowingStream<WebRTCInboundEvent, Error>.Continuation
-	private let productionStream: AsyncThrowingStream<WebRTCConnectorPeerBackingEvent, any Error>.Continuation
+	private var productionEventSink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
 	private let qualificationStream: AsyncThrowingStream<WebRTCConnectorQualificationEvent, Error>.Continuation
 	private let signalingClient: WebRTCSignalingClient
 	private let inboundEventDecoder = WebRTCInboundEventDecoder()
@@ -422,9 +421,6 @@ import FoundationNetworking
 		diagnosticDispatcher = DiagnosticDispatcher(sink: diagnosticSink)
 		generation = lifecycle.begin()
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self, bufferingPolicy: .bufferingOldest(0))
-		(productionEvents, productionStream) = AsyncThrowingStream.makeStream(
-			of: WebRTCConnectorPeerBackingEvent.self, bufferingPolicy: .bufferingOldest(0)
-		)
 		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorQualificationEvent.self, bufferingPolicy: .bufferingOldest(2))
 		(ingressEvents, ingressStream) = AsyncThrowingStream.makeStream(
 			of: Data.self,
@@ -524,6 +520,10 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: command.encoded(), isBinary: false))
 	}
 
+	package func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void) {
+		productionEventSink = sink
+	}
+
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard lifecycle.isCurrent(generation) else { return }
 		audioTrack.isEnabled = state == .enabled
@@ -593,7 +593,7 @@ import FoundationNetworking
 			qualificationStream.finish(throwing: failure)
 		}
 		stream.finish(throwing: failure)
-		productionStream.finish(throwing: failure)
+		productionEventSink?(.success(.terminal(failure)))
 		await drain?.value
 		terminalGate.markSettled()
 		diagnosticDispatcher.submitAndClose(.teardownCompleted)
@@ -655,6 +655,13 @@ extension WebRTCConnector {
 		)
 		connector.setLocalAudioState(initialAudioState)
 		return connector
+	}
+
+	package static func createProduction(
+		session: any WebRTCSignalingSession,
+		terminalObserver: TerminalObserver = .none
+	) throws -> WebRTCConnector {
+		try create(session: session, terminalObserver: terminalObserver, deliveryMode: .production, diagnosticSink: { _ in })
 	}
 
 	public static func create(connectingTo signaling: WebRTCSignalingRequest, session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) async throws -> WebRTCConnector {
@@ -1015,16 +1022,10 @@ extension WebRTCConnector {
 		}
 	}
 
-	private func yieldProduction(_ event: WebRTCConnectorPeerBackingEvent, fromAcceptedIngress: Bool) {
-		switch productionStream.yield(event) {
-		case .enqueued: break
-		case .dropped, .terminated:
-			if fromAcceptedIngress { requestTerminalFromAcceptedIngress(.ingressOverloaded) }
-			else { requestTerminal(.ingressOverloaded) }
-		@unknown default:
-			if fromAcceptedIngress { requestTerminalFromAcceptedIngress(.ingressOverloaded) }
-			else { requestTerminal(.ingressOverloaded) }
-		}
+	private func yieldProduction(_ event: WebRTCConnectorPeerBackingEvent, fromAcceptedIngress _: Bool) {
+		// Production delivery is a direct MainActor handoff. The public peer stream
+		// below is the sole checked two-slot semantic buffer.
+		productionEventSink?(.success(event))
 	}
 }
 
