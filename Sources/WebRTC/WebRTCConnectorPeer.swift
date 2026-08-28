@@ -70,6 +70,16 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		makePeerClosure = makePeer
 	}
 
+	/// Keeps deterministic direct-fork tests on the same initial-audio contract
+	/// as the production factory without making injection available to consumers.
+	package init(initialAudioState: WebRTCLocalAudioState, makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking) {
+		makePeerClosure = {
+			let backing = try makePeer()
+			backing.setLocalAudioState(initialAudioState)
+			return backing
+		}
+	}
+
 	public func makePeer() throws -> any WebRTCConnectorPeer {
 		try ProductionWebRTCConnectorPeer(backing: makePeerClosure())
 	}
