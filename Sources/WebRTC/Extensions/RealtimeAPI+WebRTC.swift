@@ -4,7 +4,7 @@ import Foundation
 import FoundationNetworking
 #endif
 
-public extension RealtimeAPI {
+@_spi(AirbridgeQualification) public extension RealtimeAPI {
 	/// Connect to the OpenAI WebRTC Realtime API with the given request.
 	static func webRTC(endpoint: URL, model: String, bearerToken: String? = nil) async throws -> RealtimeAPI {
 		let signaling = try WebRTCSignalingRequest(endpoint: endpoint, model: model, bearerToken: bearerToken)

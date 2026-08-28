@@ -6,7 +6,7 @@ import LiveKitWebRTC
 import FoundationNetworking
 #endif
 
-@MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
+@_spi(AirbridgeQualification) @MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
 	private enum DeliveryMode { case ordinary, qualification }
 	/// Terminal states describe teardown progress and remain observable after a
 	/// winner is selected. Every other native category is connection progression
@@ -507,9 +507,21 @@ import FoundationNetworking
 		lifecycle.installSignalingTask(task, for: generation)
 	}
 
-	public func send(event: ClientEvent) throws {
+	@_spi(AirbridgeQualification) public func send(event: ClientEvent) throws {
 		guard isCurrentAndAcceptingProgression() else { throw WebRTCTransportFailure.cancelled }
 		try dataChannel.sendData(LKRTCDataBuffer(data: encoder.encode(event), isBinary: false))
+	}
+
+	package func sendProductionCommand(_ command: ProductionCommand) throws {
+		guard isCurrentAndAcceptingProgression(), dataChannel.readyState == .open else {
+			throw WebRTCTransportFailure.cancelled
+		}
+		try dataChannel.sendData(LKRTCDataBuffer(data: command.encoded(), isBinary: false))
+	}
+
+	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
+		guard lifecycle.isCurrent(generation) else { return }
+		audioTrack.isEnabled = state == .enabled
 	}
 
 	@_spi(AirbridgeQualification) public func sendSessionUpdate(
@@ -630,6 +642,12 @@ import FoundationNetworking
 }
 
 extension WebRTCConnector {
+	package static func createProduction(initialAudioState: WebRTCLocalAudioState) throws -> WebRTCConnector {
+		let connector = try create(session: URLSessionWebRTCSignalingSession())
+		connector.setLocalAudioState(initialAudioState)
+		return connector
+	}
+
 	public static func create(connectingTo signaling: WebRTCSignalingRequest, session: any WebRTCSignalingSession = URLSessionWebRTCSignalingSession()) async throws -> WebRTCConnector {
 		let connector = try create(session: session)
 		try await connector.connect(using: signaling)
