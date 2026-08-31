@@ -199,8 +199,9 @@ func runOpenAISession() async throws {
 }
 ```
 
-After `cancelResponse()`, the caller must establish its own bounded proof that
-predecessor output is quiescent before calling `settleCancelledResponse()` and
+To cancel a response, call `cancelResponse()`, then `clearOutputAudio()`, then
+establish the caller-owned bounded proof that predecessor output is quiescent.
+Only after that proof succeeds, call `settleCancelledResponse()` before
 admitting a successor response. `.responseCancellationTerminalObserved` is an
 optional correlated signal; by itself it is neither necessary nor sufficient
 for that proof. The legacy `RealtimeAPI.webRTC` credential and signaling
