@@ -24,7 +24,9 @@ func exerciseOpenAI(_ peer: any WebRTCConnectorPeer) async throws {
 
 @main struct ExternalConsumerProof {
 	static func main() throws {
-		_ = WebRTCConnectorPeerFactory(initialAudioState: .disabled)
+		let _: WebRTCSessionProvider = .localAI
+		_ = WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled)
+		_ = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled)
 		_ = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
 		_ = try WebRTCSessionConfiguration.openAI(language: "en")
 		_ = WebRTCConnectorEvent.ready

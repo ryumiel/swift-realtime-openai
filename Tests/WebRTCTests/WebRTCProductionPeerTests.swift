@@ -9,12 +9,14 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	@MainActor func testRealOpenAIConnectorAndPeerGateRemotePCMFromConstructionThroughTerminal() async throws {
 		let frames = ProductionFrameCounter()
 		let connector = try WebRTCConnector.createProduction(
+			provider: .openAI,
 			initialAudioState: .disabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(
 				cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {},
 				recordPermissionGranted: { true },
-				didAdmitRemoteAudioFrame: { frames.increment() }
+				didAttemptRemoteAudioFrame: { frames.recordAttempt() },
+				didAdmitRemoteAudioFrame: { frames.recordAdmission() }
 			)
 		)
 		let factory = LKRTCPeerConnectionFactory()
@@ -28,9 +30,9 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let overflowTrack = factory.audioTrack(with: source, trackId: "synthetic-overflow")
 		XCTAssertNotNil(remoteConnection.add(track, streamIds: ["openai-remote"]))
 		XCTAssertNotNil(remoteConnection.add(overflowTrack, streamIds: ["openai-overflow"]))
-		XCTAssertEqual(frames.value, 0, "Pre-peer-construction PCM is discarded")
+		XCTAssertEqual(frames.admittedValue, 0, "Pre-peer-construction PCM is discarded")
 
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { connector }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { connector }).makePeer()
 		var events = peer.events.makeAsyncIterator()
 		let offer = try await peer.makeOffer()
 		try await remoteConnection.setRemoteDescription(LKRTCSessionDescription(type: .offer, sdp: offer))
@@ -44,22 +46,27 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let ready = try await events.next()
 		XCTAssertEqual(ready, .ready)
 
-		try await waitUntil(timeout: .seconds(1)) { frames.value == 0 }
-		XCTAssertEqual(frames.value, 0, "Pre-creation PCM is discarded")
+		try await waitUntil(timeout: .seconds(2)) { frames.attemptedValue > 0 }
+		let precreationAttempts = frames.attemptedValue
+		XCTAssertEqual(frames.admittedValue, 0, "Observed pre-creation RTP/frame attempts are discarded")
 
 		connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
 		await Task.yield()
-		XCTAssertEqual(frames.value, 0, "Preconfiguration ingress remains quarantined")
+		XCTAssertEqual(frames.admittedValue, 0, "Preconfiguration ingress remains quarantined")
 		try peer.configure(.openAI(language: "en"))
 		let created = try await events.next()
 		XCTAssertEqual(created, .openAISessionCreated)
-		XCTAssertEqual(frames.value, 0, "Creation-to-ack PCM is discarded")
+		try await waitUntil(timeout: .seconds(2)) { frames.attemptedValue > precreationAttempts }
+		let preackAttempts = frames.attemptedValue
+		XCTAssertEqual(frames.admittedValue, 0, "Observed creation-to-ack RTP/frame attempts are discarded")
 		connector.receiveInbound(Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8))
 		let configured = try await events.next()
 		XCTAssertEqual(configured, .openAISessionConfigured(language: "en"))
 		peer.setLocalAudioState(.enabled)
-		XCTAssertEqual(frames.value, 0, "Discarded callbacks are never replayed")
-		try await waitUntil(timeout: .seconds(2)) { frames.value > 0 }
+		XCTAssertEqual(frames.admittedValue, 0, "Discarded callbacks are never replayed")
+		try await waitUntil(timeout: .seconds(2)) {
+			frames.attemptedValue > preackAttempts && frames.admittedValue > 0
+		}
 		frames.blockNextFrame()
 		try await waitUntil(timeout: .seconds(2)) { frames.isFrameBlocked }
 		let releaseObserved = LockedFlag()
@@ -70,12 +77,12 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 		connector.receiveDataChannelState(isOpen: false, isTerminal: true)
 		XCTAssertTrue(releaseObserved.value, "Terminal selection joins every already-admitted real RTP/frame callback")
-		let framesAtTerminal = frames.value
+		let framesAtTerminal = frames.admittedValue
 		peer.setLocalAudioState(.enabled)
 		let lateTrack = factory.audioTrack(with: source, trackId: "synthetic-late-remote")
 		XCTAssertNotNil(remoteConnection.add(lateTrack, streamIds: ["openai-late-remote"]))
 		try await Task.sleep(for: .milliseconds(100))
-		XCTAssertEqual(frames.value, framesAtTerminal, "Post-invalidation tracks and frames are neither retained nor replayed")
+		XCTAssertEqual(frames.admittedValue, framesAtTerminal, "Post-invalidation tracks and frames are neither retained nor replayed")
 		await peer.closeAndJoin()
 		remoteConnection.close()
 	}
@@ -88,7 +95,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	}
 
 	@MainActor func testFactoryConstructionFailureIsContentFree() throws {
-		let factory = WebRTCConnectorPeerFactory(makePeer: { () throws -> any WebRTCConnectorPeerBacking in
+		let factory = WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { () throws -> any WebRTCConnectorPeerBacking in
 			throw FakeProductionBacking.ArbitraryError()
 		})
 		XCTAssertThrowsError(try factory.makePeer()) { error in
@@ -97,8 +104,27 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 	}
 
+	@MainActor func testFactoryRejectsUnsupportedProviderAudioPairsBeforeCreatingBacking() throws {
+		for (provider, initialAudioState) in [
+			(WebRTCSessionProvider.localAI, WebRTCLocalAudioState.disabled),
+			(.openAI, .enabled)
+		] {
+			let backing = FakeProductionBacking()
+			let factory = WebRTCConnectorPeerFactory(
+				provider: provider,
+				initialAudioState: initialAudioState,
+				makePeer: { backing }
+			)
+			XCTAssertThrowsError(try factory.makePeer()) { error in
+				XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+			}
+			XCTAssertTrue(backing.audioStates.isEmpty, "Rejected pairs cannot create or configure a backing resource")
+		}
+	}
+
 	@MainActor func testProductionSurfaceHasExplicitAudioAndOnlyTypedCommands() {
-		let factory = WebRTCConnectorPeerFactory(initialAudioState: .disabled)
+		let factory = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled)
+		let _: WebRTCSessionProvider = .localAI
 		let _: WebRTCLocalAudioState = .enabled
 		let _: WebRTCConnectorEvent = .closed
 		_ = factory
@@ -108,6 +134,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let drained = expectation(description: "pre-ready inbound drained")
 		let delivered = expectation(description: "configured raw inbound delivered")
 		let connector = try WebRTCConnector.createProduction(
+			provider: .openAI,
 			initialAudioState: .disabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {}, didDrainInbound: { drained.fulfill() })
@@ -136,6 +163,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let drainGate = ProductionDrainGate()
 		let terminal = expectation(description: "mailbox overflow settles")
 		let connector = try WebRTCConnector.createProduction(
+			provider: .openAI,
 			initialAudioState: .disabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(
@@ -161,6 +189,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let drained = expectation(description: "open-channel input reached the authoritative mailbox")
 		let delivered = expectation(description: "construction-bound provider releases the input")
 		let connector = try WebRTCConnector.createProduction(
+			provider: .localAI,
+			initialAudioState: .enabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {}, didDrainInbound: { drained.fulfill() })
 		)
@@ -184,9 +214,12 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	}
 
 	@MainActor func testRealProductionOversizeMappingIsProviderSpecific() async throws {
-		for (initialAudioState, expected) in [(WebRTCLocalAudioState.disabled, WebRTCTransportFailure.responseTooLarge), (.enabled, .eventTooLarge)] {
+		for (provider, initialAudioState, expected) in [
+			(WebRTCSessionProvider.openAI, WebRTCLocalAudioState.disabled, WebRTCTransportFailure.responseTooLarge),
+			(.localAI, .enabled, .eventTooLarge)
+		] {
 			let terminal = expectation(description: "provider-specific terminal")
-			let connector = try WebRTCConnector.createProduction(initialAudioState: initialAudioState)
+			let connector = try WebRTCConnector.createProduction(provider: provider, initialAudioState: initialAudioState)
 			connector.installProductionEventSink { result in
 				if case let .success(.terminal(failure)) = result {
 					XCTAssertEqual(failure, expected)
@@ -200,7 +233,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	}
 
 	@MainActor func testLocalAIConstructionDoesNotApplyOpenAIRemoteTrackCustody() async throws {
-		let connector = try WebRTCConnector.createProduction(session: ProductionStubSession())
+		let connector = try WebRTCConnector.createProduction(provider: .localAI, initialAudioState: .enabled, session: ProductionStubSession())
 		let factory = LKRTCPeerConnectionFactory()
 		let source = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
 		let first = factory.audioTrack(with: source, trackId: "localai-first")
@@ -222,6 +255,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	@MainActor func testRealProductionTerminalDisablesAudioBeforeResourcesAndPublication() async throws {
 		var order: [String] = []
 		let connector = try WebRTCConnector.createProduction(
+			provider: .openAI,
 			initialAudioState: .disabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(
@@ -243,6 +277,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	@MainActor func testLocalAITerminalPreservesExistingResourceCleanupOrder() async throws {
 		var order: [String] = []
 		let connector = try WebRTCConnector.createProduction(
+			provider: .localAI,
 			initialAudioState: .enabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(
@@ -262,7 +297,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testPeerDisablesSynchronouslyAndCannotReopenDuringSettlement() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -285,7 +320,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	}
 
 	@MainActor func testCloseAndJoinPublishesTerminalClosedEvent() async throws {
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled).makePeer()
 		let reader = Task { @MainActor in
 			var iterator = peer.events.makeAsyncIterator()
 			return try await iterator.next()
@@ -298,7 +333,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testPublicPeerOrdersReadyConfigurationAcknowledgementAndCommands() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 
 		let offer = try await peer.makeOffer()
@@ -342,9 +377,24 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(backing.closeCount, 1)
 	}
 
+	@MainActor func testLocalAIConstructionRejectsOpenAIConfiguration() async throws {
+		let backing = FakeProductionBacking()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		var events = peer.events.makeAsyncIterator()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		await backing.emit(.ready)
+		_ = try await events.next()
+		XCTAssertThrowsError(try peer.configure(.openAI(language: "en"))) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+		}
+		XCTAssertTrue(backing.sessionUpdates.isEmpty)
+		await peer.closeAndJoin()
+	}
+
 	@MainActor func testInitialEnabledAudioIsSelectedThenDisabledBeforeClose() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		XCTAssertEqual(backing.audioStates, [.enabled])
 
 		await peer.closeAndJoin()
@@ -353,7 +403,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testConcurrentOfferIsRejectedWhileFirstOfferIsInFlight() async throws {
 		let backing = FakeProductionBacking(suspendOffer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let first = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
 
@@ -375,7 +425,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testCloseDuringSuspendedOfferCannotPublishALateOffer() async throws {
 		let backing = FakeProductionBacking(suspendOffer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
 		let didClose = expectation(description: "close releases held offer")
@@ -394,7 +444,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testCallerCancellationOfSuspendedOfferSettlesAndReturnsCancelled() async throws {
 		let backing = FakeProductionBacking(suspendOffer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
 		offer.cancel()
@@ -412,7 +462,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testCancelledOfferKeepsCancellationPrecedenceOverBackingError() async throws {
 		let backing = FakeProductionBacking(suspendOffer: true, offerErrorOnClose: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
@@ -434,7 +484,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testOfferCancellationWinsBeforeAnyTerminalSelection() async throws {
 		let backing = FakeProductionBacking(suspendOffer: true, offerErrorOnCancellation: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
@@ -454,7 +504,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testExplicitCloseWinsOverInterruptedOfferCancellation() async throws {
 		let backing = FakeProductionBacking(suspendOffer: true, suspendClose: true, offerErrorOnCancellation: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		let offer = Task { @MainActor in try await peer.makeOffer() }
 		await backing.waitForOfferStart()
@@ -475,7 +525,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testReadinessRacingSuspendedAnswerIsAdmittedOnlyAfterAnswer() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
@@ -490,7 +540,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testConcurrentAnswerAndCloseDuringSuspendedAnswerCannotSucceedLate() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		_ = try await peer.makeOffer()
 		let first = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
 		await backing.waitForAnswerStart()
@@ -512,7 +562,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testCloseDuringSuspendedAnswerCannotPublishALateAnswer() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
 		await backing.waitForAnswerStart()
@@ -532,7 +582,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testCallerCancellationOfSuspendedAnswerSettlesAndReturnsCancelled() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
 		await backing.waitForAnswerStart()
@@ -551,7 +601,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testCancelledAnswerKeepsCancellationPrecedenceOverBackingError() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true, answerErrorOnClose: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
@@ -574,7 +624,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testAnswerCancellationWinsBeforeAnyTerminalSelection() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true, answerErrorOnCancellation: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
@@ -595,7 +645,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testExplicitCloseWinsOverInterruptedAnswerCancellation() async throws {
 		let backing = FakeProductionBacking(suspendAnswer: true, suspendClose: true, answerErrorOnCancellation: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		let answer = Task { @MainActor in try await peer.apply(remoteAnswer: "answer") }
@@ -617,7 +667,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testSecondOfferFailsClosedAndJoinsTheBacking() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		_ = try await peer.makeOffer()
 		do {
 			_ = try await peer.makeOffer()
@@ -630,7 +680,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testTwoSlotOutputOverflowClosesBeforeLaterCommands() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -653,7 +703,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testRemoteTerminalUsesTheSameJoinableSettlement() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let reader = Task { @MainActor in
 			var iterator = peer.events.makeAsyncIterator()
 			return try await iterator.next()
@@ -668,7 +718,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testIteratorCancellationClosesOnceDisablesFirstAndRejectsLateWork() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let reader = Task { @MainActor in
 			var iterator = peer.events.makeAsyncIterator()
 			return try await iterator.next()
@@ -687,7 +737,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testIteratorCancellationRetainsPeerUntilJoinedSettlementCompletes() async throws {
 		let backing = FakeProductionBacking(suspendClose: true)
-		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let weakPeer = WeakPeerBox(peer as AnyObject)
 		let closeStarted = expectation(description: "iterator cancellation started retained settlement")
 		backing.didStartClose = { closeStarted.fulfill() }
@@ -718,9 +768,76 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertNil(weakPeer.value)
 	}
 
+	@MainActor func testIteratorCancellationWinsBeforeLaterBackingFailure() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		let closeStarted = expectation(description: "iterator cancellation selected settlement")
+		backing.didStartClose = { closeStarted.fulfill() }
+		let reader = Task { @MainActor in
+			var iterator = peer.events.makeAsyncIterator()
+			return try await iterator.next()
+		}
+		await Task.yield()
+		reader.cancel()
+		await fulfillment(of: [closeStarted], timeout: 1)
+		backing.finishEvents(throwing: FakeProductionBacking.ArbitraryError())
+		backing.resumeClose()
+		do {
+			_ = try await reader.value
+			XCTFail("Cancellation that wins terminal arbitration must remain cancelled")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
+		await peer.closeAndJoin()
+	}
+
+	@MainActor func testIteratorCancellationAfterExplicitClosePreservesClosedTerminal() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		let closeStarted = expectation(description: "explicit close selected terminal first")
+		backing.didStartClose = { closeStarted.fulfill() }
+		let reader = Task { @MainActor in
+			var iterator = peer.events.makeAsyncIterator()
+			return try await iterator.next()
+		}
+		await Task.yield()
+		let close = Task { @MainActor in await peer.closeAndJoin() }
+		await fulfillment(of: [closeStarted], timeout: 1)
+		reader.cancel()
+		await Task.yield()
+		backing.resumeClose()
+		await close.value
+		let terminal = try await reader.value
+		XCTAssertEqual(terminal, .closed)
+	}
+
+	@MainActor func testIteratorCancellationAfterProviderFailurePreservesFailureTerminal() async throws {
+		let backing = FakeProductionBacking(suspendClose: true)
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		let closeStarted = expectation(description: "provider failure selected terminal first")
+		backing.didStartClose = { closeStarted.fulfill() }
+		let reader = Task { @MainActor in
+			var iterator = peer.events.makeAsyncIterator()
+			return try await iterator.next()
+		}
+		await Task.yield()
+		backing.finishEvents(throwing: FakeProductionBacking.ArbitraryError())
+		await fulfillment(of: [closeStarted], timeout: 1)
+		reader.cancel()
+		await Task.yield()
+		backing.resumeClose()
+		do {
+			_ = try await reader.value
+			XCTFail("Late iterator cancellation cannot replace a selected provider failure")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .requestFailed)
+		}
+		await peer.closeAndJoin()
+	}
+
 	@MainActor func testClosePurgesPendingSemanticEventsAndEndsTheSingleConsumer() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -741,7 +858,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	}
 
 	@MainActor func testSecondEventIteratorIsRejectedContentFree() async throws {
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled).makePeer()
 		var first = peer.events.makeAsyncIterator()
 		var second = peer.events.makeAsyncIterator()
 		await peer.closeAndJoin()
@@ -757,7 +874,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testSynchronousFailureRetainsPeerThroughSettlementThenReleases() async throws {
 		let backing = FakeProductionBacking(suspendClose: true)
-		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let weakPeer = WeakPeerBox(peer as AnyObject)
 		var iterator = peer!.events.makeAsyncIterator()
 		let closeStarted = expectation(description: "settlement owns peer through close")
@@ -781,7 +898,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testBackingFailureUpgradesNormalCloseBeforeTerminalCompletion() async throws {
 		let backing = FakeProductionBacking(suspendClose: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		let closeStarted = expectation(description: "normal close entered backing settlement")
 		backing.didStartClose = { closeStarted.fulfill() }
@@ -802,7 +919,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testSuspendedExplicitCloseRejectsLaterCallerGuardsWithoutRewritingClosedTerminal() async throws {
 		let backing = FakeProductionBacking(suspendClose: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		let closeStarted = expectation(description: "explicit close selected before later caller guards")
 		backing.didStartClose = { closeStarted.fulfill() }
@@ -836,7 +953,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testSuspendedBackingNormalTerminalRejectsCallerGuardsWithoutRewritingClosedTerminal() async throws {
 		let backing = FakeProductionBacking(suspendClose: true)
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		var iterator = peer.events.makeAsyncIterator()
 		let closeStarted = expectation(description: "backing normal terminal selected before caller guards")
 		backing.didStartClose = { closeStarted.fulfill() }
@@ -860,7 +977,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testMismatchedAndDuplicateAcknowledgementsFailClosedWithoutAnotherConnected() async throws {
 		let mismatchedBacking = FakeProductionBacking()
-		let mismatchedPeer = try WebRTCConnectorPeerFactory(makePeer: { mismatchedBacking }).makePeer()
+		let mismatchedPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { mismatchedBacking }).makePeer()
 		var mismatchedEvents = mismatchedPeer.events.makeAsyncIterator()
 		_ = try await mismatchedPeer.makeOffer()
 		try await mismatchedPeer.apply(remoteAnswer: "answer")
@@ -878,7 +995,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(mismatchedBacking.closeCount, 1)
 
 		let duplicateBacking = FakeProductionBacking()
-		let duplicatePeer = try WebRTCConnectorPeerFactory(makePeer: { duplicateBacking }).makePeer()
+		let duplicatePeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { duplicateBacking }).makePeer()
 		var duplicateEvents = duplicatePeer.events.makeAsyncIterator()
 		_ = try await duplicatePeer.makeOffer()
 		try await duplicatePeer.apply(remoteAnswer: "answer")
@@ -903,7 +1020,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testBackingErrorsAreContentFreeAndStaleCallbacksAreIgnoredAfterSettlement() async throws {
 		let backing = FakeProductionBacking()
-		let peer = try WebRTCConnectorPeerFactory(makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let reader = Task { @MainActor in
 			var iterator = peer.events.makeAsyncIterator()
 			return try await iterator.next()
@@ -921,7 +1038,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	@MainActor func testProviderMalformedAndRacingBackingFailuresEachJoinTheTerminalStream() async throws {
 		let providerBacking = FakeProductionBacking()
-		let providerPeer = try WebRTCConnectorPeerFactory(makePeer: { providerBacking }).makePeer()
+		let providerPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { providerBacking }).makePeer()
 		var providerEvents = providerPeer.events.makeAsyncIterator()
 		await providerBacking.emit(.inbound(.providerError))
 		do {
@@ -934,7 +1051,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(providerBacking.closeCount, 1)
 
 		let malformedBacking = FakeProductionBacking()
-		let malformedPeer = try WebRTCConnectorPeerFactory(makePeer: { malformedBacking }).makePeer()
+		let malformedPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { malformedBacking }).makePeer()
 		var malformedEvents = malformedPeer.events.makeAsyncIterator()
 		await malformedBacking.emit(.ready)
 		do {
@@ -947,7 +1064,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(malformedBacking.closeCount, 1)
 
 		let racingBacking = FakeProductionBacking()
-		let racingPeer = try WebRTCConnectorPeerFactory(makePeer: { racingBacking }).makePeer()
+		let racingPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { racingBacking }).makePeer()
 		var racingEvents = racingPeer.events.makeAsyncIterator()
 		async let closing: Void = racingPeer.closeAndJoin()
 		racingBacking.finishEvents(throwing: FakeProductionBacking.ArbitraryError())
@@ -964,7 +1081,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	@MainActor func testEveryCommandRejectsInvalidPhaseAndBackingFailureWithJoinedSettlement() async throws {
 		for command in CommandCase.allCases {
 			let invalidBacking = FakeProductionBacking()
-			let invalidPeer = try WebRTCConnectorPeerFactory(makePeer: { invalidBacking }).makePeer()
+			let invalidPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { invalidBacking }).makePeer()
 			XCTAssertThrowsError(try command.invoke(invalidPeer)) { error in
 				XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
 			}
@@ -972,7 +1089,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			XCTAssertEqual(invalidBacking.closeCount, 1)
 
 			let failedBacking = FakeProductionBacking(commandError: FakeProductionBacking.ArbitraryError())
-			let failedPeer = try WebRTCConnectorPeerFactory(makePeer: { failedBacking }).makePeer()
+			let failedPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { failedBacking }).makePeer()
 			var events = failedPeer.events.makeAsyncIterator()
 			_ = try await failedPeer.makeOffer()
 			try await failedPeer.apply(remoteAnswer: "answer")
@@ -1033,13 +1150,20 @@ private final class WeakPeerBox {
 
 private final class ProductionFrameCounter: @unchecked Sendable {
 	private let condition = NSCondition()
-	private var count = 0
+	private var attemptedCount = 0
+	private var admittedCount = 0
 	private var shouldBlockNextFrame = false
 	private var frameBlocked = false
 	private var releaseFrame = false
-	func increment() {
+	func recordAttempt() {
+		condition.withLock {
+			attemptedCount += 1
+			condition.broadcast()
+		}
+	}
+	func recordAdmission() {
 		condition.lock()
-		count += 1
+		admittedCount += 1
 		if shouldBlockNextFrame {
 			shouldBlockNextFrame = false
 			frameBlocked = true
@@ -1058,7 +1182,8 @@ private final class ProductionFrameCounter: @unchecked Sendable {
 		}
 	}
 	var isFrameBlocked: Bool { condition.withLock { frameBlocked } }
-	var value: Int { condition.withLock { count } }
+	var attemptedValue: Int { condition.withLock { attemptedCount } }
+	var admittedValue: Int { condition.withLock { admittedCount } }
 }
 
 private final class LockedFlag: @unchecked Sendable {

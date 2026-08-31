@@ -276,7 +276,8 @@ package struct OpenAIProductionStateMachine: Sendable {
 			_ = try limit.requiredString("name", maximumBytes: 64, nonempty: true)
 			_ = try limit.requiredNonnegativeInteger("limit")
 			_ = try limit.requiredNonnegativeInteger("remaining")
-			guard try limit.requiredExactNumber("reset_seconds").isNonnegative else { throw WebRTCTransportFailure.malformedEvent }
+			let resetSeconds = try limit.requiredExactNumber("reset_seconds")
+			guard resetSeconds.isFinite, resetSeconds.isNonnegative else { throw WebRTCTransportFailure.malformedEvent }
 		}
 	}
 
@@ -527,6 +528,7 @@ private extension Dictionary where Key == String, Value == StrictJSON {
 
 private struct ExactJSONNumber {
 	let token: String
+	var isFinite: Bool { Double(token)?.isFinite == true }
 
 	var isNonnegative: Bool {
 		guard token.first == "-" else { return true }

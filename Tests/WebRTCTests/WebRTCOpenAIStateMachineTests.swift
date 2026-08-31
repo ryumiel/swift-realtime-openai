@@ -21,7 +21,7 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("creation sends one update and exact acknowledgement gates audio")
 	func strictHandshakeAndAudioGate() async throws {
 		let backing = OpenAIBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 		var events = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -43,7 +43,7 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("creation and acknowledgement fit the fixed two-slot production stream")
 	func handshakeBurstFitsBoundedStream() async throws {
 		let backing = OpenAIBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 		var events = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -62,7 +62,7 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("session update send failure stays content free")
 	func configurationSendFailureIsContentFree() async throws {
 		let backing = OpenAIBacking(configurationSendFails: true)
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 		var events = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -99,7 +99,9 @@ struct WebRTCOpenAIStateMachineTests {
 		let malformedRows = [
 			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":9223372036854775808,"remaining":0,"reset_seconds":0}]}"#,
 			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1.0,"remaining":0,"reset_seconds":0}]}"#,
-			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-1e-9999}]}"#
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-1e-9999}]}"#,
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":1e9999}]}"#,
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-1e9999}]}"#
 		]
 		for json in malformedRows {
 			var machine = try activeMachine()
@@ -107,14 +109,19 @@ struct WebRTCOpenAIStateMachineTests {
 		}
 		var exactZero = try activeMachine()
 		#expect(try exactZero.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-0.0}]}"#.utf8)) == nil)
+		var finite = try activeMachine()
+		#expect(try finite.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":1.7976931348623157e308}]}"#.utf8)) == nil)
 	}
 
 	@Test("RT-OE-022 covers one malformed case per required schema dimension")
 	func schemaDimensionMatrix() throws {
 		let overlongIdentifier = String(repeating: "x", count: 129)
+		let validAcknowledgement = Self.acknowledgement(language: "en")
+		let missingPath = validAcknowledgement.replacingOccurrences(of: #""model":"gpt-realtime-2.1","#, with: "")
+		let mistypedPath = validAcknowledgement.replacingOccurrences(of: #""type":"realtime""#, with: #""type":1"#)
 		let rows = [
-			#"{"type":"session.updated","session":{"type":"realtime"}}"#,
-			#"{"type":"session.updated","session":{"type":1}}"#,
+			missingPath,
+			mistypedPath,
 			#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"\#(overlongIdentifier)","content_index":0,"transcript":""}"#,
 			#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"u","content_index":0.5,"transcript":""}"#,
 			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-1e-9999}]}"#,
@@ -139,22 +146,20 @@ struct WebRTCOpenAIStateMachineTests {
 	}
 
 	@Test("OpenAI construction requires initially disabled audio")
-	func openAIRejectsInitiallyEnabledAudio() async throws {
+	func openAIRejectsInitiallyEnabledAudioBeforeCreatingBacking() throws {
 		let backing = OpenAIBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .enabled, makePeer: { backing }).makePeer()
-		_ = try await peer.makeOffer()
-		try await peer.apply(remoteAnswer: "answer")
-		backing.emit(.ready)
-		#expect(throws: WebRTCTransportFailure.invalidRequest) { try peer.configure(.openAI(language: "en")) }
-		await peer.closeAndJoin()
+		let factory = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .enabled) {
+			return backing
+		}
+		#expect(throws: WebRTCTransportFailure.invalidRequest) { _ = try factory.makePeer() }
 		#expect(backing.configurationPayloads.isEmpty)
-		#expect(backing.audioStates == [.enabled, .disabled])
+		#expect(backing.audioStates.isEmpty)
 	}
 
 	@Test("construction-bound provider rejects a LocalAI configuration on the OpenAI path")
 	func openAIConstructionRejectsLocalAIConfiguration() async throws {
 		let backing = OpenAIBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
 		backing.emit(.ready)
@@ -291,7 +296,7 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("peer exposes only bounded cancellation and settlement primitives")
 	func peerCancellationPrimitives() async throws {
 		let backing = OpenAIBacking()
-		let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 		var events = peer.events.makeAsyncIterator()
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
@@ -319,7 +324,7 @@ struct WebRTCOpenAIStateMachineTests {
 	func openAICommandFailuresSettle() async throws {
 		for command in OpenAICommandCase.allCases {
 			let backing = OpenAIBacking(commandSendFails: true)
-			let peer = try WebRTCConnectorPeerFactory(initialAudioState: .disabled, makePeer: { backing }).makePeer()
+			let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
 			var events = peer.events.makeAsyncIterator()
 			_ = try await peer.makeOffer()
 			try await peer.apply(remoteAnswer: "answer")

@@ -2,6 +2,14 @@ import Core
 import Foundation
 
 public enum WebRTCLocalAudioState: Sendable, Equatable { case enabled, disabled }
+public enum WebRTCSessionProvider: Sendable, Equatable { case localAI, openAI }
+
+package extension WebRTCSessionProvider {
+	func supports(initialAudioState: WebRTCLocalAudioState) -> Bool {
+		(self == .localAI && initialAudioState == .enabled) ||
+			(self == .openAI && initialAudioState == .disabled)
+	}
+}
 
 public struct WebRTCSessionConfiguration: Sendable, Equatable {
 	fileprivate enum Provider: Sendable, Equatable { case localAI(voice: String), openAI }
@@ -11,6 +19,13 @@ public struct WebRTCSessionConfiguration: Sendable, Equatable {
 	private init(provider: Provider, language: String) {
 		self.provider = provider
 		self.language = language
+	}
+
+	fileprivate var sessionProvider: WebRTCSessionProvider {
+		switch provider {
+		case .localAI: .localAI
+		case .openAI: .openAI
+		}
 	}
 
 	public static func localAI(voice: String, language: String) throws -> Self {
@@ -99,11 +114,6 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	case rawInbound(Data)
 	case terminal(WebRTCTransportFailure?)
 }
-package enum ProductionSessionSelection: Sendable, Equatable {
-	case localAI, openAI
-	init(initialAudioState: WebRTCLocalAudioState) { self = initialAudioState == .disabled ? .openAI : .localAI }
-}
-
 @MainActor package protocol WebRTCConnectorPeerBacking: Sendable {
 	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)
 	func installProductionConfiguration()
@@ -121,21 +131,23 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 
 @MainActor public struct WebRTCConnectorPeerFactory: Sendable {
 	private let makePeerClosure: @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking
+	private let provider: WebRTCSessionProvider
 	private let initialAudioState: WebRTCLocalAudioState
 
-	public init(initialAudioState: WebRTCLocalAudioState) {
+	public init(provider: WebRTCSessionProvider, initialAudioState: WebRTCLocalAudioState) {
+		self.provider = provider
 		self.initialAudioState = initialAudioState
-		makePeerClosure = { try WebRTCConnector.createProduction(initialAudioState: initialAudioState) }
-	}
-
-	package init(makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking) {
-		initialAudioState = .enabled
-		makePeerClosure = makePeer
+		makePeerClosure = { try WebRTCConnector.createProduction(provider: provider, initialAudioState: initialAudioState) }
 	}
 
 	/// Keeps deterministic direct-fork tests on the same initial-audio contract
 	/// as the production factory without making injection available to consumers.
-	package init(initialAudioState: WebRTCLocalAudioState, makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking) {
+	package init(
+		provider: WebRTCSessionProvider,
+		initialAudioState: WebRTCLocalAudioState,
+		makePeer: @escaping @MainActor @Sendable () throws -> any WebRTCConnectorPeerBacking
+	) {
+		self.provider = provider
 		self.initialAudioState = initialAudioState
 		makePeerClosure = {
 			let backing = try makePeer()
@@ -145,7 +157,15 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 	}
 
 	public func makePeer() throws -> any WebRTCConnectorPeer {
-		do { return try ProductionWebRTCConnectorPeer(backing: makePeerClosure(), initialAudioState: initialAudioState) }
+		do {
+			guard provider.supports(initialAudioState: initialAudioState) else {
+				throw WebRTCTransportFailure.invalidRequest
+			}
+			return try ProductionWebRTCConnectorPeer(
+				backing: makePeerClosure(),
+				provider: provider
+			)
+		}
 		catch { throw ProductionWebRTCConnectorPeer.contentFree(error) }
 	}
 }
@@ -155,8 +175,7 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 	package let events: WebRTCConnectorEventStream
 	private let eventStorage: WebRTCConnectorEventStream.Storage
 	private let backing: any WebRTCConnectorPeerBacking
-	private let initialAudioState: WebRTCLocalAudioState
-	private let productionSession: ProductionSessionSelection
+	private let productionSession: WebRTCSessionProvider
 	private let terminalSelection = ProductionTerminalSelection()
 	private var settlementTask: Task<Void, Never>?
 	private var offerOperation: Task<String, Error>?
@@ -175,10 +194,12 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 	private var terminal = false
 	private var settlementStarting = false
 
-	init(backing: any WebRTCConnectorPeerBacking, initialAudioState: WebRTCLocalAudioState) {
+	init(
+		backing: any WebRTCConnectorPeerBacking,
+		provider: WebRTCSessionProvider
+	) {
 		self.backing = backing
-		self.initialAudioState = initialAudioState
-		productionSession = ProductionSessionSelection(initialAudioState: initialAudioState)
+		productionSession = provider
 		let eventStorage = WebRTCConnectorEventStream.Storage()
 		self.eventStorage = eventStorage
 		events = WebRTCConnectorEventStream(storage: eventStorage)
@@ -275,15 +296,16 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 			throw WebRTCTransportFailure.invalidRequest
 		}
 		do {
+			guard configuration.sessionProvider == productionSession else {
+				throw WebRTCTransportFailure.invalidRequest
+			}
 			self.configuration = configuration
 			switch configuration.provider {
 			case .localAI:
-				guard productionSession == .localAI else { throw WebRTCTransportFailure.invalidRequest }
 				configurationAcknowledgementPending = true
 				try backing.sendSessionConfiguration(configuration.encoded())
 				backing.installProductionConfiguration()
 			case .openAI:
-				guard productionSession == .openAI, initialAudioState == .disabled else { throw WebRTCTransportFailure.invalidRequest }
 				openAIState = try OpenAIProductionStateMachine(language: configuration.language)
 				backing.installProductionConfiguration()
 			}

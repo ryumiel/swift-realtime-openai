@@ -209,9 +209,9 @@ extension WebRTCConnectorEventStream {
 			var resume: CheckedContinuation<Delivery, Never>?
 			var handler: (@Sendable () -> Task<Void, Never>)?
 			lock.withLock {
-				guard !iteratorCancelled else { return }
+				guard !iteratorCancelled, case .open = phase else { return }
 				iteratorCancelled = true
-				if case .open = phase { phase = .closing }
+				phase = .closing
 				pending.removeAll(keepingCapacity: false)
 				resume = waiter
 				waiter = nil

@@ -168,33 +168,27 @@ To manually send an audio message (or part of one), call the `send(audioDelta: D
 
 To manually send an event to the API, use the `send(event: RealtimeAPI.ClientEvent)` method. Note that this bypasses some of the logic in the `Conversation` class such as handling interrupts, so you should prefer to use other methods whenever possible.
 
-### `RealtimeAPI`
+### Production WebRTC peer
 
-To interact with the API directly, create a new instance of `RealtimeAPI` providing one of the available connectors. There are helper methods that let you create an instance from an apiKey or a `URLRequest`, like so:
-
-```swift
-let api = RealtimeAPI.webRTC(ephemeralKey: YOUR_EPHEMERAL_KEY, model: .gptRealtime) // or RealtimeAPI.webRTC(connectingTo: URLRequest)
-let api = RealtimeAPI.webSocket(authToken: YOUR_OPENAI_API_KEY, model: .gptRealtime) // or RealtimeAPI.webSocket(connectingTo: URLRequest)
-```
-
-You can listen for new events through the `events` property, like so:
+Regular imports use `WebRTCConnectorPeerFactory` for the production WebRTC boundary. Provider identity and initial audio state are bound before any peer or media resource is created. LocalAI starts enabled; OpenAI starts disabled until its exact session acknowledgement has been received.
 
 ```swift
-for try await event in api.events {
-    switch event {
-        case let .sessionCreated(event):
-            print(event.session.id)
-    }
+let factory = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled)
+let peer = try factory.makePeer()
+
+let offer = try await peer.makeOffer()
+let answer = try await exchangeOfferForAnswer(offer)
+try await peer.apply(remoteAnswer: answer)
+try peer.configure(.openAI(language: "en"))
+
+for try await event in peer.events {
+    // Handle the bounded production event sequence.
 }
+
+await peer.closeAndJoin()
 ```
 
-To send an event to the API, call the `send` method with a `ClientEvent` instance:
-
-```swift
-try await api.send(event: .updateSession(session))
-try await api.send(event: .appendInputAudioBuffer(encoding: audioData))
-try await api.send(event: .createResponse())
-```
+If a cancelled response must be reconciled before closure, call `settleCancelledResponse()` on the peer. The legacy `RealtimeAPI.webRTC` credential and signaling helpers are qualification-only SPI and are unavailable to ordinary imports. `RealtimeAPI.webSocket` remains the existing diagnostic connector helper.
 
 ## License
 

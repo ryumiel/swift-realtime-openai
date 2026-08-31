@@ -3,12 +3,15 @@ import XCTest
 
 final class ExternalProductionImportProof: XCTestCase {
 	@MainActor func testExternalConsumerCompilesEveryProductionOperation() throws {
-		let factory = WebRTCConnectorPeerFactory(initialAudioState: .disabled)
+		let factory = WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled)
+		let openAIFactory = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled)
 		let configuration = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
 		let openAIConfiguration = try WebRTCSessionConfiguration.openAI(language: "en")
 		let _: WebRTCConnectorEvent = .ready
 		let _: WebRTCLocalAudioState = .enabled
+		let _: WebRTCSessionProvider = .openAI
 		_ = factory
+		_ = openAIFactory
 		_ = configuration
 		_ = openAIConfiguration
 	}
