@@ -36,6 +36,19 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		var events = peer.events.makeAsyncIterator()
 		let offer = try await peer.makeOffer()
 		try await remoteConnection.setRemoteDescription(LKRTCSessionDescription(type: .offer, sdp: offer))
+		let receiver = try XCTUnwrap(remoteConnection.receivers.first { $0.track?.kind == "audio" })
+		let firstWrapper = try XCTUnwrap(receiver.track)
+		let equivalentWrapper = try XCTUnwrap(receiver.track)
+		XCTAssertFalse(firstWrapper === equivalentWrapper)
+		XCTAssertTrue(firstWrapper.isEqual(equivalentWrapper))
+		let equalityGate = ProductionRemoteAudioAdmissionGate(initiallyEnabled: true)
+		equalityGate.register([firstWrapper, equivalentWrapper])
+		XCTAssertTrue(firstWrapper.isEnabled, "Equivalent wrappers consume one track slot")
+		XCTAssertTrue(equivalentWrapper.isEnabled, "An equivalent wrapper is not disabled as overflow")
+		equalityGate.unregister([equivalentWrapper])
+		equalityGate.setEnabled(true)
+		XCTAssertFalse(firstWrapper.isEnabled, "Equivalent removal releases the retained canonical wrapper")
+		equalityGate.releaseTracks()
 		let answer = try await remoteConnection.answer(for: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
 		try await remoteConnection.setLocalDescription(answer)
 		for _ in 0..<500 where remoteConnection.iceGatheringState != .complete {
@@ -183,6 +196,49 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await drainGate.release()
 		await fulfillment(of: [terminal], timeout: 1)
 		await connector.closeAndSettle()
+	}
+
+	@MainActor func testLocalAIOverloadReservesTerminalBeforeConcurrentCloseAndLateIngress() async throws {
+		let drainGate = ProductionDrainGate()
+		let reservationGate = ProductionSynchronousGate()
+		let terminal = expectation(description: "reserved overload settles")
+		var retiredIngress = 0
+		let connector = try WebRTCConnector.createProduction(
+			provider: .localAI,
+			initialAudioState: .enabled,
+			session: ProductionStubSession(),
+			terminalObserver: .init(
+				cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {},
+				beforeDrainInbound: { await drainGate.hold() },
+				didRetireAcceptedIngress: { retiredIngress += 1 },
+				didReserveIngressOverload: { reservationGate.hold() }
+			)
+		)
+		let recorder = ProductionEventRecorder()
+		connector.installProductionEventSink { result in
+			recorder.values.append(result)
+			if case .success(.terminal(.ingressOverloaded)) = result { terminal.fulfill() }
+		}
+		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
+		let raw = Data(#"{"type":"input_audio_buffer.committed"}"#.utf8)
+		connector.receiveInbound(raw)
+		await drainGate.waitUntilHeld()
+		for _ in 0..<WebRTCConnector.inboundMailboxCapacity { connector.receiveInbound(raw) }
+		DispatchQueue.global().async {
+			connector.receiveInbound(raw)
+			reservationGate.recordReturn()
+		}
+		XCTAssertTrue(reservationGate.waitUntilHeld(), "The overload transition is reserved before cleanup")
+
+		connector.receiveDataChannelState(isOpen: false, isTerminal: true)
+		connector.receiveInbound(raw)
+		reservationGate.resume()
+		XCTAssertTrue(reservationGate.waitUntilReturned())
+		await drainGate.release()
+		await fulfillment(of: [terminal], timeout: 1)
+		await connector.closeAndSettle()
+		XCTAssertEqual(retiredIngress, WebRTCConnector.inboundMailboxCapacity + 1, "Neither overflow nor later ingress is admitted")
+		XCTAssertEqual(try recorder.values.last?.get(), .terminal(.ingressOverloaded))
 	}
 
 	@MainActor func testProductionMailboxUsesConstructionBoundProviderOnOpenChannel() async throws {
@@ -1191,6 +1247,20 @@ private final class LockedFlag: @unchecked Sendable {
 	private var stored = false
 	func set() { lock.withLock { stored = true } }
 	var value: Bool { lock.withLock { stored } }
+}
+
+private final class ProductionSynchronousGate: @unchecked Sendable {
+	private let entered = DispatchSemaphore(value: 0)
+	private let release = DispatchSemaphore(value: 0)
+	private let returned = DispatchSemaphore(value: 0)
+	func hold() {
+		entered.signal()
+		release.wait()
+	}
+	func waitUntilHeld() -> Bool { entered.wait(timeout: .now() + 1) == .success }
+	func resume() { release.signal() }
+	func recordReturn() { returned.signal() }
+	func waitUntilReturned() -> Bool { returned.wait(timeout: .now() + 1) == .success }
 }
 
 private actor ProductionDrainGate {

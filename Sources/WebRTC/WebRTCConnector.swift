@@ -40,7 +40,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 				candidates.filter { $0.kind == "audio" }.forEach { $0.isEnabled = false }
 				return
 			}
-			for track in candidates where track.kind == "audio" && !tracks.contains(where: { $0 === track }) {
+			for track in candidates where track.kind == "audio" && !tracks.contains(where: { $0.isEqual(track) }) {
 				if tracks.count < Self.trackCapacity {
 					track.isEnabled = enabled
 					tracks.append(track)
@@ -53,9 +53,12 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	func unregister(_ candidates: [LKRTCMediaStreamTrack]) {
 		condition.withLock {
 			for candidate in candidates where candidate.kind == "audio" {
-				candidate.isEnabled = false
-				(candidate as? LKRTCAudioTrack)?.remove(self)
-				tracks.removeAll { $0 === candidate }
+				let retained = tracks.filter { $0.isEqual(candidate) }
+				retained.forEach {
+					$0.isEnabled = false
+					($0 as? LKRTCAudioTrack)?.remove(self)
+				}
+				tracks.removeAll { $0.isEqual(candidate) }
 			}
 		}
 	}
@@ -228,6 +231,12 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 
 	private final class TerminalGate: @unchecked Sendable {
 		private let lock = NSLock()
+		private enum RequestReservation {
+			case start
+			case existing(Task<Void, Never>)
+			case pending
+			case settled
+		}
 		private enum State {
 			case open(acceptedIngress: Int)
 			case closing(
@@ -241,28 +250,37 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 		private var state: State = .open(acceptedIngress: 0)
 		private var openTransitionPending = false
+		private var settlementTaskWaiters: [CheckedContinuation<Task<Void, Never>?, Never>] = []
 
 		func acceptIngress(
 			_ data: Data,
 			with continuation: AsyncThrowingStream<Data, Error>.Continuation,
 			connector: WebRTCConnector
 		) {
-			let overloaded = lock.withLock { () -> Bool in
-				guard case let .open(acceptedIngress) = state else { return false }
+			let closesProductionMedia = connector.requiresSynchronousProductionMediaClosure
+			let reservation = lock.withLock { () -> RequestReservation? in
+				guard case let .open(acceptedIngress) = state else { return nil }
 				switch continuation.yield(data) {
 				case .enqueued:
 					state = .open(acceptedIngress: acceptedIngress + 1)
-					return false
-				case .dropped, .terminated: return true
-				@unknown default: return true
+					return nil
+				case .dropped, .terminated:
+					return reserveLocked(.ingressOverloaded, acceptedFailureSelected: closesProductionMedia)
+				@unknown default:
+					return reserveLocked(.ingressOverloaded, acceptedFailureSelected: closesProductionMedia)
 				}
 			}
-			if overloaded { _ = request(.ingressOverloaded, connector: connector) }
+			guard let reservation else { return }
+			connector.terminalObserver.didReserveIngressOverload()
+			_ = finish(reservation, closesProductionMedia: closesProductionMedia, connector: connector)
 		}
 
 		func request(_ failure: WebRTCTransportFailure?, connector: WebRTCConnector) -> Task<Void, Never>? {
-			let mediaClosed = connector.closeProductionMediaSynchronously()
-			return lock.withLock { requestLocked(failure, acceptedFailureSelected: mediaClosed, connector: connector) }
+			let closesProductionMedia = connector.requiresSynchronousProductionMediaClosure
+			let reservation = lock.withLock {
+				reserveLocked(failure, acceptedFailureSelected: closesProductionMedia)
+			}
+			return finish(reservation, closesProductionMedia: closesProductionMedia, connector: connector)
 		}
 
 		func acceptsProgression() -> Bool {
@@ -329,11 +347,14 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 
 		func requestFromAcceptedIngress(_ failure: WebRTCTransportFailure, connector: WebRTCConnector) -> Task<Void, Never>? {
-			_ = connector.closeProductionMediaSynchronously()
-			return lock.withLock {
+			let closesProductionMedia = connector.requiresSynchronousProductionMediaClosure
+			let reservation = lock.withLock { () -> RequestReservation in
 				switch state {
 				case let .closing(_, acceptedFailureSelected, acceptedIngress, task, waiter):
-					guard !acceptedFailureSelected else { return task }
+					guard !acceptedFailureSelected else {
+						if let task { return .existing(task) }
+						return .pending
+					}
 					state = .closing(
 						failure: failure,
 						acceptedFailureSelected: true,
@@ -341,13 +362,15 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 						task: task,
 						waiter: waiter
 					)
-					return task
+					if let task { return .existing(task) }
+					return .pending
 				case .open:
-					return requestLocked(failure, acceptedFailureSelected: true, connector: connector)
+					return reserveLocked(failure, acceptedFailureSelected: true)
 				case .settled:
-					return nil
+					return .settled
 				}
 			}
+			return finish(reservation, closesProductionMedia: closesProductionMedia, connector: connector)
 		}
 
 		func acceptedIngressDidDrain() {
@@ -374,9 +397,13 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 
 		func markSettled() {
+			var taskWaiters: [CheckedContinuation<Task<Void, Never>?, Never>] = []
 			lock.withLock {
 				if case let .closing(failure, _, _, _, _) = state { state = .settled(failure) }
+				taskWaiters = settlementTaskWaiters
+				settlementTaskWaiters.removeAll(keepingCapacity: false)
 			}
+			taskWaiters.forEach { $0.resume(returning: nil) }
 		}
 
 		private func failureAfterAcceptedIngressDrains() async -> WebRTCTransportFailure? {
@@ -405,35 +432,85 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			}
 		}
 
-		private func requestLocked(
+		private func reserveLocked(
 			_ failure: WebRTCTransportFailure?,
-			acceptedFailureSelected: Bool,
-			connector: WebRTCConnector
-		) -> Task<Void, Never>? {
+			acceptedFailureSelected: Bool
+		) -> RequestReservation {
 			switch state {
 			case let .open(acceptedIngress):
+				state = .closing(failure: failure, acceptedFailureSelected: acceptedFailureSelected, acceptedIngress: acceptedIngress, task: nil, waiter: nil)
+				return .start
+			case let .closing(_, _, _, task?, _):
+				return .existing(task)
+			case .closing:
+				return .pending
+			case .settled:
+				return .settled
+			}
+		}
+
+		private func finish(
+			_ reservation: RequestReservation,
+			closesProductionMedia: Bool,
+			connector: WebRTCConnector
+		) -> Task<Void, Never>? {
+			switch reservation {
+			case .start:
+				if closesProductionMedia { _ = connector.closeProductionMediaSynchronously() }
 				let gate = self
 				Task { @MainActor [weak connector] in connector?.resumeProductionReadinessForTerminal() }
-				state = .closing(failure: failure, acceptedFailureSelected: acceptedFailureSelected, acceptedIngress: acceptedIngress, task: nil, waiter: nil)
 				let task = Task { @MainActor [connector, gate] in
 					let selectedFailure = await gate.failureAfterAcceptedIngressDrains()
 					await connector.completeTerminal(selectedFailure)
 				}
-				state = .closing(
-					failure: failure,
-					acceptedFailureSelected: acceptedFailureSelected,
-					acceptedIngress: acceptedIngress,
-					task: task,
-					waiter: nil
-				)
+				install(task)
 				return task
-			case let .closing(_, _, _, task?, _):
+			case let .existing(task):
 				return task
-			case .closing:
-				preconditionFailure("Terminal settlement task was not installed")
+			case .pending:
+				return Task { await self.joinPendingSettlement() }
 			case .settled:
 				return nil
 			}
+		}
+
+		private func install(_ task: Task<Void, Never>) {
+			var taskWaiters: [CheckedContinuation<Task<Void, Never>?, Never>] = []
+			lock.withLock {
+				switch state {
+				case let .closing(failure, acceptedFailureSelected, acceptedIngress, nil, waiter):
+					state = .closing(
+						failure: failure,
+						acceptedFailureSelected: acceptedFailureSelected,
+						acceptedIngress: acceptedIngress,
+						task: task,
+						waiter: waiter
+					)
+				case .closing, .settled:
+					break
+				case .open:
+					preconditionFailure("Terminal settlement task installed before selection")
+				}
+				taskWaiters = settlementTaskWaiters
+				settlementTaskWaiters.removeAll(keepingCapacity: false)
+			}
+			taskWaiters.forEach { $0.resume(returning: task) }
+		}
+
+		private func joinPendingSettlement() async {
+			let task = await withCheckedContinuation { continuation in
+				var immediate: Task<Void, Never>??
+				lock.withLock {
+					switch state {
+					case let .closing(_, _, _, task?, _): immediate = .some(task)
+					case .closing: settlementTaskWaiters.append(continuation)
+					case .settled: immediate = .some(nil)
+					case .open: preconditionFailure("Terminal join requested before selection")
+					}
+				}
+				if let immediate { continuation.resume(returning: immediate) }
+			}
+			await task?.value
 		}
 	}
 	@MainActor package struct TerminalObserver {
@@ -449,6 +526,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		let didDrainInbound: () -> Void
 		let didRetireAcceptedIngress: () -> Void
 		let didSettle: () -> Void
+		let didReserveIngressOverload: @Sendable () -> Void
 		let didAttemptRemoteAudioFrame: @Sendable () -> Void
 		let didAdmitRemoteAudioFrame: @Sendable () -> Void
 
@@ -465,6 +543,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			didDrainInbound: @escaping () -> Void = {},
 			didRetireAcceptedIngress: @escaping () -> Void = {},
 			didSettle: @escaping () -> Void = {},
+			didReserveIngressOverload: @escaping @Sendable () -> Void = {},
 			didAttemptRemoteAudioFrame: @escaping @Sendable () -> Void = {},
 			didAdmitRemoteAudioFrame: @escaping @Sendable () -> Void = {}
 		) {
@@ -480,6 +559,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			self.didDrainInbound = didDrainInbound
 			self.didRetireAcceptedIngress = didRetireAcceptedIngress
 			self.didSettle = didSettle
+			self.didReserveIngressOverload = didReserveIngressOverload
 			self.didAttemptRemoteAudioFrame = didAttemptRemoteAudioFrame
 			self.didAdmitRemoteAudioFrame = didAdmitRemoteAudioFrame
 		}
@@ -776,6 +856,10 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		guard productionSession == .openAI else { return false }
 		productionMediaCloser.close()
 		return true
+	}
+
+	nonisolated private var requiresSynchronousProductionMediaClosure: Bool {
+		productionSession == .openAI
 	}
 
 	public func toggleMute() {

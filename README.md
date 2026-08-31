@@ -12,23 +12,12 @@ It can handle automatically recording the user's microphone and playing back the
 
 ### Swift Package Manager
 
-The Swift Package Manager allows for developers to easily integrate packages into their Xcode projects and packages; and is also fully integrated into the swift compiler.
-
-### SPM Through XCode Project
-
--   File > Swift Packages > Add Package Dependency
--   Add https://github.com/m1guelpf/swift-realtime-openai.git
--   Select "Branch" with "main"
-
-### SPM Through Xcode Package
-
-Once you have your Swift package set up, add the Git link within the dependencies value of your Package.swift file.
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/m1guelpf/swift-realtime-openai.git", .branch("main"))
-]
-```
+The production WebRTC surface described below is not published yet. The
+upstream `m1guelpf/swift-realtime-openai` `main` branch does not contain this
+API, so do not use that mutable branch to obtain it. Airbridge Task 3 will
+publish the reviewed fork and update this section with its exact immutable
+revision and `RealtimeWebRTC` product. No production dependency identity is
+claimed before that publication.
 
 ## Getting started 🚀
 
@@ -173,22 +162,49 @@ To manually send an event to the API, use the `send(event: RealtimeAPI.ClientEve
 Regular imports use `WebRTCConnectorPeerFactory` for the production WebRTC boundary. Provider identity and initial audio state are bound before any peer or media resource is created. LocalAI starts enabled; OpenAI starts disabled until its exact session acknowledgement has been received.
 
 ```swift
-let factory = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled)
-let peer = try factory.makePeer()
+import WebRTC
 
-let offer = try await peer.makeOffer()
-let answer = try await exchangeOfferForAnswer(offer)
-try await peer.apply(remoteAnswer: answer)
-try peer.configure(.openAI(language: "en"))
+@MainActor
+func runOpenAISession() async throws {
+    let factory = WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled)
+    let peer = try factory.makePeer()
+    var events = peer.events.makeAsyncIterator()
+    let eventTask = Task { @MainActor in
+        while let event = try await events.next() {
+            switch event {
+            case .ready:
+                try peer.configure(.openAI(language: "en"))
+            case .openAISessionConfigured(language: "en"):
+                // The exact acknowledgement opens the audio gate.
+                peer.setLocalAudioState(.enabled)
+            default:
+                handle(event)
+            }
+        }
+    }
 
-for try await event in peer.events {
-    // Handle the bounded production event sequence.
+    do {
+        let offer = try await peer.makeOffer()
+        let answer = try await exchangeOfferForAnswer(offer)
+        try await peer.apply(remoteAnswer: answer)
+        try await waitForCallerStop()
+        await peer.closeAndJoin()
+        try await eventTask.value
+    } catch {
+        await peer.closeAndJoin()
+        eventTask.cancel()
+        _ = try? await eventTask.value
+        throw error
+    }
 }
-
-await peer.closeAndJoin()
 ```
 
-If a cancelled response must be reconciled before closure, call `settleCancelledResponse()` on the peer. The legacy `RealtimeAPI.webRTC` credential and signaling helpers are qualification-only SPI and are unavailable to ordinary imports. `RealtimeAPI.webSocket` remains the existing diagnostic connector helper.
+After `cancelResponse()`, call `settleCancelledResponse()` only after receiving
+`.responseCancellationTerminalObserved` and before admitting a successor
+response. The legacy `RealtimeAPI.webRTC` credential and signaling helpers are
+qualification-only SPI and are unavailable to ordinary imports. WebSocket
+sources are retained outside the package's published product graph and are not
+part of this production surface.
 
 ## License
 
