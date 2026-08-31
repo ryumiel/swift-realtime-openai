@@ -177,7 +177,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 		guard ["completed", "cancelled", "failed", "incomplete"].contains(status) else {
 			throw WebRTCTransportFailure.malformedEvent
 		}
-		let code = try response.optionalObject("status_details")?.optionalObject("error")?.optionalBoundedString("code", maximumBytes: 128)
+		let code = try response.optionalNullableObject("status_details")?.optionalNullableObject("error")?.optionalBoundedString("code", maximumBytes: 128)
 		if status == "completed" || status == "cancelled" {
 			guard code == nil else { throw WebRTCTransportFailure.malformedEvent }
 		} else if code == "" {
@@ -505,6 +505,11 @@ private extension Dictionary where Key == String, Value == StrictJSON {
 	}
 	func requiredObject(_ key: String) throws -> [String: StrictJSON] { guard let value = self[key] else { throw WebRTCTransportFailure.malformedEvent }; return try value.requiredObject() }
 	func optionalObject(_ key: String) throws -> [String: StrictJSON]? { guard let value = self[key] else { return nil }; return try value.requiredObject() }
+	func optionalNullableObject(_ key: String) throws -> [String: StrictJSON]? {
+		guard let value = self[key] else { return nil }
+		if case .null = value.node { return nil }
+		return try value.requiredObject()
+	}
 	func requiredArray(_ key: String) throws -> [StrictJSON] { guard let value = self[key] else { throw WebRTCTransportFailure.malformedEvent }; return try value.requiredArrayValue() }
 	func requiredString(_ key: String, maximumBytes: Int, nonempty: Bool) throws -> String {
 		guard let wrapped = self[key], case let .string(value) = wrapped.node else { throw WebRTCTransportFailure.malformedEvent }
@@ -532,7 +537,8 @@ private struct ExactJSONNumber {
 
 	var isNonnegative: Bool {
 		guard token.first == "-" else { return true }
-		return !token.contains(where: { $0 >= "1" && $0 <= "9" })
+		let significand = token.dropFirst().prefix { $0 != "e" && $0 != "E" }
+		return !significand.contains(where: { $0 >= "1" && $0 <= "9" })
 	}
 
 	var isExactlyHalf: Bool {

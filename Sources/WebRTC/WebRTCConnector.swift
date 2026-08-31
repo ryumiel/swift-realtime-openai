@@ -1109,6 +1109,9 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove stream: LKRTCMediaStream) {
 		remoteAudioGate?.unregister(stream.audioTracks)
 	}
+	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove receiver: LKRTCRtpReceiver) {
+		if let track = receiver.track { remoteAudioGate?.unregister([track]) }
+	}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCSignalingState) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didGenerate _: LKRTCIceCandidate) {}
 	nonisolated public func peerConnection(_: LKRTCPeerConnection, didRemove _: [LKRTCIceCandidate]) {}

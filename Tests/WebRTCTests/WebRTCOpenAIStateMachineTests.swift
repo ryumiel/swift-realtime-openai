@@ -109,8 +109,35 @@ struct WebRTCOpenAIStateMachineTests {
 		}
 		var exactZero = try activeMachine()
 		#expect(try exactZero.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-0.0}]}"#.utf8)) == nil)
+		for zero in ["-0e1", "-0.0e-1"] {
+			var exponentZero = try activeMachine()
+			let json = #"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":\#(zero)}]}"#
+			#expect(try exponentZero.consume(Data(json.utf8)) == nil)
+		}
 		var finite = try activeMachine()
 		#expect(try finite.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":1.7976931348623157e308}]}"#.utf8)) == nil)
+	}
+
+	@Test("nullable response status containers preserve an absent error-code path")
+	func nullableResponseStatusContainers() throws {
+		for statusDetails in [#""status_details":null"#, #""status_details":{"error":null}"#] {
+			for status in ["completed", "cancelled"] {
+				var machine = try activeResponseMachine()
+				let json = #"{"type":"response.done","response":{"id":"r1","status":"\#(status)",\#(statusDetails)}}"#
+				#expect(try machine.consume(Data(json.utf8)) == .responseFinished)
+			}
+			for status in ["failed", "incomplete"] {
+				var machine = try activeResponseMachine()
+				let json = #"{"type":"response.done","response":{"id":"r1","status":"\#(status)",\#(statusDetails)}}"#
+				#expect(throws: WebRTCTransportFailure.providerError) {
+					_ = try machine.consume(Data(json.utf8))
+				}
+			}
+		}
+		var codePresent = try activeResponseMachine()
+		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+			_ = try codePresent.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"completed","status_details":{"error":{"code":"synthetic"}}}}"#.utf8))
+		}
 	}
 
 	@Test("RT-OE-022 covers one malformed case per required schema dimension")

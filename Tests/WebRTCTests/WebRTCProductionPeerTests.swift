@@ -6,6 +6,44 @@ import LiveKitWebRTC
 import XCTest
 
 final class WebRTCProductionPeerTests: XCTestCase {
+	@MainActor func testUnifiedPlanReceiverRemovalReleasesTrackForValidReplacement() async throws {
+		let connector = try WebRTCConnector.createProduction(
+			provider: .openAI,
+			initialAudioState: .disabled,
+			session: ProductionStubSession(),
+			terminalObserver: .init(
+				cancelSignaling: {}, closeData: {}, closePeer: {}, disableAudio: {},
+				recordPermissionGranted: { true }
+			)
+		)
+		let factory = LKRTCPeerConnectionFactory()
+		let remoteConnection = try XCTUnwrap(factory.peerConnection(
+			with: LKRTCConfiguration(),
+			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+			delegate: nil
+		))
+		let source = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+		let replacement = factory.audioTrack(with: source, trackId: "synthetic-replacement")
+		let offer = try await connector.makeOffer()
+		try await remoteConnection.setRemoteDescription(LKRTCSessionDescription(type: .offer, sdp: offer))
+		let firstReceiver = try XCTUnwrap(remoteConnection.receivers.first { $0.track?.kind == "audio" })
+		let equivalentReceiver = try XCTUnwrap(remoteConnection.receivers.first { $0.isEqual(firstReceiver) })
+		XCTAssertFalse(firstReceiver === equivalentReceiver)
+		let firstTrack = try XCTUnwrap(firstReceiver.track)
+
+		connector.peerConnection(remoteConnection, didAdd: firstReceiver, streams: [])
+		connector.peerConnection(remoteConnection, didRemove: equivalentReceiver)
+		let replacementStream = factory.mediaStream(withStreamId: "replacement-stream")
+		replacementStream.addAudioTrack(replacement)
+		connector.peerConnection(remoteConnection, didAdd: replacementStream)
+		connector.setLocalAudioState(.enabled)
+
+		XCTAssertFalse(firstTrack.isEnabled, "Unified Plan receiver removal releases the retained equal track wrapper")
+		XCTAssertTrue(replacement.isEnabled, "A valid replacement track can occupy the released one-track slot")
+		await connector.closeAndSettle()
+		remoteConnection.close()
+	}
+
 	@MainActor func testRealOpenAIConnectorAndPeerGateRemotePCMFromConstructionThroughTerminal() async throws {
 		let frames = ProductionFrameCounter()
 		let connector = try WebRTCConnector.createProduction(

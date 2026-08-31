@@ -199,12 +199,14 @@ func runOpenAISession() async throws {
 }
 ```
 
-After `cancelResponse()`, call `settleCancelledResponse()` only after receiving
-`.responseCancellationTerminalObserved` and before admitting a successor
-response. The legacy `RealtimeAPI.webRTC` credential and signaling helpers are
-qualification-only SPI and are unavailable to ordinary imports. WebSocket
-sources are retained outside the package's published product graph and are not
-part of this production surface.
+After `cancelResponse()`, the caller must establish its own bounded proof that
+predecessor output is quiescent before calling `settleCancelledResponse()` and
+admitting a successor response. `.responseCancellationTerminalObserved` is an
+optional correlated signal; by itself it is neither necessary nor sufficient
+for that proof. The legacy `RealtimeAPI.webRTC` credential and signaling
+helpers are qualification-only SPI and are unavailable to ordinary imports.
+WebSocket sources are retained outside the package's published product graph
+and are not part of this production surface.
 
 ## License
 
