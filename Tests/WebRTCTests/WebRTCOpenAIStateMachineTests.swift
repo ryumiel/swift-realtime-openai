@@ -70,12 +70,71 @@ struct WebRTCOpenAIStateMachineTests {
 		_ = try await events.next()
 		try peer.configure(.openAI(language: "en"))
 		backing.emitRaw(#"{"type":"session.created"}"#)
-		#expect(try await events.next() == .openAISessionCreated)
 		do {
 			_ = try await events.next()
-			Issue.record("send failure must terminate")
+			Issue.record("send failure must purge pending semantic output and terminate")
 		} catch {
 			#expect(error as? WebRTCTransportFailure == .requestFailed)
+		}
+	}
+
+	@Test("exact numeric tokens enforce acknowledgement and rate-limit bounds")
+	func exactNumericValidation() throws {
+		for threshold in ["0.5", "0.50", "5e-1", "50e-2", "500E-3"] {
+			var machine = try OpenAIProductionStateMachine(language: "en")
+			_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
+			#expect(try machine.consume(Data(Self.acknowledgement(language: "en", threshold: threshold).utf8)) == .sessionAcknowledged)
+		}
+		for threshold in [
+			"0.5000000000000000000000000000000000000001",
+			"0.4999999999999999999999999999999999999999"
+		] {
+			var machine = try OpenAIProductionStateMachine(language: "en")
+			_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
+			#expect(throws: WebRTCTransportFailure.providerError) {
+				_ = try machine.consume(Data(Self.acknowledgement(language: "en", threshold: threshold).utf8))
+			}
+		}
+
+		let malformedRows = [
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":9223372036854775808,"remaining":0,"reset_seconds":0}]}"#,
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1.0,"remaining":0,"reset_seconds":0}]}"#,
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-1e-9999}]}"#
+		]
+		for json in malformedRows {
+			var machine = try activeMachine()
+			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+		}
+		var exactZero = try activeMachine()
+		#expect(try exactZero.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-0.0}]}"#.utf8)) == nil)
+	}
+
+	@Test("RT-OE-022 covers one malformed case per required schema dimension")
+	func schemaDimensionMatrix() throws {
+		let overlongIdentifier = String(repeating: "x", count: 129)
+		let rows = [
+			#"{"type":"session.updated","session":{"type":"realtime"}}"#,
+			#"{"type":"session.updated","session":{"type":1}}"#,
+			#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"\#(overlongIdentifier)","content_index":0,"transcript":""}"#,
+			#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"u","content_index":0.5,"transcript":""}"#,
+			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-1e-9999}]}"#,
+			#"{"type":"response.output_audio.done","response_id":"other","item_id":"a","output_index":0,"content_index":0}"#
+		]
+		for (index, json) in rows.enumerated() {
+			if index < 2 {
+				var machine = try OpenAIProductionStateMachine(language: "en")
+				_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
+				#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+			} else if index == 5 {
+				var machine = try activeResponseMachine()
+				#expect(throws: WebRTCTransportFailure.providerError) { _ = try machine.consume(Data(json.utf8)) }
+			} else if index == 2 {
+				var machine = try activeMachine()
+				#expect(throws: WebRTCTransportFailure.responseTooLarge) { _ = try machine.consume(Data(json.utf8)) }
+			} else {
+				var machine = try activeMachine()
+				#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+			}
 		}
 	}
 
@@ -391,8 +450,8 @@ struct WebRTCOpenAIStateMachineTests {
 		return machine
 	}
 
-	private static func acknowledgement(language: String) -> String {
-		#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"\#(language)"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#
+	private static func acknowledgement(language: String, threshold: String = "0.5") -> String {
+		#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"\#(language)"},"turn_detection":{"type":"server_vad","threshold":\#(threshold),"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#
 	}
 }
 

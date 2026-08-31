@@ -47,7 +47,7 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 }
 
 @MainActor public protocol WebRTCConnectorPeer: Sendable {
-	var events: AsyncThrowingStream<WebRTCConnectorEvent, any Error> { get }
+	var events: WebRTCConnectorEventStream { get }
 	func makeOffer() async throws -> String
 	func apply(remoteAnswer: String) async throws
 	func configure(_ configuration: WebRTCSessionConfiguration) throws
@@ -106,12 +106,17 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 
 @MainActor package protocol WebRTCConnectorPeerBacking: Sendable {
 	func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)
+	func installProductionConfiguration()
 	func makeOffer() async throws -> String
 	func apply(answer: String) async throws
 	func sendSessionConfiguration(_ data: Data) throws
 	func sendProductionCommand(_ command: ProductionCommand) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
 	func closeAndSettle() async
+}
+
+@MainActor package extension WebRTCConnectorPeerBacking {
+	func installProductionConfiguration() {}
 }
 
 @MainActor public struct WebRTCConnectorPeerFactory: Sendable {
@@ -147,8 +152,8 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 
 @MainActor package final class ProductionWebRTCConnectorPeer: WebRTCConnectorPeer, @unchecked Sendable {
 	private enum SettlementOrigin { case explicitClose, caller, backing }
-	package let events: AsyncThrowingStream<WebRTCConnectorEvent, any Error>
-	private let stream: AsyncThrowingStream<WebRTCConnectorEvent, any Error>.Continuation
+	package let events: WebRTCConnectorEventStream
+	private let eventStorage: WebRTCConnectorEventStream.Storage
 	private let backing: any WebRTCConnectorPeerBacking
 	private let initialAudioState: WebRTCLocalAudioState
 	private let productionSession: ProductionSessionSelection
@@ -174,10 +179,13 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 		self.backing = backing
 		self.initialAudioState = initialAudioState
 		productionSession = ProductionSessionSelection(initialAudioState: initialAudioState)
-		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorEvent.self, bufferingPolicy: .bufferingOldest(2))
-		stream.onTermination = { [weak self] _ in
-			guard let self else { return }
-			Task { @MainActor [self] in await self.beginSettlement(failure: nil, origin: .caller) }
+		let eventStorage = WebRTCConnectorEventStream.Storage()
+		self.eventStorage = eventStorage
+		events = WebRTCConnectorEventStream(storage: eventStorage)
+		eventStorage.installCancellationHandler(owner: { [weak self] in self }) { [weak self] in
+			Task { @MainActor [weak self] in
+				await self?.beginSettlement(failure: .cancelled, origin: .caller)
+			}
 		}
 		backing.installProductionEventSink { [weak self] result in self?.receive(result) }
 	}
@@ -271,11 +279,13 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 			switch configuration.provider {
 			case .localAI:
 				guard productionSession == .localAI else { throw WebRTCTransportFailure.invalidRequest }
-				try backing.sendSessionConfiguration(configuration.encoded())
 				configurationAcknowledgementPending = true
+				try backing.sendSessionConfiguration(configuration.encoded())
+				backing.installProductionConfiguration()
 			case .openAI:
 				guard productionSession == .openAI, initialAudioState == .disabled else { throw WebRTCTransportFailure.invalidRequest }
 				openAIState = try OpenAIProductionStateMachine(language: configuration.language)
+				backing.installProductionConfiguration()
 			}
 		} catch {
 			let failure = Self.contentFree(error)
@@ -379,11 +389,11 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 	}
 
 	private func yield(_ event: WebRTCConnectorEvent) -> Bool {
-		switch stream.yield(event) {
-		case .enqueued: return true
-		case .dropped, .terminated: startSettlement(failure: .ingressOverloaded, origin: .backing); return false
-		@unknown default: startSettlement(failure: .ingressOverloaded, origin: .backing); return false
+		guard eventStorage.offer(event) else {
+			startSettlement(failure: .ingressOverloaded, origin: .backing)
+			return false
 		}
+		return true
 	}
 
 	private func admitReady() -> Bool {
@@ -417,6 +427,7 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 		guard !terminal, !settlementStarting else { return Task {} }
 		settlementStarting = true
 		backing.setLocalAudioState(.disabled)
+		eventStorage.beginTerminalSelection()
 		terminal = true
 		openAIState?.invalidate()
 		terminalFailure = failure
@@ -430,14 +441,8 @@ package enum ProductionSessionSelection: Sendable, Equatable {
 			await backingClose.value
 			_ = await offerOperation?.result
 			_ = await answerOperation?.result
-			if let failure = self.terminalFailure { self.stream.finish(throwing: failure) }
-			else {
-				switch self.stream.yield(.closed) {
-				case .enqueued: self.stream.finish()
-				case .dropped, .terminated: self.stream.finish(throwing: WebRTCTransportFailure.ingressOverloaded)
-				@unknown default: self.stream.finish(throwing: WebRTCTransportFailure.ingressOverloaded)
-				}
-			}
+			await self.eventStorage.waitForAdmittedDeliveries()
+			self.eventStorage.finish(failure: self.terminalFailure)
 			self.settlementTask = nil
 		}
 		settlementTask = task

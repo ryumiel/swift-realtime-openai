@@ -8,10 +8,11 @@ import FoundationNetworking
 
 final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
 	private static let trackCapacity = 1
-	private let lock = NSLock()
+	private let condition = NSCondition()
 	private var enabled: Bool
 	private var closed = false
 	private var tracks: [LKRTCMediaStreamTrack] = []
+	private var admittedCallbacks = 0
 	private let admittedFrame: @Sendable () -> Void
 
 	init(initiallyEnabled: Bool, admittedFrame: @escaping @Sendable () -> Void = {}) {
@@ -20,7 +21,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func setEnabled(_ enabled: Bool) {
-		lock.withLock {
+		condition.withLock {
 			guard !closed else { return }
 			self.enabled = enabled
 			tracks.forEach { $0.isEnabled = enabled }
@@ -28,7 +29,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func register(_ candidates: [LKRTCMediaStreamTrack]) {
-		lock.withLock {
+		condition.withLock {
 			if closed {
 				candidates.filter { $0.kind == "audio" }.forEach { $0.isEnabled = false }
 				return
@@ -44,7 +45,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func unregister(_ candidates: [LKRTCMediaStreamTrack]) {
-		lock.withLock {
+		condition.withLock {
 			for candidate in candidates where candidate.kind == "audio" {
 				candidate.isEnabled = false
 				(candidate as? LKRTCAudioTrack)?.remove(self)
@@ -54,14 +55,32 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func deliverIfAdmitted(_ delivery: () -> Void) {
-		let admitted = lock.withLock { !closed && enabled }
-		if admitted { delivery() }
+		let admitted = condition.withLock { () -> Bool in
+			guard !closed, enabled else { return false }
+			admittedCallbacks += 1
+			return true
+		}
+		guard admitted else { return }
+		delivery()
+		condition.withLock {
+			admittedCallbacks = max(0, admittedCallbacks - 1)
+			if admittedCallbacks == 0 { condition.broadcast() }
+		}
 	}
 
 	func render(pcmBuffer _: AVAudioPCMBuffer) { deliverIfAdmitted(admittedFrame) }
 
 	func close() {
-		lock.withLock {
+		condition.lock()
+		closed = true
+		enabled = false
+		tracks.forEach { $0.isEnabled = false }
+		while admittedCallbacks != 0 { condition.wait() }
+		condition.unlock()
+	}
+
+	func releaseTracks() {
+		condition.withLock {
 			closed = true
 			enabled = false
 			tracks.forEach {
@@ -104,6 +123,8 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 		if didClose { didDisable() }
 	}
+
+	func releaseRemoteTracks() { remoteGate?.releaseTracks() }
 }
 
 @_spi(AirbridgeQualification) @MainActor @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
@@ -231,8 +252,8 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 
 		func request(_ failure: WebRTCTransportFailure?, connector: WebRTCConnector) -> Task<Void, Never>? {
-			connector.closeProductionMediaSynchronously()
-			return lock.withLock { requestLocked(failure, acceptedFailureSelected: false, connector: connector) }
+			let mediaClosed = connector.closeProductionMediaSynchronously()
+			return lock.withLock { requestLocked(failure, acceptedFailureSelected: mediaClosed, connector: connector) }
 		}
 
 		func acceptsProgression() -> Bool {
@@ -299,7 +320,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 
 		func requestFromAcceptedIngress(_ failure: WebRTCTransportFailure, connector: WebRTCConnector) -> Task<Void, Never>? {
-			connector.closeProductionMediaSynchronously()
+			_ = connector.closeProductionMediaSynchronously()
 			return lock.withLock {
 				switch state {
 				case let .closing(_, acceptedFailureSelected, acceptedIngress, task, waiter):
@@ -493,6 +514,8 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 	private var ingressDrainTask: Task<Void, Never>?
 	nonisolated private let terminalGate = TerminalGate()
 	private var productionReadinessWaiter: CheckedContinuation<Void, Never>?
+	private var productionConfigurationWaiter: CheckedContinuation<Void, Never>?
+	private var productionConfigurationInstalled = false
 	private var productionDeliveryCancelled = false
 	package static let inboundMailboxCapacity = 32
 	private enum PreReadyInboundEvent {
@@ -650,6 +673,13 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		productionEventSink = sink
 	}
 
+	package func installProductionConfiguration() {
+		guard !productionConfigurationInstalled else { return }
+		productionConfigurationInstalled = true
+		productionConfigurationWaiter?.resume()
+		productionConfigurationWaiter = nil
+	}
+
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard lifecycle.isCurrent(generation) else { return }
 		productionMediaCloser.set(state)
@@ -698,10 +728,14 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		terminalObserver.closeData()
 		connection.close()
 		terminalObserver.closePeer()
+		productionMediaCloser.releaseRemoteTracks()
+		productionMediaCloser.close()
 		Self.deactivateAudioSession()
 		preReadyInboundEvents.removeAll()
 		productionReadinessWaiter?.resume()
 		productionReadinessWaiter = nil
+		productionConfigurationWaiter?.resume()
+		productionConfigurationWaiter = nil
 		ingressStream.finish(throwing: failure)
 		let drain = ingressDrainTask
 		ingressDrainTask = nil
@@ -726,7 +760,11 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		terminalObserver.didSettle()
 	}
 
-	nonisolated private func closeProductionMediaSynchronously() { productionMediaCloser.close() }
+	nonisolated private func closeProductionMediaSynchronously() -> Bool {
+		guard productionSession == .openAI else { return false }
+		productionMediaCloser.close()
+		return true
+	}
 
 	public func toggleMute() {
 		guard lifecycle.isCurrent(generation) else { return }
@@ -1102,6 +1140,8 @@ extension WebRTCConnector {
 		if deliveryMode == .production {
 			await waitForProductionReadiness()
 			guard !productionDeliveryCancelled, terminalGate.shouldProcessAcceptedIngress(), lifecycle.isCurrent(generation) else { return }
+			await waitForProductionConfiguration()
+			guard !productionDeliveryCancelled, terminalGate.shouldProcessAcceptedIngress(), lifecycle.isCurrent(generation) else { return }
 			yieldProduction(.rawInbound(data), fromAcceptedIngress: true)
 			return
 		}
@@ -1142,10 +1182,19 @@ extension WebRTCConnector {
 		productionReadinessWaiter = nil
 	}
 
+	private func waitForProductionConfiguration() async {
+		while !productionConfigurationInstalled {
+			guard !productionDeliveryCancelled, terminalGate.shouldProcessAcceptedIngress(), lifecycle.isCurrent(generation) else { return }
+			await withCheckedContinuation { productionConfigurationWaiter = $0 }
+		}
+	}
+
 	private func resumeProductionReadinessForTerminal() {
 		productionDeliveryCancelled = true
 		productionReadinessWaiter?.resume()
 		productionReadinessWaiter = nil
+		productionConfigurationWaiter?.resume()
+		productionConfigurationWaiter = nil
 	}
 
 	private func requestTerminalFromAcceptedIngress(_ failure: WebRTCTransportFailure) {

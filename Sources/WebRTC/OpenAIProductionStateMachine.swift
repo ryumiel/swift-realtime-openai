@@ -210,7 +210,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 			try transcription.requiredString("model", maximumBytes: 256 * 1024, nonempty: true) == "gpt-4o-mini-transcribe",
 			try transcription.requiredString("language", maximumBytes: 256 * 1024, nonempty: true) == language,
 			try vad.requiredString("type", maximumBytes: 256 * 1024, nonempty: true) == "server_vad",
-			try vad.requiredFiniteNumber("threshold") == 0.5,
+			try vad.requiredExactNumber("threshold").isExactlyHalf,
 			try vad.requiredNonnegativeInteger("prefix_padding_ms") == 300,
 			try vad.requiredNonnegativeInteger("silence_duration_ms") == 500,
 			try vad.requiredBool("create_response"), try vad.requiredBool("interrupt_response"),
@@ -276,7 +276,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 			_ = try limit.requiredString("name", maximumBytes: 64, nonempty: true)
 			_ = try limit.requiredNonnegativeInteger("limit")
 			_ = try limit.requiredNonnegativeInteger("remaining")
-			guard try limit.requiredFiniteNumber("reset_seconds") >= 0 else { throw WebRTCTransportFailure.malformedEvent }
+			guard try limit.requiredExactNumber("reset_seconds").isNonnegative else { throw WebRTCTransportFailure.malformedEvent }
 		}
 	}
 
@@ -518,8 +518,54 @@ private extension Dictionary where Key == String, Value == StrictJSON {
 		guard let wrapped = self[key], case let .number(token) = wrapped.node, !token.contains("."), !token.contains("e"), !token.contains("E"), let value = Int64(token), value >= 0 else { throw WebRTCTransportFailure.malformedEvent }
 		return value
 	}
-	func requiredFiniteNumber(_ key: String) throws -> Double { guard let wrapped = self[key], case let .number(token) = wrapped.node, let value = Double(token), value.isFinite else { throw WebRTCTransportFailure.malformedEvent }; return value }
+	func requiredExactNumber(_ key: String) throws -> ExactJSONNumber {
+		guard let wrapped = self[key], case let .number(token) = wrapped.node else { throw WebRTCTransportFailure.malformedEvent }
+		return ExactJSONNumber(token: token)
+	}
 	func requiredBool(_ key: String) throws -> Bool { guard let wrapped = self[key], case let .bool(value) = wrapped.node else { throw WebRTCTransportFailure.malformedEvent }; return value }
+}
+
+private struct ExactJSONNumber {
+	let token: String
+
+	var isNonnegative: Bool {
+		guard token.first == "-" else { return true }
+		return !token.contains(where: { $0 >= "1" && $0 <= "9" })
+	}
+
+	var isExactlyHalf: Bool {
+		guard token.first != "-" else { return false }
+		let exponentSplit = token.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "e" || $0 == "E" })
+		guard exponentSplit.count <= 2 else { return false }
+		let significand = String(exponentSplit[0])
+		let exponent = exponentSplit.count == 2 ? boundedSignedInteger(String(exponentSplit[1])) : 0
+		guard let exponent else { return false }
+		let decimalSplit = significand.split(separator: ".", omittingEmptySubsequences: false)
+		guard decimalSplit.count <= 2 else { return false }
+		let fractionCount = decimalSplit.count == 2 ? decimalSplit[1].count : 0
+		let digits = decimalSplit.joined()
+		let withoutLeadingZeros = digits.drop(while: { $0 == "0" })
+		guard !withoutLeadingZeros.isEmpty else { return false }
+		let trailingZeroCount = withoutLeadingZeros.reversed().prefix(while: { $0 == "0" }).count
+		let coefficient = withoutLeadingZeros.dropLast(trailingZeroCount)
+		return coefficient == "5" && exponent - fractionCount + trailingZeroCount == -1
+	}
+
+	private func boundedSignedInteger(_ value: String) -> Int? {
+		guard !value.isEmpty else { return nil }
+		let negative = value.first == "-"
+		let positive = value.first == "+"
+		let digits = (negative || positive) ? value.dropFirst() : value[...]
+		guard !digits.isEmpty, digits.allSatisfy({ $0.isNumber }) else { return nil }
+		let bound = token.count + 1
+		var result = 0
+		for digit in digits {
+			guard let value = digit.wholeNumberValue else { return nil }
+			if result > bound { return negative ? -bound : bound }
+			result = result * 10 + value
+		}
+		return negative ? -min(result, bound) : min(result, bound)
+	}
 }
 
 private extension Optional where Wrapped == [String: StrictJSON] {
