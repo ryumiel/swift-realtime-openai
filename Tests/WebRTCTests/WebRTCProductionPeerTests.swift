@@ -925,8 +925,10 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let stream = try XCTUnwrap(peer?.events)
 		let storage = stream.storage
 		let publicationGate = ProductionSynchronousGate()
+		let publicationWaiterInstalled = ProductionSynchronousGate()
 		let cancellationReturned = ProductionSynchronousGate()
 		storage.installCancellationSelectionHook { publicationGate.hold() }
+		storage.installCancellationPublicationWaiterInstalledHook { publicationWaiterInstalled.recordReturn() }
 		let closeStarted = expectation(description: "iterator cancellation started retained settlement")
 		backing.didStartClose = { closeStarted.fulfill() }
 		var cancellation: Task<Void, Never>? = Task.detached {
@@ -936,15 +938,13 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertTrue(publicationGate.waitUntilHeld())
 		peer = nil
 		XCTAssertNotNil(weakPeer.value, "Cancellation selection must retain the peer before task publication")
-		let readerStarted = ProductionSynchronousGate()
 		let readerReturned = ProductionSynchronousGate()
 		var reader: Task<WebRTCConnectorEvent?, any Error>? = Task.detached {
 			var iterator = stream.makeAsyncIterator()
-			readerStarted.recordReturn()
 			defer { readerReturned.recordReturn() }
 			return try await iterator.next()
 		}
-		XCTAssertTrue(readerStarted.waitUntilReturned())
+		XCTAssertTrue(publicationWaiterInstalled.waitUntilReturned())
 		XCTAssertFalse(readerReturned.waitUntilReturned(), "Cancelled next must await settlement task publication")
 
 		publicationGate.resume()
