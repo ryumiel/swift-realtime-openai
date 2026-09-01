@@ -1069,7 +1069,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(terminal, .closed)
 	}
 
-	@MainActor func testMismatchedAndDuplicateAcknowledgementsFailClosedWithoutAnotherConnected() async throws {
+	@MainActor func testMismatchedAcknowledgementIsProviderErrorAndDuplicateRemainsMalformed() async throws {
 		let mismatchedBacking = FakeProductionBacking()
 		let mismatchedPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { mismatchedBacking }).makePeer()
 		var mismatchedEvents = mismatchedPeer.events.makeAsyncIterator()
@@ -1083,7 +1083,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			_ = try await mismatchedEvents.next()
 			XCTFail("Mismatched acknowledgement must fail")
 		} catch {
-			XCTAssertEqual(error as? WebRTCTransportFailure, .malformedEvent)
+			XCTAssertEqual(error as? WebRTCTransportFailure, .providerError)
 		}
 		await mismatchedPeer.closeAndJoin()
 		XCTAssertEqual(mismatchedBacking.closeCount, 1)
@@ -1110,6 +1110,97 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 		await duplicatePeer.closeAndJoin()
 		XCTAssertEqual(duplicateBacking.closeCount, 1)
+	}
+
+	@MainActor func testPendingLocalAIRawAcknowledgementTaxonomyIsExact() async throws {
+		let acknowledgement = Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8)
+		do {
+			let (peer, backing) = try await makePendingLocalAIPeer()
+			var events = peer.events.makeAsyncIterator()
+			let ready = try await events.next()
+			XCTAssertEqual(ready, .ready)
+			await backing.emit(.rawInbound(acknowledgement))
+			let configured = try await events.next()
+			let connected = try await events.next()
+			XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
+			XCTAssertEqual(connected, .connected)
+
+			await backing.emit(.rawInbound(acknowledgement))
+			do {
+				_ = try await events.next()
+				XCTFail("A duplicate acknowledgement must remain malformed")
+			} catch {
+				XCTAssertEqual(error as? WebRTCTransportFailure, .malformedEvent)
+			}
+			await peer.closeAndJoin()
+		}
+
+		let rejectedAcknowledgements = [
+			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Other"}}}}"#.utf8),
+			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"en"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8),
+			Data(#"{"type":"session.updated"}"#.utf8),
+			Data(#"{"type":"session.updated","session":{"type":7,"audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8),
+			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{}}}}"#.utf8),
+			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":7}},"output":{"voice":"Ono_Anna"}}}}"#.utf8),
+		]
+		for payload in rejectedAcknowledgements {
+			let (peer, backing) = try await makePendingLocalAIPeer()
+			var events = peer.events.makeAsyncIterator()
+			let ready = try await events.next()
+			XCTAssertEqual(ready, .ready)
+			await backing.emit(.rawInbound(payload))
+			do {
+				_ = try await events.next()
+				XCTFail("A malformed pending acknowledgement must be a provider rejection")
+			} catch {
+				XCTAssertEqual(error as? WebRTCTransportFailure, .providerError)
+			}
+			await peer.closeAndJoin()
+		}
+
+		let controls: [(Data, WebRTCTransportFailure)] = [
+			(Data(#"{"type":"conversation.item.input_audio_transcription.completed"}"#.utf8), .malformedEvent),
+			(Data(#"{"type":"unrelated.event"}"#.utf8), .unsupportedEvent),
+			(Data(repeating: 0, count: WebRTCTransportLimits.maximumPayloadBytes + 1), .eventTooLarge),
+		]
+		for (payload, expected) in controls {
+			let (peer, backing) = try await makePendingLocalAIPeer()
+			var events = peer.events.makeAsyncIterator()
+			let ready = try await events.next()
+			XCTAssertEqual(ready, .ready)
+			await backing.emit(.rawInbound(payload))
+			do {
+				_ = try await events.next()
+				XCTFail("An unrelated pending event must retain its failure category")
+			} catch {
+				XCTAssertEqual(error as? WebRTCTransportFailure, expected)
+			}
+			await peer.closeAndJoin()
+		}
+	}
+
+	@MainActor func testOpenAIMalformedAcknowledgementRemainsMalformed() async throws {
+		let backing = FakeProductionBacking()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		var events = peer.events.makeAsyncIterator()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		await backing.emit(.ready)
+		let ready = try await events.next()
+		XCTAssertEqual(ready, .ready)
+		try peer.configure(.openAI(language: "en"))
+		await backing.emit(.rawInbound(Data(#"{"type":"session.created"}"#.utf8)))
+		let created = try await events.next()
+		XCTAssertEqual(created, .openAISessionCreated)
+
+		await backing.emit(.rawInbound(Data(#"{"type":"session.updated","session":{"type":"realtime"}}"#.utf8)))
+		do {
+			_ = try await events.next()
+			XCTFail("OpenAI acknowledgement validation must remain unchanged")
+		} catch {
+			XCTAssertEqual(error as? WebRTCTransportFailure, .malformedEvent)
+		}
+		await peer.closeAndJoin()
 	}
 
 	@MainActor func testBackingErrorsAreContentFreeAndStaleCallbacksAreIgnoredAfterSettlement() async throws {
@@ -1211,6 +1302,19 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			}
 			try await Task.sleep(for: .milliseconds(10))
 		}
+	}
+
+	@MainActor private func makePendingLocalAIPeer() async throws -> (
+		peer: any WebRTCConnectorPeer,
+		backing: FakeProductionBacking
+	) {
+		let backing = FakeProductionBacking()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		await backing.emit(.ready)
+		try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
+		return (peer, backing)
 	}
 
 }

@@ -371,10 +371,13 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			switch inbound {
 			case let .sessionUpdated(voice, language):
 				guard ready, configurationAcknowledgementPending, let configuration,
-					case let .localAI(expectedVoice) = configuration.provider,
-					expectedVoice == voice, configuration.language == language,
-					yield(.localAISessionConfigured(voice: voice, language: language)), yield(.connected)
+					case let .localAI(expectedVoice) = configuration.provider
 				else { startSettlement(failure: .malformedEvent, origin: .backing); return }
+				guard expectedVoice == voice, configuration.language == language else {
+					startSettlement(failure: .providerError, origin: .backing)
+					return
+				}
+				guard yield(.localAISessionConfigured(voice: voice, language: language)), yield(.connected) else { return }
 				configurationAcknowledgementPending = false
 				connected = true
 			case let .userTranscript(text): guard connected, yield(.userTranscript(text)) else { startSettlement(failure: .malformedEvent, origin: .backing); return }; return
@@ -390,8 +393,15 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		guard let configuration else { throw WebRTCTransportFailure.malformedEvent }
 		switch configuration.provider {
 		case .localAI:
-			guard let inbound = try WebRTCInboundEventDecoder().decodeForConnector(data) else { return }
-			receive(.success(.inbound(inbound)))
+			do {
+				guard let inbound = try WebRTCInboundEventDecoder().decodeForConnector(data) else { return }
+				receive(.success(.inbound(inbound)))
+			} catch let failure as WebRTCTransportFailure {
+				let acknowledgementRejected = configurationAcknowledgementPending &&
+					(failure == .malformedEvent || failure == .invalidRequest) &&
+					Self.identifiesLocalAISessionUpdated(data)
+				throw acknowledgementRejected ? WebRTCTransportFailure.providerError : failure
+			}
 		case .openAI:
 			guard let event = try openAIState?.consume(data) else { return }
 			switch event {
@@ -408,6 +418,11 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			case .cancellationTerminalObserved: guard yield(.responseCancellationTerminalObserved) else { return }
 			}
 		}
+	}
+
+	private nonisolated static func identifiesLocalAISessionUpdated(_ data: Data) -> Bool {
+		guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+		return object["type"] as? String == "session.updated"
 	}
 
 	private func yield(_ event: WebRTCConnectorEvent) -> Bool {
