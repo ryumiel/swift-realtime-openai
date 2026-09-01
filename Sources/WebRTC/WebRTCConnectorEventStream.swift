@@ -43,6 +43,38 @@ public struct WebRTCConnectorEventStream: AsyncSequence, Sendable {
 
 extension WebRTCConnectorEventStream {
 	package final class Storage: @unchecked Sendable {
+		private final class CancellationSettlementJoin: @unchecked Sendable {
+			private let lock = NSLock()
+			private var task: Task<Void, Never>?
+			private var publicationWaiter: CheckedContinuation<Task<Void, Never>, Never>?
+
+			func publish(_ task: Task<Void, Never>) {
+				var waiter: CheckedContinuation<Task<Void, Never>, Never>?
+				lock.withLock {
+					precondition(self.task == nil, "Cancellation settlement can only be published once")
+					self.task = task
+					waiter = publicationWaiter
+					publicationWaiter = nil
+				}
+				waiter?.resume(returning: task)
+			}
+
+			func join() async {
+				let task: Task<Void, Never> = await withCheckedContinuation { continuation in
+					var published: Task<Void, Never>?
+					lock.withLock {
+						if let task = self.task { published = task }
+						else {
+							precondition(publicationWaiter == nil, "Cancellation settlement has one joiner")
+							publicationWaiter = continuation
+						}
+					}
+					if let published { continuation.resume(returning: published) }
+				}
+				await task.value
+			}
+		}
+
 		fileprivate enum Value {
 			case event(WebRTCConnectorEvent)
 			case failure(WebRTCTransportFailure)
@@ -78,8 +110,9 @@ extension WebRTCConnectorEventStream {
 		private var iteratorClaimed = false
 		private var nextInFlight = false
 		private var iteratorCancelled = false
-		private var cancellationSettlement: Task<Void, Never>?
+		private var cancellationSettlement: CancellationSettlementJoin?
 		private var cancellationHandler: (@Sendable () -> Task<Void, Never>)?
+		private var cancellationSelectionHook: (@Sendable () -> Void)?
 		private var ownerProvider: (@Sendable () -> AnyObject?)?
 		private var suspendedOwner: AnyObject?
 
@@ -91,6 +124,10 @@ extension WebRTCConnectorEventStream {
 				ownerProvider = owner
 				cancellationHandler = handler
 			}
+		}
+
+		func installCancellationSelectionHook(_ hook: @escaping @Sendable () -> Void) {
+			lock.withLock { cancellationSelectionHook = hook }
 		}
 
 		func claimIterator() -> Bool {
@@ -208,23 +245,38 @@ extension WebRTCConnectorEventStream {
 		func cancelIterator() {
 			var resume: CheckedContinuation<Delivery, Never>?
 			var handler: (@Sendable () -> Task<Void, Never>)?
+			var selectionHook: (@Sendable () -> Void)?
+			let settlement = CancellationSettlementJoin()
+			var selected = false
 			lock.withLock {
 				guard !iteratorCancelled, case .open = phase else { return }
+				cancellationSettlement = settlement
+				suspendedOwner = ownerProvider?()
 				iteratorCancelled = true
 				phase = .closing
 				pending.removeAll(keepingCapacity: false)
 				resume = waiter
 				waiter = nil
 				handler = cancellationHandler
+				selectionHook = cancellationSelectionHook
+				cancellationSelectionHook = nil
+				selected = true
 			}
-			let task = handler?()
-			if let task { lock.withLock { cancellationSettlement = task } }
+			guard selected else { return }
+			selectionHook?()
+			let task = handler?() ?? Task {}
+			settlement.publish(task)
 			resume?.resume(returning: Delivery(value: .cancelled, admitted: false))
 		}
 
 		func joinCancellationSettlement() async {
-			let task = lock.withLock { cancellationSettlement }
-			await task?.value
+			let settlement: CancellationSettlementJoin = lock.withLock {
+				guard let cancellationSettlement else {
+					preconditionFailure("Cancelled delivery requires a settlement join")
+				}
+				return cancellationSettlement
+			}
+			await settlement.join()
 		}
 	}
 }

@@ -922,21 +922,45 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let backing = FakeProductionBacking(suspendClose: true)
 		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
 		let weakPeer = WeakPeerBox(peer as AnyObject)
+		let stream = try XCTUnwrap(peer?.events)
+		let storage = stream.storage
+		let publicationGate = ProductionSynchronousGate()
+		let cancellationReturned = ProductionSynchronousGate()
+		storage.installCancellationSelectionHook { publicationGate.hold() }
 		let closeStarted = expectation(description: "iterator cancellation started retained settlement")
 		backing.didStartClose = { closeStarted.fulfill() }
-		var reader: Task<WebRTCConnectorEvent?, any Error>?
-		if let peer {
-			reader = Task { @MainActor [peer] in
-			var iterator = peer.events.makeAsyncIterator()
-			return try await iterator.next()
-			}
+		var cancellation: Task<Void, Never>? = Task.detached {
+			storage.cancelIterator()
+			cancellationReturned.recordReturn()
 		}
-		await Task.yield()
+		XCTAssertTrue(publicationGate.waitUntilHeld())
 		peer = nil
-		reader?.cancel()
+		XCTAssertNotNil(weakPeer.value, "Cancellation selection must retain the peer before task publication")
+		let readerStarted = ProductionSynchronousGate()
+		let readerReturned = ProductionSynchronousGate()
+		var reader: Task<WebRTCConnectorEvent?, any Error>? = Task.detached {
+			var iterator = stream.makeAsyncIterator()
+			readerStarted.recordReturn()
+			defer { readerReturned.recordReturn() }
+			return try await iterator.next()
+		}
+		XCTAssertTrue(readerStarted.waitUntilReturned())
+		XCTAssertFalse(readerReturned.waitUntilReturned(), "Cancelled next must await settlement task publication")
+
+		publicationGate.resume()
+		XCTAssertTrue(cancellationReturned.waitUntilReturned())
+		await cancellation?.value
 		await fulfillment(of: [closeStarted], timeout: 1)
 		guard backing.closeCount == 1 else { return }
+		XCTAssertFalse(readerReturned.waitUntilReturned(), "Cancelled next must await suspended backing close")
 		XCTAssertNotNil(weakPeer.value, "Iterator cancellation retains peer settlement while backing close is suspended")
+		do {
+			let retainedPeer = try XCTUnwrap(weakPeer.value as? any WebRTCConnectorPeer)
+			XCTAssertThrowsError(try retainedPeer.createResponse()) { error in
+				XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
+			}
+		}
+		XCTAssertFalse(storage.offer(.ready), "Cancellation selection rejects late semantic work")
 		backing.resumeClose()
 		do {
 			_ = try await reader?.value
@@ -945,9 +969,11 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
 		}
 		reader = nil
+		cancellation = nil
+		await backing.emit(.ready)
+		XCTAssertTrue(backing.lastYieldWasTerminated)
 		XCTAssertEqual(backing.closeCount, 1)
 		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
-		for _ in 0..<16 where weakPeer.value != nil { await Task.yield() }
 		XCTAssertNil(weakPeer.value)
 	}
 
