@@ -12,12 +12,10 @@ It can handle automatically recording the user's microphone and playing back the
 
 ### Swift Package Manager
 
-The production WebRTC surface described below is not published yet. The
-upstream `m1guelpf/swift-realtime-openai` `main` branch does not contain this
-API, so do not use that mutable branch to obtain it. Airbridge Task 3 will
-publish the reviewed fork and update this section with its exact immutable
-revision and `RealtimeWebRTC` product. No production dependency identity is
-claimed before that publication.
+For the production WebRTC surface described below, use the `RealtimeWebRTC`
+product from `https://github.com/ryumiel/swift-realtime-openai.git`. Consumers
+must select an independently reviewed immutable commit. The mutable `main`
+branch and all other branch references are forbidden production selectors.
 
 ## Getting started 🚀
 
