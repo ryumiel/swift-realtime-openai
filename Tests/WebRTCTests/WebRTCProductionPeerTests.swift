@@ -1138,6 +1138,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let rejectedAcknowledgements = [
 			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Other"}}}}"#.utf8),
 			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"en"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8),
+			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":""}}}}"#.utf8),
+			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"EN"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8),
 			Data(#"{"type":"session.updated"}"#.utf8),
 			Data(#"{"type":"session.updated","session":{"type":7,"audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8),
 			Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{}}}}"#.utf8),
@@ -1155,7 +1157,10 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			} catch {
 				XCTAssertEqual(error as? WebRTCTransportFailure, .providerError)
 			}
+			let eventAfterFailure = try await events.next()
+			XCTAssertNil(eventAfterFailure, "No configured or connected event may cross a rejected acknowledgement")
 			await peer.closeAndJoin()
+			XCTAssertEqual(backing.closeCount, 1)
 		}
 
 		let controls: [(Data, WebRTCTransportFailure)] = [
