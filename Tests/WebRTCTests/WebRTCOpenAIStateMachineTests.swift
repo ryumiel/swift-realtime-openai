@@ -9,11 +9,13 @@ struct WebRTCOpenAIStateMachineTests {
 	func exactSessionEncoding() throws {
 		let english = try WebRTCSessionConfiguration.openAI(language: "en")
 		let korean = try WebRTCSessionConfiguration.openAI(language: "ko")
-		#expect(try english.encoded() == Data(#"{"type":"session.update","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8))
+		let encodingMatchesContract = try english.encoded() == Data(#"{"type":"session.update","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8)
+		#expect(encodingMatchesContract, "Session configuration must use the fixed production schema")
 		let koreanData = try korean.encoded()
 		let englishData = try english.encoded()
-		#expect(koreanData != englishData)
-		#expect(throws: WebRTCTransportFailure.invalidRequest) {
+		let languageChangesEncoding = koreanData != englishData
+		#expect(languageChangesEncoding, "The selected language must affect the encoded configuration")
+		assertFailure(.invalidRequest) {
 			_ = try WebRTCSessionConfiguration.openAI(language: "fr")
 		}
 	}
@@ -26,14 +28,19 @@ struct WebRTCOpenAIStateMachineTests {
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
 		backing.emit(.ready)
-		#expect(try await events.next() == .ready)
+		let ready = try await events.next()
+		assertEventKind(.ready, ready)
 		try peer.configure(.openAI(language: "en"))
-		#expect(backing.configurationPayloads.isEmpty)
+		let payloadCountBeforeCreation = backing.configurationPayloads.count
+		#expect(payloadCountBeforeCreation == 0)
 		backing.emitRaw(#"{"type":"session.created","session":{"id":"synthetic"}}"#)
-		#expect(try await events.next() == .openAISessionCreated)
-		#expect(backing.configurationPayloads.count == 1)
+		let created = try await events.next()
+		assertEventKind(.sessionCreated, created)
+		let payloadCountAfterCreation = backing.configurationPayloads.count
+		#expect(payloadCountAfterCreation == 1)
 		backing.emitRaw(Self.acknowledgement(language: "en"))
-		#expect(try await events.next() == .openAISessionConfigured(language: "en"))
+		let configured = try await events.next()
+		assertEventKind(.sessionConfigured, configured)
 		#expect(backing.audioStates == [.disabled])
 		peer.setLocalAudioState(.enabled)
 		#expect(backing.audioStates == [.disabled, .enabled])
@@ -52,10 +59,13 @@ struct WebRTCOpenAIStateMachineTests {
 		try peer.configure(.openAI(language: "en"))
 		backing.emitRaw(#"{"type":"session.created"}"#)
 		backing.emitRaw(Self.acknowledgement(language: "en"))
-		#expect(try await events.next() == .openAISessionCreated)
-		#expect(try await events.next() == .openAISessionConfigured(language: "en"))
+		let created = try await events.next()
+		assertEventKind(.sessionCreated, created)
+		let configured = try await events.next()
+		assertEventKind(.sessionConfigured, configured)
 		try peer.createResponse()
-		#expect(backing.commandTypes == ["response.create"])
+		let sentCreateOnly = backing.commandTypes == ["response.create"]
+		#expect(sentCreateOnly, "The handshake must send exactly one create command")
 		await peer.closeAndJoin()
 	}
 
@@ -83,7 +93,8 @@ struct WebRTCOpenAIStateMachineTests {
 		for threshold in ["0.5", "0.50", "5e-1", "50e-2", "500E-3"] {
 			var machine = try OpenAIProductionStateMachine(language: "en")
 			_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
-			#expect(try machine.consume(Data(Self.acknowledgement(language: "en", threshold: threshold).utf8)) == .sessionAcknowledged)
+			let event = try machine.consume(Data(Self.acknowledgement(language: "en", threshold: threshold).utf8))
+			assertEventKind(.sessionAcknowledged, event)
 		}
 		for threshold in [
 			"0.5000000000000000000000000000000000000001",
@@ -91,7 +102,7 @@ struct WebRTCOpenAIStateMachineTests {
 		] {
 			var machine = try OpenAIProductionStateMachine(language: "en")
 			_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
-			#expect(throws: WebRTCTransportFailure.providerError) {
+			assertFailure(.providerError) {
 				_ = try machine.consume(Data(Self.acknowledgement(language: "en", threshold: threshold).utf8))
 			}
 		}
@@ -105,17 +116,20 @@ struct WebRTCOpenAIStateMachineTests {
 		]
 		for json in malformedRows {
 			var machine = try activeMachine()
-			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+			assertFailure(.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
 		}
 		var exactZero = try activeMachine()
-		#expect(try exactZero.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-0.0}]}"#.utf8)) == nil)
+		let exactZeroEvent = try exactZero.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":-0.0}]}"#.utf8))
+		assertNoEvent(exactZeroEvent)
 		for zero in ["-0e1", "-0.0e-1"] {
 			var exponentZero = try activeMachine()
 			let json = #"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":\#(zero)}]}"#
-			#expect(try exponentZero.consume(Data(json.utf8)) == nil)
+			let exponentZeroEvent = try exponentZero.consume(Data(json.utf8))
+			assertNoEvent(exponentZeroEvent)
 		}
 		var finite = try activeMachine()
-		#expect(try finite.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":1.7976931348623157e308}]}"#.utf8)) == nil)
+		let finiteEvent = try finite.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":1,"remaining":0,"reset_seconds":1.7976931348623157e308}]}"#.utf8))
+		assertNoEvent(finiteEvent)
 	}
 
 	@Test("nullable response status containers preserve an absent error-code path")
@@ -124,18 +138,19 @@ struct WebRTCOpenAIStateMachineTests {
 			for status in ["completed", "cancelled"] {
 				var machine = try activeResponseMachine()
 				let json = #"{"type":"response.done","response":{"id":"r1","status":"\#(status)",\#(statusDetails)}}"#
-				#expect(try machine.consume(Data(json.utf8)) == .responseFinished)
+				let event = try machine.consume(Data(json.utf8))
+				assertEventKind(.responseFinished, event)
 			}
 			for status in ["failed", "incomplete"] {
 				var machine = try activeResponseMachine()
 				let json = #"{"type":"response.done","response":{"id":"r1","status":"\#(status)",\#(statusDetails)}}"#
-				#expect(throws: WebRTCTransportFailure.providerError) {
+				assertFailure(.providerError) {
 					_ = try machine.consume(Data(json.utf8))
 				}
 			}
 		}
 		var codePresent = try activeResponseMachine()
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		assertFailure(.malformedEvent) {
 			_ = try codePresent.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"completed","status_details":{"error":{"code":"synthetic"}}}}"#.utf8))
 		}
 	}
@@ -158,16 +173,16 @@ struct WebRTCOpenAIStateMachineTests {
 			if index < 2 {
 				var machine = try OpenAIProductionStateMachine(language: "en")
 				_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
-				#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+					assertFailure(.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
 			} else if index == 5 {
 				var machine = try activeResponseMachine()
-				#expect(throws: WebRTCTransportFailure.providerError) { _ = try machine.consume(Data(json.utf8)) }
+					assertFailure(.providerError) { _ = try machine.consume(Data(json.utf8)) }
 			} else if index == 2 {
 				var machine = try activeMachine()
-				#expect(throws: WebRTCTransportFailure.responseTooLarge) { _ = try machine.consume(Data(json.utf8)) }
+					assertFailure(.responseTooLarge) { _ = try machine.consume(Data(json.utf8)) }
 			} else {
 				var machine = try activeMachine()
-				#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+					assertFailure(.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
 			}
 		}
 	}
@@ -179,7 +194,8 @@ struct WebRTCOpenAIStateMachineTests {
 			return backing
 		}
 		#expect(throws: WebRTCTransportFailure.invalidRequest) { _ = try factory.makePeer() }
-		#expect(backing.configurationPayloads.isEmpty)
+		let configurationPayloadCount = backing.configurationPayloads.count
+		#expect(configurationPayloadCount == 0)
 		#expect(backing.audioStates.isEmpty)
 	}
 
@@ -190,55 +206,57 @@ struct WebRTCOpenAIStateMachineTests {
 		_ = try await peer.makeOffer()
 		try await peer.apply(remoteAnswer: "answer")
 		backing.emit(.ready)
-		#expect(throws: WebRTCTransportFailure.invalidRequest) {
+		assertFailure(.invalidRequest) {
 			try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
 		}
 		await peer.closeAndJoin()
-		#expect(backing.configurationPayloads.isEmpty)
+		let configurationPayloadCount = backing.configurationPayloads.count
+		#expect(configurationPayloadCount == 0)
 	}
 
 	@Test("handshake preserves structural semantic and unsupported failure partitions")
 	func handshakeFailurePartitions() throws {
 		var premature = try OpenAIProductionStateMachine(language: "en")
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		assertFailure(.malformedEvent) {
 			_ = try premature.consume(Data(#"{"type":"response.created","response":{"id":"r"}}"#.utf8))
 		}
 
 		var unknown = try OpenAIProductionStateMachine(language: "en")
-		#expect(throws: WebRTCTransportFailure.unsupportedEvent) {
+		assertFailure(.unsupportedEvent) {
 			_ = try unknown.consume(Data(#"{"type":"function.call"}"#.utf8))
 		}
 
 		var duplicate = try OpenAIProductionStateMachine(language: "en")
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		assertFailure(.malformedEvent) {
 			_ = try duplicate.consume(Data(#"{"type":"session.created","type":"session.created"}"#.utf8))
 		}
 
 		var conflictingPath = try OpenAIProductionStateMachine(language: "en")
 		_ = try conflictingPath.consume(Data(#"{"type":"session.created","metadata.value":"ignored"}"#.utf8))
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		assertFailure(.malformedEvent) {
 			let acknowledgement = String(Self.acknowledgement(language: "en").dropLast())
 			_ = try conflictingPath.consume(Data((acknowledgement + #", "session.type":"realtime"}"#).utf8))
 		}
 
 		var nested = try OpenAIProductionStateMachine(language: "en")
 		let deeplyNested = #"{"type":"session.created","default":"# + String(repeating: "[", count: 1_024) + "null" + String(repeating: "]", count: 1_024) + "}"
-		#expect(try nested.consume(Data(deeplyNested.utf8)) == .sessionCreated)
+		let nestedEvent = try nested.consume(Data(deeplyNested.utf8))
+		assertEventKind(.sessionCreated, nestedEvent)
 
 		var provider = try OpenAIProductionStateMachine(language: "en")
-		#expect(throws: WebRTCTransportFailure.providerError) {
+		assertFailure(.providerError) {
 			_ = try provider.consume(Data(#"{"type":"error","error":{"type":"synthetic","code":null,"param":"bounded","event_id":null}}"#.utf8))
 		}
 
 		var mismatch = try OpenAIProductionStateMachine(language: "en")
 		_ = try mismatch.consume(Data(#"{"type":"session.created"}"#.utf8))
-		#expect(throws: WebRTCTransportFailure.providerError) {
+		assertFailure(.providerError) {
 			_ = try mismatch.consume(Data(Self.acknowledgement(language: "ko").utf8))
 		}
 
 		var longMismatch = try OpenAIProductionStateMachine(language: "en")
 		_ = try longMismatch.consume(Data(#"{"type":"session.created"}"#.utf8))
-		#expect(throws: WebRTCTransportFailure.providerError) {
+		assertFailure(.providerError) {
 			_ = try longMismatch.consume(Data(Self.acknowledgement(language: "not-the-selected-language").utf8))
 		}
 	}
@@ -246,8 +264,9 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("flattened conflicts are event specific and done stages are strict")
 	func eventSpecificPathsAndDoneStages() throws {
 		var unrelated = try OpenAIProductionStateMachine(language: "en")
-		#expect(try unrelated.consume(Data(#"{"type":"session.created","response.id":"provider-default"}"#.utf8)) == .sessionCreated)
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		let unrelatedEvent = try unrelated.consume(Data(#"{"type":"session.created","response.id":"provider-default"}"#.utf8))
+		assertEventKind(.sessionCreated, unrelatedEvent)
+		assertFailure(.malformedEvent) {
 			_ = try unrelated.consume(Data((String(Self.acknowledgement(language: "en").dropLast()) + #", "session.audio":"conflict"}"#).utf8))
 		}
 
@@ -257,7 +276,7 @@ struct WebRTCOpenAIStateMachineTests {
 			#"{"type":"conversation.item.done","item":{"id":"a","type":"message","role":"assistant","status":"completed","content":[]}}"#
 		] {
 			var machine = try activeMachine()
-			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+			assertFailure(.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
 		}
 		for json in [
 			#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","content":[{"type":"audio"}]}}"#,
@@ -265,10 +284,10 @@ struct WebRTCOpenAIStateMachineTests {
 			#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"completed","content":[]}}"#
 		] {
 			var machine = try activeResponseMachine()
-			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+			assertFailure(.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
 		}
 		var rate = try activeMachine()
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		assertFailure(.malformedEvent) {
 			_ = try rate.consume(Data(#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":10,"remaining":9,"reset_seconds":1}],"rate_limits.remaining":9}"#.utf8))
 		}
 	}
@@ -290,32 +309,46 @@ struct WebRTCOpenAIStateMachineTests {
 			#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"u","content_index":0,"delta":"partial"}"#,
 			#"{"type":"rate_limits.updated","rate_limits":[{"name":"requests","limit":10,"remaining":9,"reset_seconds":0.25}]}"#
 		] {
-			#expect(try machine.consume(Data(json.utf8)) == nil)
+			let event = try machine.consume(Data(json.utf8))
+			assertNoEvent(event)
 		}
-		#expect(try machine.consume(Data(#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"u","content_index":0,"transcript":"hello"}"#.utf8)) == .userTranscript("hello"))
+		let transcriptEvent = try machine.consume(Data(#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"u","content_index":0,"transcript":"hello"}"#.utf8))
+		assertEventKind(.userTranscript, transcriptEvent)
 	}
 
 	@Test("response identity correlation cancellation drain and reuse stay bounded")
 	func responseCorrelationAndCancellation() throws {
 		var machine = try activeMachine()
 		try machine.prepareCreateResponse()
-		#expect(try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8)) == .responseStarted)
-		#expect(try machine.consume(Data(#"{"type":"response.output_item.added","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"in_progress","content":[]}}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.content_part.added","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"part":{"type":"audio"}}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.output_audio.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"YQ=="}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.audio.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"YWJj"}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.output_audio.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.output_audio_transcript.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"partial"}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.content_part.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"part":{"type":"output_audio"}}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"completed","content":[{"type":"audio"}]}}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"answer"}"#.utf8)) == .assistantTranscript("answer"))
+		let startedEvent = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8))
+		assertEventKind(.responseStarted, startedEvent)
+		let addedEvent = try machine.consume(Data(#"{"type":"response.output_item.added","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"in_progress","content":[]}}"#.utf8))
+		assertNoEvent(addedEvent)
+		let contentEvent = try machine.consume(Data(#"{"type":"response.content_part.added","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"part":{"type":"audio"}}"#.utf8))
+		assertNoEvent(contentEvent)
+		let deltaEvent = try machine.consume(Data(#"{"type":"response.output_audio.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"YQ=="}"#.utf8))
+		assertNoEvent(deltaEvent)
+		let alternateDeltaEvent = try machine.consume(Data(#"{"type":"response.audio.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"YWJj"}"#.utf8))
+		assertNoEvent(alternateDeltaEvent)
+		let audioDoneEvent = try machine.consume(Data(#"{"type":"response.output_audio.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0}"#.utf8))
+		assertNoEvent(audioDoneEvent)
+		let transcriptDeltaEvent = try machine.consume(Data(#"{"type":"response.output_audio_transcript.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"partial"}"#.utf8))
+		assertNoEvent(transcriptDeltaEvent)
+		let partDoneEvent = try machine.consume(Data(#"{"type":"response.content_part.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"part":{"type":"output_audio"}}"#.utf8))
+		assertNoEvent(partDoneEvent)
+		let itemDoneEvent = try machine.consume(Data(#"{"type":"response.output_item.done","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"completed","content":[{"type":"audio"}]}}"#.utf8))
+		assertNoEvent(itemDoneEvent)
+		let transcriptDoneEvent = try machine.consume(Data(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"answer"}"#.utf8))
+		assertEventKind(.assistantTranscript, transcriptDoneEvent)
 		try machine.prepareCancelResponse()
-		#expect(try machine.consume(Data(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"suppressed"}"#.utf8)) == nil)
-		#expect(try machine.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"cancelled"}}"#.utf8)) == .cancellationTerminalObserved)
+		let suppressedEvent = try machine.consume(Data(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"suppressed"}"#.utf8))
+		assertNoEvent(suppressedEvent)
+		let cancellationEvent = try machine.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"cancelled"}}"#.utf8))
+		assertEventKind(.cancellationTerminalObserved, cancellationEvent)
 		#expect(throws: WebRTCTransportFailure.invalidRequest) { try machine.prepareCreateResponse() }
 		try machine.settleCancelledResponse()
 		try machine.prepareCreateResponse()
-		#expect(throws: WebRTCTransportFailure.providerError) {
+		assertFailure(.providerError) {
 			_ = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8))
 		}
 	}
@@ -335,15 +368,18 @@ struct WebRTCOpenAIStateMachineTests {
 		backing.emitRaw(Self.acknowledgement(language: "en"))
 		_ = try await events.next()
 		backing.emitRaw(#"{"type":"response.created","response":{"id":"r1"}}"#)
-		#expect(try await events.next() == .responseStarted)
+		let responseStarted = try await events.next()
+		assertEventKind(.responseStarted, responseStarted)
 		try peer.cancelResponse()
 		try peer.clearOutputAudio()
 		backing.emitRaw(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"not-delivered"}"#)
 		backing.emitRaw(#"{"type":"response.done","response":{"id":"r1","status":"completed"}}"#)
-		#expect(try await events.next() == .responseCancellationTerminalObserved)
+		let cancellationTerminal = try await events.next()
+		assertEventKind(.cancellationTerminalObserved, cancellationTerminal)
 		try peer.settleCancelledResponse()
 		try peer.createResponse()
-		#expect(backing.commandTypes == ["response.cancel", "output_audio_buffer.clear", "response.create"])
+		let commandSequenceIsCorrect = backing.commandTypes == ["response.cancel", "output_audio_buffer.clear", "response.create"]
+		#expect(commandSequenceIsCorrect, "Cancellation settlement must preserve the restricted command order")
 		await peer.closeAndJoin()
 	}
 
@@ -363,7 +399,7 @@ struct WebRTCOpenAIStateMachineTests {
 				backing.emitRaw(#"{"type":"response.created","response":{"id":"r1"}}"#)
 				_ = try await events.next()
 			}
-			#expect(throws: WebRTCTransportFailure.requestFailed) { try command.invoke(peer) }
+			assertFailure(.requestFailed) { try command.invoke(peer) }
 			await peer.closeAndJoin()
 			do { _ = try await events.next(); Issue.record("failed command must terminate") }
 			catch { #expect(error as? WebRTCTransportFailure == .requestFailed) }
@@ -374,30 +410,32 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("server VAD may open a response without an explicit create command")
 	func serverVADOpensResponseEpoch() throws {
 		var machine = try activeMachine()
-		#expect(try machine.consume(Data(#"{"type":"response.created","response":{"id":"server-vad"}}"#.utf8)) == .responseStarted)
-		#expect(try machine.consume(Data(#"{"type":"response.done","response":{"id":"server-vad","status":"completed"}}"#.utf8)) == .responseFinished)
+		let startedEvent = try machine.consume(Data(#"{"type":"response.created","response":{"id":"server-vad"}}"#.utf8))
+		assertEventKind(.responseStarted, startedEvent)
+		let finishedEvent = try machine.consume(Data(#"{"type":"response.done","response":{"id":"server-vad","status":"completed"}}"#.utf8))
+		assertEventKind(.responseFinished, finishedEvent)
 	}
 
 	@Test("malformed oversized and correlation failures remain distinct")
 	func inboundFailurePartitions() throws {
 		var invalidBase64 = try activeResponseMachine()
-		#expect(throws: WebRTCTransportFailure.malformedEvent) {
+		assertFailure(.malformedEvent) {
 			_ = try invalidBase64.consume(Data(#"{"type":"response.output_audio.delta","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"delta":"YQ-_"}"#.utf8))
 		}
 
 		var mismatch = try activeResponseMachine()
-		#expect(throws: WebRTCTransportFailure.providerError) {
+		assertFailure(.providerError) {
 			_ = try mismatch.consume(Data(#"{"type":"response.output_audio.done","response_id":"other","item_id":"a","output_index":0,"content_index":0}"#.utf8))
 		}
 
 		var oversized = try activeResponseMachine()
 		let identifier = String(repeating: "x", count: 129)
-		#expect(throws: WebRTCTransportFailure.responseTooLarge) {
+		assertFailure(.responseTooLarge) {
 			_ = try oversized.consume(Data(#"{"type":"response.output_audio.done","response_id":"r1","item_id":"\#(identifier)","output_index":0,"content_index":0}"#.utf8))
 		}
 
 		var raw = try OpenAIProductionStateMachine(language: "en")
-		#expect(throws: WebRTCTransportFailure.responseTooLarge) {
+		assertFailure(.responseTooLarge) {
 			_ = try raw.consume(Data(repeating: 0x20, count: 256 * 1024 + 1))
 		}
 	}
@@ -408,13 +446,14 @@ struct WebRTCOpenAIStateMachineTests {
 		for _ in 0..<(4_096 - 2) {
 			_ = try count.consume(Data(#"{"type":"input_audio_buffer.committed"}"#.utf8))
 		}
-		#expect(throws: WebRTCTransportFailure.responseTooLarge) {
+		assertFailure(.responseTooLarge) {
 			_ = try count.consume(Data(#"{"type":"input_audio_buffer.committed"}"#.utf8))
 		}
 
 		var stale = try activeMachine()
 		stale.invalidate()
-		#expect(try stale.consume(Data(repeating: 0, count: 256 * 1024 + 1)) == nil)
+		let staleEvent = try stale.consume(Data(repeating: 0, count: 256 * 1024 + 1))
+		assertNoEvent(staleEvent)
 	}
 
 	@Test("aggregate raw custody fails before crossing sixteen MiB")
@@ -428,7 +467,7 @@ struct WebRTCOpenAIStateMachineTests {
 		maximumEvent.append(suffix)
 		#expect(maximumEvent.count == 256 * 1024)
 		for _ in 0..<63 { _ = try machine.consume(maximumEvent) }
-		#expect(throws: WebRTCTransportFailure.responseTooLarge) {
+		assertFailure(.responseTooLarge) {
 			_ = try machine.consume(maximumEvent)
 		}
 	}
@@ -436,11 +475,11 @@ struct WebRTCOpenAIStateMachineTests {
 	@Test("unsupported item shapes never become tool or text capability")
 	func rejectsExpandedItemCapability() throws {
 		var machine = try activeMachine()
-		#expect(throws: WebRTCTransportFailure.unsupportedEvent) {
+		assertFailure(.unsupportedEvent) {
 			_ = try machine.consume(Data(#"{"type":"conversation.item.added","item":{"id":"f","type":"function_call","role":"assistant","content":[]}}"#.utf8))
 		}
 		var text = try activeMachine()
-		#expect(throws: WebRTCTransportFailure.unsupportedEvent) {
+		assertFailure(.unsupportedEvent) {
 			_ = try text.consume(Data(#"{"type":"conversation.item.added","item":{"id":"t","type":"message","role":"user","content":[{"type":"input_text"}]}}"#.utf8))
 		}
 	}
@@ -453,7 +492,7 @@ struct WebRTCOpenAIStateMachineTests {
 			#"{"type":"conversation.item.done","item":{"id":"u","type":"message","role":"user","status":"completed","content":[]}}"#
 		] {
 			var machine = try activeMachine()
-			#expect(throws: WebRTCTransportFailure.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
+			assertFailure(.malformedEvent) { _ = try machine.consume(Data(json.utf8)) }
 		}
 	}
 
@@ -464,8 +503,86 @@ struct WebRTCOpenAIStateMachineTests {
 		let suffix = "}"
 		let depth = (256 * 1024 - prefix.utf8.count - suffix.utf8.count - 4) / 2
 		let json = prefix + String(repeating: "[", count: depth) + "null" + String(repeating: "]", count: depth) + suffix
-		#expect(json.utf8.count <= 256 * 1024)
-		#expect(try machine.consume(Data(json.utf8)) == .sessionCreated)
+		let inputFitsRawCap = json.utf8.count <= 256 * 1024
+		#expect(inputFitsRawCap, "The nesting fixture must stay within the raw input cap")
+		let event = try machine.consume(Data(json.utf8))
+		assertEventKind(.sessionCreated, event)
+	}
+
+	private enum ContentFreeEventKind: Equatable {
+		case ready
+		case sessionCreated
+		case sessionAcknowledged
+		case sessionConfigured
+		case userTranscript
+		case assistantTranscript
+		case responseStarted
+		case responseFinished
+		case cancellationTerminalObserved
+	}
+
+	private func assertEventKind(
+		_ expected: ContentFreeEventKind,
+		_ event: OpenAIProductionEvent?
+	) {
+		let matches: Bool
+		switch (expected, event) {
+		case (.sessionCreated, .sessionCreated),
+			(.sessionAcknowledged, .sessionAcknowledged),
+			(.responseStarted, .responseStarted),
+			(.responseFinished, .responseFinished),
+			(.cancellationTerminalObserved, .cancellationTerminalObserved):
+			matches = true
+		case let (.userTranscript, .userTranscript(transcript)):
+			matches = transcript == "hello"
+		case let (.assistantTranscript, .assistantTranscript(transcript)):
+			matches = transcript == "answer"
+		default:
+			matches = false
+		}
+		#expect(matches, "The state machine must publish the expected content-free event kind")
+	}
+
+	private func assertEventKind(
+		_ expected: ContentFreeEventKind,
+		_ event: WebRTCConnectorEvent?
+	) {
+		let matches: Bool
+		switch (expected, event) {
+		case (.ready, .ready),
+			(.sessionCreated, .openAISessionCreated),
+			(.responseStarted, .responseStarted),
+			(.responseFinished, .responseFinished),
+			(.cancellationTerminalObserved, .responseCancellationTerminalObserved):
+			matches = true
+		case let (.sessionConfigured, .openAISessionConfigured(language)):
+			matches = language == "en"
+		case let (.userTranscript, .userTranscript(transcript)):
+			matches = transcript == "hello"
+		case let (.assistantTranscript, .assistantTranscript(transcript)):
+			matches = transcript == "answer"
+		default:
+			matches = false
+		}
+		#expect(matches, "The peer must publish the expected content-free event kind")
+	}
+
+	private func assertNoEvent(_ event: OpenAIProductionEvent?) {
+		let isAbsent = event == nil
+		#expect(isAbsent, "The input must not publish a semantic event")
+	}
+
+	private func assertFailure(
+		_ expected: WebRTCTransportFailure,
+		_ operation: () throws -> Void
+	) {
+		do {
+			try operation()
+			Issue.record("The operation must fail with the expected content-free category")
+		} catch {
+			let matches = error as? WebRTCTransportFailure == expected
+			#expect(matches, "The operation must fail with the expected content-free category")
+		}
 	}
 
 	private func activeMachine() throws -> OpenAIProductionStateMachine {

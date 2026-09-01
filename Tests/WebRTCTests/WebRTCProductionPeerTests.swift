@@ -66,8 +66,10 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let source = factory.audioSource(with: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
 		let track = factory.audioTrack(with: source, trackId: "synthetic-remote")
 		let overflowTrack = factory.audioTrack(with: source, trackId: "synthetic-overflow")
-		XCTAssertNotNil(remoteConnection.add(track, streamIds: ["openai-remote"]))
-		XCTAssertNotNil(remoteConnection.add(overflowTrack, streamIds: ["openai-overflow"]))
+		let firstTrackAdded = remoteConnection.add(track, streamIds: ["openai-remote"]) != nil
+		let overflowTrackAdded = remoteConnection.add(overflowTrack, streamIds: ["openai-overflow"]) != nil
+		XCTAssertTrue(firstTrackAdded, "The first remote track must attach")
+		XCTAssertTrue(overflowTrackAdded, "The overflow remote track must attach")
 		XCTAssertEqual(frames.admittedValue, 0, "Pre-peer-construction PCM is discarded")
 
 		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { connector }).makePeer()
@@ -95,7 +97,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let gatheredAnswer = try XCTUnwrap(remoteConnection.localDescription)
 		try await peer.apply(remoteAnswer: gatheredAnswer.sdp)
 		let ready = try await events.next()
-		XCTAssertEqual(ready, .ready)
+		assertEventKind(.ready, ready)
 
 		try await waitUntil(timeout: .seconds(2)) { frames.attemptedValue > 0 }
 		let precreationAttempts = frames.attemptedValue
@@ -106,13 +108,14 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertEqual(frames.admittedValue, 0, "Preconfiguration ingress remains quarantined")
 		try peer.configure(.openAI(language: "en"))
 		let created = try await events.next()
-		XCTAssertEqual(created, .openAISessionCreated)
+		assertEventKind(.openAISessionCreated, created)
 		try await waitUntil(timeout: .seconds(2)) { frames.attemptedValue > precreationAttempts }
 		let preackAttempts = frames.attemptedValue
 		XCTAssertEqual(frames.admittedValue, 0, "Observed creation-to-ack RTP/frame attempts are discarded")
 		connector.receiveInbound(Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8))
 		let configured = try await events.next()
-		XCTAssertEqual(configured, .openAISessionConfigured(language: "en"))
+		let configurationAcknowledged = isExpectedOpenAIConfiguration(configured)
+		XCTAssertTrue(configurationAcknowledged, "The exact acknowledgement must open the media gate")
 		peer.setLocalAudioState(.enabled)
 		XCTAssertEqual(frames.admittedValue, 0, "Discarded callbacks are never replayed")
 		try await waitUntil(timeout: .seconds(2)) {
@@ -131,7 +134,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let framesAtTerminal = frames.admittedValue
 		peer.setLocalAudioState(.enabled)
 		let lateTrack = factory.audioTrack(with: source, trackId: "synthetic-late-remote")
-		XCTAssertNotNil(remoteConnection.add(lateTrack, streamIds: ["openai-late-remote"]))
+		let lateTrackAdded = remoteConnection.add(lateTrack, streamIds: ["openai-late-remote"]) != nil
+		XCTAssertTrue(lateTrackAdded, "The late remote track must reach the closed gate")
 		try await Task.sleep(for: .milliseconds(100))
 		XCTAssertEqual(frames.admittedValue, framesAtTerminal, "Post-invalidation tracks and frames are neither retained nor replayed")
 		await peer.closeAndJoin()
@@ -140,9 +144,11 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 	func testLocalAIConfigurationValidatesVoiceAndLanguageBeforePeerConstruction() throws {
 		let configuration = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
-		XCTAssertEqual(configuration, try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja"))
-		XCTAssertThrowsError(try WebRTCSessionConfiguration.localAI(voice: "", language: "ja"))
-		XCTAssertThrowsError(try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "JA"))
+		let expectedConfiguration = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
+		let configurationMatches = configuration == expectedConfiguration
+		XCTAssertTrue(configurationMatches, "The valid LocalAI configuration must be preserved")
+		assertFailure(.invalidRequest) { _ = try WebRTCSessionConfiguration.localAI(voice: "", language: "ja") }
+		assertFailure(.invalidRequest) { _ = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "JA") }
 	}
 
 	@MainActor func testFactoryConstructionFailureIsContentFree() throws {
@@ -201,15 +207,17 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		connector.receiveDataChannelState(isOpen: true, isTerminal: false)
 		await Task.yield()
 		XCTAssertEqual(recorder.values.count, 1)
-		XCTAssertEqual(try recorder.values[0].get(), .ready)
+		assertBackingEventKind(.ready, try recorder.values[0].get())
 		connector.installProductionConfiguration()
 		await fulfillment(of: [delivered], timeout: 1)
 		XCTAssertEqual(recorder.values.count, 2)
-		XCTAssertEqual(try recorder.values[0].get(), .ready)
-		XCTAssertEqual(
+		assertBackingEventKind(.ready, try recorder.values[0].get())
+		let retainedRawInput = isExpectedRawInbound(
 			try recorder.values[1].get(),
-			.rawInbound(raw, configurationDispatchedAtAcceptance: false)
+			expectedPayload: raw,
+			expectedDispatchState: false
 		)
+		XCTAssertTrue(retainedRawInput, "The authoritative mailbox must preserve accepted ingress order")
 		await connector.closeAndSettle()
 	}
 
@@ -223,7 +231,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			let setup = try await makeRealLocalAIPeer(didDrainInbound: { drained.fulfill() })
 			var events = setup.eventStream.makeAsyncIterator()
 			let ready = try await events.next()
-			XCTAssertEqual(ready, .ready)
+			assertEventKind(.ready, ready)
 			setup.connector.receiveInbound(payload)
 			await fulfillment(of: [drained], timeout: 1)
 			try setup.peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
@@ -234,7 +242,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 				XCTAssertEqual(error as? WebRTCTransportFailure, .malformedEvent)
 			}
 			let eventAfterFailure = try await events.next()
-			XCTAssertNil(eventAfterFailure, "A rejected early acknowledgement cannot publish configuration state")
+			assertNoEvent(eventAfterFailure)
 			await setup.peer.closeAndJoin()
 			XCTAssertEqual(setup.closes.dataCount, 1)
 			XCTAssertEqual(setup.closes.peerCount, 1)
@@ -245,13 +253,14 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			let setup = try await makeRealLocalAIPeer()
 			var events = setup.eventStream.makeAsyncIterator()
 			let ready = try await events.next()
-			XCTAssertEqual(ready, .ready)
+			assertEventKind(.ready, ready)
 			try setup.peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
 			setup.connector.receiveInbound(exact)
 			let configured = try await events.next()
 			let connected = try await events.next()
-			XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
-			XCTAssertEqual(connected, .connected)
+			let configurationAcknowledged = isExpectedLocalAIConfiguration(configured)
+			XCTAssertTrue(configurationAcknowledged, "The exact LocalAI acknowledgement must be published")
+			assertEventKind(.connected, connected)
 			await setup.peer.closeAndJoin()
 			XCTAssertEqual(setup.closes.dataCount, 1)
 			XCTAssertEqual(setup.closes.peerCount, 1)
@@ -262,7 +271,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			let setup = try await makeRealLocalAIPeer()
 			var events = setup.eventStream.makeAsyncIterator()
 			let ready = try await events.next()
-			XCTAssertEqual(ready, .ready)
+			assertEventKind(.ready, ready)
 			try setup.peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
 			setup.connector.receiveInbound(mismatch)
 			do {
@@ -272,7 +281,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 				XCTAssertEqual(error as? WebRTCTransportFailure, .providerError)
 			}
 			let eventAfterFailure = try await events.next()
-			XCTAssertNil(eventAfterFailure, "A rejected acknowledgement cannot publish configuration state")
+			assertNoEvent(eventAfterFailure)
 			await setup.peer.closeAndJoin()
 			XCTAssertEqual(setup.closes.dataCount, 1)
 			XCTAssertEqual(setup.closes.peerCount, 1)
@@ -346,7 +355,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await fulfillment(of: [terminal], timeout: 1)
 		await connector.closeAndSettle()
 		XCTAssertEqual(retiredIngress, WebRTCConnector.inboundMailboxCapacity + 1, "Neither overflow nor later ingress is admitted")
-		XCTAssertEqual(try recorder.values.last?.get(), .terminal(.ingressOverloaded))
+		let overloadSelected = isExpectedTerminal(try recorder.values.last?.get(), .ingressOverloaded)
+		XCTAssertTrue(overloadSelected, "The reserved overload must own terminal selection")
 	}
 
 	@MainActor func testProductionMailboxUsesConstructionBoundProviderOnOpenChannel() async throws {
@@ -369,14 +379,16 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await fulfillment(of: [drained], timeout: 1)
 		await Task.yield()
 		XCTAssertEqual(recorder.values.count, 1)
-		XCTAssertEqual(try recorder.values[0].get(), .ready)
+		assertBackingEventKind(.ready, try recorder.values[0].get())
 		connector.installProductionConfiguration()
 		await fulfillment(of: [delivered], timeout: 1)
-		XCTAssertEqual(try recorder.values[0].get(), .ready)
-		XCTAssertEqual(
+		assertBackingEventKind(.ready, try recorder.values[0].get())
+		let releasedRawInput = isExpectedRawInbound(
 			try recorder.values[1].get(),
-			.rawInbound(raw, configurationDispatchedAtAcceptance: false)
+			expectedPayload: raw,
+			expectedDispatchState: false
 		)
+		XCTAssertTrue(releasedRawInput, "Configuration must release the quarantined input in order")
 		await connector.closeAndSettle()
 	}
 
@@ -501,7 +513,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 		await peer.closeAndJoin()
 		let event = try await reader.value
-		XCTAssertEqual(event, .closed)
+		assertEventKind(.closed, event)
 	}
 
 	@MainActor func testPublicPeerOrdersReadyConfigurationAcknowledgementAndCommands() async throws {
@@ -510,36 +522,35 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		var iterator = peer.events.makeAsyncIterator()
 
 		let offer = try await peer.makeOffer()
-		XCTAssertEqual(offer, "offer")
+		let offerMatches = offer == "offer"
+		XCTAssertTrue(offerMatches, "The backing offer must cross the public peer boundary")
 		try await peer.apply(remoteAnswer: "answer")
 		await backing.emit(.ready)
 		let ready = try await iterator.next()
-		XCTAssertEqual(ready, .ready)
+		assertEventKind(.ready, ready)
 
 		try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
-		XCTAssertEqual(backing.sessionUpdates, ["Ono_Anna|ja"])
+		let sessionUpdateMatches = backing.sessionUpdates == ["Ono_Anna|ja"]
+		XCTAssertTrue(sessionUpdateMatches, "The typed configuration must produce one exact backing update")
 		await backing.emit(.inbound(.sessionUpdated(voice: "Ono_Anna", language: "ja")))
 		let configured = try await iterator.next()
 		let connected = try await iterator.next()
-		XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
-		XCTAssertEqual(connected, .connected)
+		let configurationAcknowledged = isExpectedLocalAIConfiguration(configured)
+		XCTAssertTrue(configurationAcknowledged, "The public peer must publish the exact configuration acknowledgement")
+		assertEventKind(.connected, connected)
 
 		try peer.sendUserText("  hello\n")
 		try peer.createResponse()
 		try peer.cancelResponse()
 		try peer.clearOutputAudio()
-		XCTAssertEqual(backing.commandTypes, ["conversation.item.create", "response.create", "response.cancel", "output_audio_buffer.clear"])
-		let userText = try XCTUnwrap(backing.commandObjects.first)
-		XCTAssertEqual(userText["type"] as? String, "conversation.item.create")
-		let item = try XCTUnwrap(userText["item"] as? [String: Any])
-		XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(item["id"] as? String)))
-		XCTAssertEqual(item["type"] as? String, "message")
-		XCTAssertEqual(item["role"] as? String, "user")
-		XCTAssertEqual(item["status"] as? String, "completed")
-		let content = try XCTUnwrap(item["content"] as? [[String: Any]])
-		XCTAssertEqual(content.count, 1)
-		XCTAssertEqual(content[0]["type"] as? String, "input_text")
-		XCTAssertEqual(content[0]["text"] as? String, "  hello\n")
+		let commandSequenceMatches = backing.commandTypes == ["conversation.item.create", "response.create", "response.cancel", "output_audio_buffer.clear"]
+		XCTAssertTrue(commandSequenceMatches, "The public peer must preserve the restricted command order")
+		guard let userText = backing.commandObjects.first else {
+			XCTFail("The user-text command must be recorded")
+			return
+		}
+		let commandShapeMatches = isExpectedUserTextCommand(userText)
+		XCTAssertTrue(commandShapeMatches, "The user-text command must use the bounded production schema")
 		peer.setLocalAudioState(.enabled)
 		XCTAssertEqual(backing.audioStates.last, .enabled)
 
@@ -558,10 +569,9 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		try await peer.apply(remoteAnswer: "answer")
 		await backing.emit(.ready)
 		_ = try await events.next()
-		XCTAssertThrowsError(try peer.configure(.openAI(language: "en"))) { error in
-			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
-		}
-		XCTAssertTrue(backing.sessionUpdates.isEmpty)
+		assertFailure(.invalidRequest) { try peer.configure(.openAI(language: "en")) }
+		let sessionUpdateCount = backing.sessionUpdates.count
+		XCTAssertEqual(sessionUpdateCount, 0)
 		await peer.closeAndJoin()
 	}
 
@@ -693,7 +703,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
 		}
 		let terminal = try await iterator.next()
-		XCTAssertEqual(terminal, .closed)
+		assertEventKind(.closed, terminal)
 	}
 
 	@MainActor func testReadinessRacingSuspendedAnswerIsAdmittedOnlyAfterAnswer() async throws {
@@ -707,7 +717,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		backing.resumeAnswer()
 		try await answer.value
 		let ready = try await iterator.next()
-		XCTAssertEqual(ready, .ready)
+		assertEventKind(.ready, ready)
 		await peer.closeAndJoin()
 	}
 
@@ -835,7 +845,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		case let .failure(error): XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
 		}
 		let terminal = try await iterator.next()
-		XCTAssertEqual(terminal, .closed)
+		assertEventKind(.closed, terminal)
 	}
 
 	@MainActor func testSecondOfferFailsClosedAndJoinsTheBacking() async throws {
@@ -884,7 +894,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 		backing.finishEvents()
 		let event = try await reader.value
-		XCTAssertEqual(event, .closed)
+		assertEventKind(.closed, event)
 		await peer.closeAndJoin()
 		XCTAssertEqual(backing.closeCount, 1)
 	}
@@ -981,7 +991,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		backing.resumeClose()
 		await close.value
 		let terminal = try await reader.value
-		XCTAssertEqual(terminal, .closed)
+		assertEventKind(.closed, terminal)
 	}
 
 	@MainActor func testIteratorCancellationAfterProviderFailurePreservesFailureTerminal() async throws {
@@ -1026,8 +1036,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await peer.closeAndJoin()
 		let terminal = try await iterator.next()
 		let end = try await iterator.next()
-		XCTAssertEqual(terminal, .closed)
-		XCTAssertNil(end)
+		assertEventKind(.closed, terminal)
+		assertNoEvent(end)
 	}
 
 	@MainActor func testSecondEventIteratorIsRejectedContentFree() async throws {
@@ -1036,7 +1046,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		var second = peer.events.makeAsyncIterator()
 		await peer.closeAndJoin()
 		let terminal = try await first.next()
-		XCTAssertEqual(terminal, .closed)
+		assertEventKind(.closed, terminal)
 		do {
 			_ = try await second.next()
 			XCTFail("The production event sequence permits exactly one consumer")
@@ -1111,9 +1121,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		} catch {
 			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidSDP)
 		}
-		XCTAssertThrowsError(try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))) { error in
-			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
-		}
+		assertFailure(.invalidRequest) { try peer.configure(.localAI(voice: "Ono_Anna", language: "ja")) }
 		XCTAssertThrowsError(try peer.createResponse()) { error in
 			XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
 		}
@@ -1121,7 +1129,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		backing.resumeClose()
 		await close.value
 		let terminal = try await iterator.next()
-		XCTAssertEqual(terminal, .closed)
+		assertEventKind(.closed, terminal)
 	}
 
 	@MainActor func testSuspendedBackingNormalTerminalRejectsCallerGuardsWithoutRewritingClosedTerminal() async throws {
@@ -1145,7 +1153,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 		backing.resumeClose()
 		let terminal = try await iterator.next()
-		XCTAssertEqual(terminal, .closed)
+		assertEventKind(.closed, terminal)
 	}
 
 	@MainActor func testMismatchedAcknowledgementIsProviderErrorAndDuplicateRemainsMalformed() async throws {
@@ -1178,8 +1186,9 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await duplicateBacking.emit(.inbound(.sessionUpdated(voice: "Ono_Anna", language: "ja")))
 		let configured = try await duplicateEvents.next()
 		let connected = try await duplicateEvents.next()
-		XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
-		XCTAssertEqual(connected, .connected)
+		let configurationAcknowledged = isExpectedLocalAIConfiguration(configured)
+		XCTAssertTrue(configurationAcknowledged, "The exact LocalAI acknowledgement must be published")
+		assertEventKind(.connected, connected)
 		await duplicateBacking.emit(.inbound(.sessionUpdated(voice: "Ono_Anna", language: "ja")))
 		do {
 			_ = try await duplicateEvents.next()
@@ -1197,12 +1206,13 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			let (peer, backing) = try await makePendingLocalAIPeer()
 			var events = peer.events.makeAsyncIterator()
 			let ready = try await events.next()
-			XCTAssertEqual(ready, .ready)
+			assertEventKind(.ready, ready)
 			await backing.emit(.rawInbound(acknowledgement, configurationDispatchedAtAcceptance: true))
 			let configured = try await events.next()
 			let connected = try await events.next()
-			XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
-			XCTAssertEqual(connected, .connected)
+			let configurationAcknowledged = isExpectedLocalAIConfiguration(configured)
+			XCTAssertTrue(configurationAcknowledged, "The exact LocalAI acknowledgement must be published")
+			assertEventKind(.connected, connected)
 
 			await backing.emit(.rawInbound(acknowledgement, configurationDispatchedAtAcceptance: true))
 			do {
@@ -1228,7 +1238,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			let (peer, backing) = try await makePendingLocalAIPeer()
 			var events = peer.events.makeAsyncIterator()
 			let ready = try await events.next()
-			XCTAssertEqual(ready, .ready)
+			assertEventKind(.ready, ready)
 			await backing.emit(.rawInbound(payload, configurationDispatchedAtAcceptance: true))
 			do {
 				_ = try await events.next()
@@ -1237,7 +1247,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 				XCTAssertEqual(error as? WebRTCTransportFailure, .providerError)
 			}
 			let eventAfterFailure = try await events.next()
-			XCTAssertNil(eventAfterFailure, "No configured or connected event may cross a rejected acknowledgement")
+			assertNoEvent(eventAfterFailure)
 			await peer.closeAndJoin()
 			XCTAssertEqual(backing.closeCount, 1)
 		}
@@ -1251,7 +1261,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			let (peer, backing) = try await makePendingLocalAIPeer()
 			var events = peer.events.makeAsyncIterator()
 			let ready = try await events.next()
-			XCTAssertEqual(ready, .ready)
+			assertEventKind(.ready, ready)
 			await backing.emit(.rawInbound(payload, configurationDispatchedAtAcceptance: true))
 			do {
 				_ = try await events.next()
@@ -1271,14 +1281,14 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		try await peer.apply(remoteAnswer: "answer")
 		await backing.emit(.ready)
 		let ready = try await events.next()
-		XCTAssertEqual(ready, .ready)
+		assertEventKind(.ready, ready)
 		try peer.configure(.openAI(language: "en"))
 		await backing.emit(.rawInbound(
 			Data(#"{"type":"session.created"}"#.utf8),
 			configurationDispatchedAtAcceptance: false
 		))
 		let created = try await events.next()
-		XCTAssertEqual(created, .openAISessionCreated)
+		assertEventKind(.openAISessionCreated, created)
 
 		await backing.emit(.rawInbound(
 			Data(#"{"type":"session.updated","session":{"type":"realtime"}}"#.utf8),
@@ -1357,9 +1367,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		for command in CommandCase.allCases {
 			let invalidBacking = FakeProductionBacking()
 			let invalidPeer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { invalidBacking }).makePeer()
-			XCTAssertThrowsError(try command.invoke(invalidPeer)) { error in
-				XCTAssertEqual(error as? WebRTCTransportFailure, .invalidRequest)
-			}
+			assertFailure(.invalidRequest) { try command.invoke(invalidPeer) }
 			await invalidPeer.closeAndJoin()
 			XCTAssertEqual(invalidBacking.closeCount, 1)
 
@@ -1374,11 +1382,113 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			await failedBacking.emit(.inbound(.sessionUpdated(voice: "Ono_Anna", language: "ja")))
 			_ = try await events.next()
 			_ = try await events.next()
-			XCTAssertThrowsError(try command.invoke(failedPeer)) { error in
-				XCTAssertEqual(error as? WebRTCTransportFailure, .requestFailed)
-			}
+			assertFailure(.requestFailed) { try command.invoke(failedPeer) }
 			await failedPeer.closeAndJoin()
 			XCTAssertEqual(failedBacking.closeCount, 1)
+		}
+	}
+
+	private func isExpectedOpenAIConfiguration(_ event: WebRTCConnectorEvent?) -> Bool {
+		guard case let .openAISessionConfigured(language) = event else { return false }
+		return language == "en"
+	}
+
+	private enum ContentFreePeerEventKind {
+		case ready
+		case openAISessionCreated
+		case connected
+		case closed
+	}
+
+	private func assertEventKind(
+		_ expected: ContentFreePeerEventKind,
+		_ event: WebRTCConnectorEvent?
+	) {
+		let matches: Bool
+		switch (expected, event) {
+		case (.ready, .ready),
+			(.openAISessionCreated, .openAISessionCreated),
+			(.connected, .connected),
+			(.closed, .closed):
+			matches = true
+		default:
+			matches = false
+		}
+		XCTAssertTrue(matches, "The peer must publish the expected content-free event kind")
+	}
+
+	private func assertNoEvent(_ event: WebRTCConnectorEvent?) {
+		let isAbsent = event == nil
+		XCTAssertTrue(isAbsent, "No semantic event may cross the closed gate")
+	}
+
+	private enum ContentFreeBackingEventKind {
+		case ready
+	}
+
+	private func assertBackingEventKind(
+		_ expected: ContentFreeBackingEventKind,
+		_ event: WebRTCConnectorPeerBackingEvent
+	) {
+		let matches: Bool
+		switch (expected, event) {
+		case (.ready, .ready): matches = true
+		default: matches = false
+		}
+		XCTAssertTrue(matches, "The backing must publish the expected content-free event kind")
+	}
+
+	private func isExpectedLocalAIConfiguration(_ event: WebRTCConnectorEvent?) -> Bool {
+		guard case let .localAISessionConfigured(voice, language) = event else { return false }
+		return voice == "Ono_Anna" && language == "ja"
+	}
+
+	private func isExpectedRawInbound(
+		_ event: WebRTCConnectorPeerBackingEvent,
+		expectedPayload: Data,
+		expectedDispatchState: Bool
+	) -> Bool {
+		guard case let .rawInbound(payload, configurationDispatchedAtAcceptance) = event else {
+			return false
+		}
+		return payload == expectedPayload
+			&& configurationDispatchedAtAcceptance == expectedDispatchState
+	}
+
+	private func isExpectedTerminal(
+		_ event: WebRTCConnectorPeerBackingEvent?,
+		_ expectedFailure: WebRTCTransportFailure
+	) -> Bool {
+		guard case let .terminal(failure) = event else { return false }
+		return failure == expectedFailure
+	}
+
+	private func isExpectedUserTextCommand(_ object: [String: Any]) -> Bool {
+		guard object["type"] as? String == "conversation.item.create",
+			let item = object["item"] as? [String: Any],
+			let identifier = item["id"] as? String,
+			UUID(uuidString: identifier) != nil,
+			item["type"] as? String == "message",
+			item["role"] as? String == "user",
+			item["status"] as? String == "completed",
+			let content = item["content"] as? [[String: Any]],
+			content.count == 1,
+			content[0]["type"] as? String == "input_text",
+			content[0]["text"] as? String == "  hello\n"
+		else { return false }
+		return true
+	}
+
+	private func assertFailure(
+		_ expected: WebRTCTransportFailure,
+		_ operation: () throws -> Void
+	) {
+		do {
+			try operation()
+			XCTFail("The operation must fail with the expected content-free category")
+		} catch {
+			let matches = error as? WebRTCTransportFailure == expected
+			XCTAssertTrue(matches, "The operation must fail with the expected content-free category")
 		}
 	}
 
@@ -1638,7 +1748,8 @@ private actor ProductionDrainGate {
 		}
 	}
 	func apply(answer: String) async throws {
-		XCTAssertEqual(answer, "answer")
+		let answerMatches = answer == "answer"
+		XCTAssertTrue(answerMatches, "The backing must receive the expected remote answer")
 		answerStartWaiter?.resume()
 		answerStartWaiter = nil
 		guard suspendAnswer else { return }
