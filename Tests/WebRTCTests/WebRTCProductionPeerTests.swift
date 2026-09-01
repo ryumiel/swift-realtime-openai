@@ -206,8 +206,78 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await fulfillment(of: [delivered], timeout: 1)
 		XCTAssertEqual(recorder.values.count, 2)
 		XCTAssertEqual(try recorder.values[0].get(), .ready)
-		XCTAssertEqual(try recorder.values[1].get(), .rawInbound(raw))
+		XCTAssertEqual(
+			try recorder.values[1].get(),
+			.rawInbound(raw, configurationDispatchedAtAcceptance: false)
+		)
 		await connector.closeAndSettle()
+	}
+
+	@MainActor func testRealLocalAIConnectorPreservesConfigurationDispatchCausality() async throws {
+		let exact = Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8)
+		let mismatch = Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Other"}}}}"#.utf8)
+		let malformed = Data(#"{"type":"session.updated"}"#.utf8)
+
+		for payload in [exact, mismatch, malformed] {
+			let drained = expectation(description: "pre-dispatch acknowledgement entered the authoritative mailbox")
+			let setup = try await makeRealLocalAIPeer(didDrainInbound: { drained.fulfill() })
+			var events = setup.eventStream.makeAsyncIterator()
+			let ready = try await events.next()
+			XCTAssertEqual(ready, .ready)
+			setup.connector.receiveInbound(payload)
+			await fulfillment(of: [drained], timeout: 1)
+			try setup.peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
+			do {
+				_ = try await events.next()
+				XCTFail("A pre-dispatch session.updated must be rejected as out of phase")
+			} catch {
+				XCTAssertEqual(error as? WebRTCTransportFailure, .malformedEvent)
+			}
+			let eventAfterFailure = try await events.next()
+			XCTAssertNil(eventAfterFailure, "A rejected early acknowledgement cannot publish configuration state")
+			await setup.peer.closeAndJoin()
+			XCTAssertEqual(setup.closes.dataCount, 1)
+			XCTAssertEqual(setup.closes.peerCount, 1)
+			setup.remoteConnection.close()
+		}
+
+		do {
+			let setup = try await makeRealLocalAIPeer()
+			var events = setup.eventStream.makeAsyncIterator()
+			let ready = try await events.next()
+			XCTAssertEqual(ready, .ready)
+			try setup.peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
+			setup.connector.receiveInbound(exact)
+			let configured = try await events.next()
+			let connected = try await events.next()
+			XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
+			XCTAssertEqual(connected, .connected)
+			await setup.peer.closeAndJoin()
+			XCTAssertEqual(setup.closes.dataCount, 1)
+			XCTAssertEqual(setup.closes.peerCount, 1)
+			setup.remoteConnection.close()
+		}
+
+		do {
+			let setup = try await makeRealLocalAIPeer()
+			var events = setup.eventStream.makeAsyncIterator()
+			let ready = try await events.next()
+			XCTAssertEqual(ready, .ready)
+			try setup.peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
+			setup.connector.receiveInbound(mismatch)
+			do {
+				_ = try await events.next()
+				XCTFail("A post-dispatch acknowledgement mismatch must remain a provider rejection")
+			} catch {
+				XCTAssertEqual(error as? WebRTCTransportFailure, .providerError)
+			}
+			let eventAfterFailure = try await events.next()
+			XCTAssertNil(eventAfterFailure, "A rejected acknowledgement cannot publish configuration state")
+			await setup.peer.closeAndJoin()
+			XCTAssertEqual(setup.closes.dataCount, 1)
+			XCTAssertEqual(setup.closes.peerCount, 1)
+			setup.remoteConnection.close()
+		}
 	}
 
 	@MainActor func testProductionMailboxFailsAtThirtyTwoPlusOneWhileDrainIsSuspended() async throws {
@@ -303,7 +373,10 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		connector.installProductionConfiguration()
 		await fulfillment(of: [delivered], timeout: 1)
 		XCTAssertEqual(try recorder.values[0].get(), .ready)
-		XCTAssertEqual(try recorder.values[1].get(), .rawInbound(raw))
+		XCTAssertEqual(
+			try recorder.values[1].get(),
+			.rawInbound(raw, configurationDispatchedAtAcceptance: false)
+		)
 		await connector.closeAndSettle()
 	}
 
@@ -398,9 +471,15 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await backing.emit(.ready)
 		_ = try await iterator.next()
 		try peer.configure(.openAI(language: "en"))
-		await backing.emit(.rawInbound(Data(#"{"type":"session.created"}"#.utf8)))
+		await backing.emit(.rawInbound(
+			Data(#"{"type":"session.created"}"#.utf8),
+			configurationDispatchedAtAcceptance: false
+		))
 		_ = try await iterator.next()
-		await backing.emit(.rawInbound(Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8)))
+		await backing.emit(.rawInbound(
+			Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8),
+			configurationDispatchedAtAcceptance: true
+		))
 		_ = try await iterator.next()
 		backing.audioStateCallback = { state in
 			if state == .disabled { peer.setLocalAudioState(.enabled) }
@@ -1119,13 +1198,13 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			var events = peer.events.makeAsyncIterator()
 			let ready = try await events.next()
 			XCTAssertEqual(ready, .ready)
-			await backing.emit(.rawInbound(acknowledgement))
+			await backing.emit(.rawInbound(acknowledgement, configurationDispatchedAtAcceptance: true))
 			let configured = try await events.next()
 			let connected = try await events.next()
 			XCTAssertEqual(configured, .localAISessionConfigured(voice: "Ono_Anna", language: "ja"))
 			XCTAssertEqual(connected, .connected)
 
-			await backing.emit(.rawInbound(acknowledgement))
+			await backing.emit(.rawInbound(acknowledgement, configurationDispatchedAtAcceptance: true))
 			do {
 				_ = try await events.next()
 				XCTFail("A duplicate acknowledgement must remain malformed")
@@ -1150,7 +1229,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			var events = peer.events.makeAsyncIterator()
 			let ready = try await events.next()
 			XCTAssertEqual(ready, .ready)
-			await backing.emit(.rawInbound(payload))
+			await backing.emit(.rawInbound(payload, configurationDispatchedAtAcceptance: true))
 			do {
 				_ = try await events.next()
 				XCTFail("A malformed pending acknowledgement must be a provider rejection")
@@ -1173,7 +1252,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			var events = peer.events.makeAsyncIterator()
 			let ready = try await events.next()
 			XCTAssertEqual(ready, .ready)
-			await backing.emit(.rawInbound(payload))
+			await backing.emit(.rawInbound(payload, configurationDispatchedAtAcceptance: true))
 			do {
 				_ = try await events.next()
 				XCTFail("An unrelated pending event must retain its failure category")
@@ -1194,11 +1273,17 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let ready = try await events.next()
 		XCTAssertEqual(ready, .ready)
 		try peer.configure(.openAI(language: "en"))
-		await backing.emit(.rawInbound(Data(#"{"type":"session.created"}"#.utf8)))
+		await backing.emit(.rawInbound(
+			Data(#"{"type":"session.created"}"#.utf8),
+			configurationDispatchedAtAcceptance: false
+		))
 		let created = try await events.next()
 		XCTAssertEqual(created, .openAISessionCreated)
 
-		await backing.emit(.rawInbound(Data(#"{"type":"session.updated","session":{"type":"realtime"}}"#.utf8)))
+		await backing.emit(.rawInbound(
+			Data(#"{"type":"session.updated","session":{"type":"realtime"}}"#.utf8),
+			configurationDispatchedAtAcceptance: true
+		))
 		do {
 			_ = try await events.next()
 			XCTFail("OpenAI acknowledgement validation must remain unchanged")
@@ -1322,6 +1407,53 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		return (peer, backing)
 	}
 
+	@MainActor private func makeRealLocalAIPeer(
+		didDrainInbound: @escaping () -> Void = {}
+	) async throws -> (
+		connector: WebRTCConnector,
+		peer: any WebRTCConnectorPeer,
+		eventStream: WebRTCConnectorEventStream,
+		remoteConnection: LKRTCPeerConnection,
+		closes: ProductionCloseCounter
+	) {
+		let closes = ProductionCloseCounter()
+		let connector = try WebRTCConnector.createProduction(
+			provider: .localAI,
+			initialAudioState: .enabled,
+			session: ProductionStubSession(),
+			terminalObserver: .init(
+				cancelSignaling: {},
+				closeData: { closes.recordData() },
+				closePeer: { closes.recordPeer() },
+				disableAudio: {},
+				recordPermissionGranted: { true },
+				didDrainInbound: didDrainInbound
+			)
+		)
+		let factory = LKRTCPeerConnectionFactory()
+		let remoteConnection = try XCTUnwrap(factory.peerConnection(
+			with: LKRTCConfiguration(),
+			constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+			delegate: nil
+		))
+		let peer = try WebRTCConnectorPeerFactory(
+			provider: .localAI,
+			initialAudioState: .enabled,
+			makePeer: { connector }
+		).makePeer()
+		let offer = try await peer.makeOffer()
+		try await remoteConnection.setRemoteDescription(LKRTCSessionDescription(type: .offer, sdp: offer))
+		let answer = try await remoteConnection.answer(
+			for: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+		)
+		try await remoteConnection.setLocalDescription(answer)
+		for _ in 0..<500 where remoteConnection.iceGatheringState != .complete {
+			try await Task.sleep(for: .milliseconds(10))
+		}
+		try await peer.apply(remoteAnswer: try XCTUnwrap(remoteConnection.localDescription).sdp)
+		return (connector, peer, peer.events, remoteConnection, closes)
+	}
+
 }
 
 @MainActor private enum CommandCase: CaseIterable {
@@ -1394,6 +1526,13 @@ private final class LockedFlag: @unchecked Sendable {
 	private var stored = false
 	func set() { lock.withLock { stored = true } }
 	var value: Bool { lock.withLock { stored } }
+}
+
+@MainActor private final class ProductionCloseCounter {
+	private(set) var dataCount = 0
+	private(set) var peerCount = 0
+	func recordData() { dataCount += 1 }
+	func recordPeer() { peerCount += 1 }
 }
 
 private final class ProductionSynchronousGate: @unchecked Sendable {

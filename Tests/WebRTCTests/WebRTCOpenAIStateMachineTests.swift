@@ -529,5 +529,7 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	func setLocalAudioState(_ state: WebRTCLocalAudioState) { audioStates.append(state) }
 	func closeAndSettle() async { closeCount += 1 }
 	func emit(_ event: WebRTCConnectorPeerBackingEvent) { sink?(.success(event)) }
-	func emitRaw(_ json: String) { emit(.rawInbound(Data(json.utf8))) }
+	func emitRaw(_ json: String) {
+		emit(.rawInbound(Data(json.utf8), configurationDispatchedAtAcceptance: false))
+	}
 }

@@ -111,7 +111,7 @@ private final class ProductionTerminalSelection: @unchecked Sendable {
 package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	case ready
 	case inbound(WebRTCInboundEvent)
-	case rawInbound(Data)
+	case rawInbound(Data, configurationDispatchedAtAcceptance: Bool)
 	case terminal(WebRTCTransportFailure?)
 }
 @MainActor package protocol WebRTCConnectorPeerBacking: Sendable {
@@ -363,8 +363,13 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			guard !ready else { startSettlement(failure: .malformedEvent, origin: .backing); return }
 			if answerInFlight { pendingReady = true; return }
 			guard admitReady() else { startSettlement(failure: .malformedEvent, origin: .backing); return }
-		case let .rawInbound(data):
-			do { try receiveRaw(data) }
+		case let .rawInbound(data, configurationDispatchedAtAcceptance):
+			do {
+				try receiveRaw(
+					data,
+					configurationDispatchedAtAcceptance: configurationDispatchedAtAcceptance
+				)
+			}
 			catch let failure as WebRTCTransportFailure { startSettlement(failure: failure, origin: .backing) }
 			catch { startSettlement(failure: Self.contentFree(error), origin: .backing) }
 		case let .inbound(inbound):
@@ -388,11 +393,17 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		}
 	}
 
-	private func receiveRaw(_ data: Data) throws {
+	private func receiveRaw(
+		_ data: Data,
+		configurationDispatchedAtAcceptance: Bool
+	) throws {
 		guard ready else { throw WebRTCTransportFailure.malformedEvent }
 		guard let configuration else { throw WebRTCTransportFailure.malformedEvent }
 		switch configuration.provider {
 		case .localAI:
+			guard configurationDispatchedAtAcceptance || !Self.identifiesLocalAISessionUpdated(data) else {
+				throw WebRTCTransportFailure.malformedEvent
+			}
 			do {
 				guard let inbound = try WebRTCInboundEventDecoder().decodeForConnector(data) else { return }
 				receive(.success(.inbound(inbound)))

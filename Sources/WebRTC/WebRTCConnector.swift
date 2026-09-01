@@ -229,6 +229,11 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 	}
 
+	private struct AcceptedRawInbound: Sendable {
+		let data: Data
+		let configurationDispatchedAtAcceptance: Bool
+	}
+
 	private final class TerminalGate: @unchecked Sendable {
 		private let lock = NSLock()
 		private enum RequestReservation {
@@ -250,17 +255,22 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 		private var state: State = .open(acceptedIngress: 0)
 		private var openTransitionPending = false
+		private var productionConfigurationDispatched = false
 		private var settlementTaskWaiters: [CheckedContinuation<Task<Void, Never>?, Never>] = []
 
 		func acceptIngress(
 			_ data: Data,
-			with continuation: AsyncThrowingStream<Data, Error>.Continuation,
+			with continuation: AsyncThrowingStream<AcceptedRawInbound, Error>.Continuation,
 			connector: WebRTCConnector
 		) {
 			let closesProductionMedia = connector.requiresSynchronousProductionMediaClosure
 			let reservation = lock.withLock { () -> RequestReservation? in
 				guard case let .open(acceptedIngress) = state else { return nil }
-				switch continuation.yield(data) {
+				let accepted = AcceptedRawInbound(
+					data: data,
+					configurationDispatchedAtAcceptance: productionConfigurationDispatched
+				)
+				switch continuation.yield(accepted) {
 				case .enqueued:
 					state = .open(acceptedIngress: acceptedIngress + 1)
 					return nil
@@ -273,6 +283,14 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			guard let reservation else { return }
 			connector.terminalObserver.didReserveIngressOverload()
 			_ = finish(reservation, closesProductionMedia: closesProductionMedia, connector: connector)
+		}
+
+		func markProductionConfigurationDispatched() -> Bool {
+			lock.withLock {
+				guard case .open = state else { return false }
+				productionConfigurationDispatched = true
+				return true
+			}
 		}
 
 		func request(_ failure: WebRTCTransportFailure?, connector: WebRTCConnector) -> Task<Void, Never>? {
@@ -601,8 +619,8 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 	private let terminalObserver: TerminalObserver
 	private let deliveryMode: DeliveryMode
 	nonisolated private let diagnosticDispatcher: DiagnosticDispatcher
-	private let ingressEvents: AsyncThrowingStream<Data, Error>
-	nonisolated private let ingressStream: AsyncThrowingStream<Data, Error>.Continuation
+	private let ingressEvents: AsyncThrowingStream<AcceptedRawInbound, Error>
+	nonisolated private let ingressStream: AsyncThrowingStream<AcceptedRawInbound, Error>.Continuation
 	private var ingressDrainTask: Task<Void, Never>?
 	nonisolated private let terminalGate = TerminalGate()
 	private var productionReadinessWaiter: CheckedContinuation<Void, Never>?
@@ -653,7 +671,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		(events, stream) = AsyncThrowingStream.makeStream(of: WebRTCInboundEvent.self, bufferingPolicy: .bufferingOldest(0))
 		(qualificationEvents, qualificationStream) = AsyncThrowingStream.makeStream(of: WebRTCConnectorQualificationEvent.self, bufferingPolicy: .bufferingOldest(2))
 		(ingressEvents, ingressStream) = AsyncThrowingStream.makeStream(
-			of: Data.self,
+			of: AcceptedRawInbound.self,
 			bufferingPolicy: .bufferingOldest(Self.inboundMailboxCapacity)
 		)
 
@@ -665,9 +683,9 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		let ingressEvents = ingressEvents
 		ingressDrainTask = Task { [weak self, ingressEvents] in
 			do {
-				for try await data in ingressEvents {
+				for try await accepted in ingressEvents {
 					guard !Task.isCancelled else { return }
-					await self?.drainInbound(data)
+					await self?.drainInbound(accepted)
 				}
 			} catch {}
 		}
@@ -754,6 +772,9 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 
 	package func sendSessionConfiguration(_ data: Data) throws {
 		guard isCurrentAndAcceptingProgression(), dataChannel.readyState == .open else {
+			throw WebRTCTransportFailure.cancelled
+		}
+		guard terminalGate.markProductionConfigurationDispatched() else {
 			throw WebRTCTransportFailure.cancelled
 		}
 		guard dataChannel.sendData(LKRTCDataBuffer(data: data, isBinary: false)) else {
@@ -1226,7 +1247,7 @@ extension WebRTCConnector {
 		terminalGate.acceptIngress(data, with: ingressStream, connector: self)
 	}
 
-	private func drainInbound(_ data: Data) async {
+	private func drainInbound(_ accepted: AcceptedRawInbound) async {
 		defer {
 			terminalGate.acceptedIngressDidDrain()
 			terminalObserver.didRetireAcceptedIngress()
@@ -1242,11 +1263,17 @@ extension WebRTCConnector {
 			guard !productionDeliveryCancelled, terminalGate.shouldProcessAcceptedIngress(), lifecycle.isCurrent(generation) else { return }
 			await waitForProductionConfiguration()
 			guard !productionDeliveryCancelled, terminalGate.shouldProcessAcceptedIngress(), lifecycle.isCurrent(generation) else { return }
-			yieldProduction(.rawInbound(data), fromAcceptedIngress: true)
+			yieldProduction(
+				.rawInbound(
+					accepted.data,
+					configurationDispatchedAtAcceptance: accepted.configurationDispatchedAtAcceptance
+				),
+				fromAcceptedIngress: true
+			)
 			return
 		}
 		do {
-			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(data) else { return }
+			guard let inboundEvent = try inboundEventDecoder.decodeForConnector(accepted.data) else { return }
 			if inboundEvent == .providerError {
 				requestTerminalFromAcceptedIngress(WebRTCTransportFailure.providerError)
 				return
