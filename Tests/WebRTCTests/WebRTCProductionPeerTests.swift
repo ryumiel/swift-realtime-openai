@@ -50,7 +50,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertFalse(firstReturned.value, "An admitted media callback keeps the first waiter pending")
 		XCTAssertFalse(secondReturned.value, "Duplicate callers join the same media boundary")
 
-		backing.resumeMediaQuiescence()
+		backing.releaseHeldAdmittedMediaCallback()
 		await first.value
 		await second.value
 		XCTAssertTrue(firstReturned.value)
@@ -136,33 +136,26 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await close
 	}
 
-	@MainActor func testRemoteAudioGateCallerCancellationStillWaitsForAdmittedMedia() async throws {
-		let gate = ProductionRemoteAudioAdmissionGate(initiallyEnabled: true)
-		let frame = ProductionQuiescenceFrame()
-		let admitted = expectation(description: "one admitted callback starts")
-		let delivery = Task.detached {
-			gate.deliverIfAdmitted {
-				admitted.fulfill()
-				frame.blockUntilReleased()
-			}
-		}
-		await fulfillment(of: [admitted], timeout: 1)
-
+	@MainActor func testPublicMediaQuiescenceCallerCancellationStillWaitsForRegisteredJoin() async throws {
+		let backing = FakeProductionBacking(suspendMediaQuiescence: true)
+		let peer = try WebRTCConnectorPeerFactory(
+			provider: .openAI,
+			initialAudioState: .disabled,
+			makePeer: { backing }
+		).makePeer()
 		let returned = LockedFlag()
-		let cutoff = gate.disableAudioForMediaQuiescence()
-		let quiescence = Task {
-			await gate.waitForMediaQuiescence(through: cutoff)
+		let quiescence = Task { @MainActor in
+			await peer.disableAudioAndWaitForMediaQuiescence()
 			returned.set()
 		}
-		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
+		await backing.waitForMediaQuiescenceWaiterCount(1)
 		quiescence.cancel()
-		await Task.yield()
-		XCTAssertFalse(returned.value, "Caller cancellation cannot abandon an admitted media callback")
+		XCTAssertFalse(returned.value, "Caller cancellation cannot abandon the held admitted media callback")
 
-		frame.release()
-		await delivery.value
+		backing.releaseHeldAdmittedMediaCallback()
 		await quiescence.value
-		XCTAssertTrue(returned.value)
+		XCTAssertTrue(returned.value, "The registered join returns after the held admitted media callback releases")
+		await peer.closeAndJoin()
 	}
 
 	@MainActor func testUnifiedPlanReceiverRemovalReleasesTrackForValidReplacement() async throws {
@@ -2036,7 +2029,9 @@ private actor ProductionDrainGate {
 			ready.forEach { $0.1.resume() }
 		}
 	}
-	func resumeMediaQuiescence() {
+	/// Represents the return of one callback already admitted by the production
+	/// remote-media gate; it carries no provider or user content.
+	func releaseHeldAdmittedMediaCallback() {
 		mediaQuiescenceReleased = true
 		let waiters = mediaQuiescenceWaiters
 		mediaQuiescenceWaiters.removeAll(keepingCapacity: false)
