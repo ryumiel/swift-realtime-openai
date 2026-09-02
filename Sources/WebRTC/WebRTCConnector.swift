@@ -12,8 +12,9 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	private var enabled: Bool
 	private var closed = false
 	private var tracks: [LKRTCMediaStreamTrack] = []
-	private var admittedCallbacks = 0
-	private var mediaQuiescenceWaiters: [CheckedContinuation<Void, Never>] = []
+	private var latestAdmission: UInt64 = 0
+	private var activeAdmissions: Set<UInt64> = []
+	private var mediaQuiescenceWaiters: [(cutoff: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
 	private let attemptedFrame: @Sendable () -> Void
 	private let admittedFrame: @Sendable () -> Void
 
@@ -65,18 +66,19 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func deliverIfAdmitted(_ delivery: () -> Void) {
-		let admitted = lock.withLock { () -> Bool in
-			guard !closed, enabled else { return false }
-			admittedCallbacks += 1
-			return true
+		let admission = lock.withLock { () -> UInt64? in
+			guard !closed, enabled else { return nil }
+			latestAdmission &+= 1
+			activeAdmissions.insert(latestAdmission)
+			return latestAdmission
 		}
-		guard admitted else { return }
+		guard let admission else { return }
 		delivery()
 		let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-			admittedCallbacks -= 1
-			guard admittedCallbacks == 0 else { return [] }
-			defer { mediaQuiescenceWaiters.removeAll(keepingCapacity: false) }
-			return mediaQuiescenceWaiters
+			activeAdmissions.remove(admission)
+			let ready = mediaQuiescenceWaiters.filter { isQuiescent(through: $0.cutoff) }
+			mediaQuiescenceWaiters.removeAll { isQuiescent(through: $0.cutoff) }
+			return ready.map(\.continuation)
 		}
 		waiters.forEach { $0.resume() }
 	}
@@ -86,21 +88,25 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 		deliverIfAdmitted(admittedFrame)
 	}
 
-	func disableAudioAndWaitForMediaQuiescence() async {
-		disableAudio()
-		await waitForMediaQuiescence()
+	func disableAudioForMediaQuiescence() -> UInt64 {
+		lock.withLock {
+			guard !closed else { return latestAdmission }
+			enabled = false
+			tracks.forEach { $0.isEnabled = false }
+			return latestAdmission
+		}
 	}
 
 	func closeAndWaitForMediaQuiescence() async {
-		close()
-		await waitForMediaQuiescence()
+		await waitForMediaQuiescence(through: close())
 	}
 
-	func close() {
+	func close() -> UInt64 {
 		lock.withLock {
 			closed = true
 			enabled = false
 			tracks.forEach { $0.isEnabled = false }
+			return latestAdmission
 		}
 	}
 
@@ -118,23 +124,19 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 		lock.withLock { !enabled }
 	}
 
-	private func disableAudio() {
-		lock.withLock {
-			guard !closed else { return }
-			enabled = false
-			tracks.forEach { $0.isEnabled = false }
-		}
-	}
-
-	private func waitForMediaQuiescence() async {
+	func waitForMediaQuiescence(through cutoff: UInt64) async {
 		await withCheckedContinuation { continuation in
 			let shouldResume = lock.withLock { () -> Bool in
-				guard admittedCallbacks != 0 else { return true }
-				mediaQuiescenceWaiters.append(continuation)
+				guard !isQuiescent(through: cutoff) else { return true }
+				mediaQuiescenceWaiters.append((cutoff, continuation))
 				return false
 			}
 			if shouldResume { continuation.resume() }
 		}
+	}
+
+	private func isQuiescent(through cutoff: UInt64) -> Bool {
+		!activeAdmissions.contains { $0 <= cutoff }
 	}
 }
 
@@ -144,6 +146,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 	private let remoteGate: ProductionRemoteAudioAdmissionGate?
 	private let didDisable: () -> Void
 	private var closed = false
+	private var closeCutoff: UInt64?
 
 	init(localTrack: LKRTCAudioTrack, remoteGate: ProductionRemoteAudioAdmissionGate?, didDisable: @escaping () -> Void) {
 		self.localTrack = localTrack
@@ -159,13 +162,16 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 	}
 
-	func disableAudioAndWaitForMediaQuiescence() async {
-		let gate = lock.withLock { () -> ProductionRemoteAudioAdmissionGate? in
+	func disableAudioForMediaQuiescence() -> UInt64? {
+		lock.withLock {
 			localTrack.isEnabled = false
-			remoteGate?.setEnabled(false)
-			return remoteGate
+			return remoteGate?.disableAudioForMediaQuiescence()
 		}
-		await gate?.disableAudioAndWaitForMediaQuiescence()
+	}
+
+	func waitForMediaQuiescence(through cutoff: UInt64?) async {
+		guard let cutoff else { return }
+		await remoteGate?.waitForMediaQuiescence(through: cutoff)
 	}
 
 	func close() {
@@ -173,14 +179,15 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			guard !closed else { return false }
 			closed = true
 			localTrack.isEnabled = false
-			remoteGate?.close()
+			closeCutoff = remoteGate?.close()
 			return true
 		}
 		if didClose { didDisable() }
 	}
 
 	func waitForMediaQuiescence() async {
-		await remoteGate?.closeAndWaitForMediaQuiescence()
+		let cutoff = lock.withLock { closeCutoff }
+		await waitForMediaQuiescence(through: cutoff)
 	}
 
 	func releaseRemoteTracks() { remoteGate?.releaseTracks() }
@@ -846,8 +853,12 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		productionMediaCloser.set(state)
 	}
 
-	package func disableAudioAndWaitForMediaQuiescence() async {
-		await productionMediaCloser.disableAudioAndWaitForMediaQuiescence()
+	package func disableAudioForMediaQuiescence() -> UInt64? {
+		productionMediaCloser.disableAudioForMediaQuiescence()
+	}
+
+	package func waitForMediaQuiescence(through cutoff: UInt64?) async {
+		await productionMediaCloser.waitForMediaQuiescence(through: cutoff)
 	}
 
 	@_spi(AirbridgeQualification) public func sendSessionUpdate(

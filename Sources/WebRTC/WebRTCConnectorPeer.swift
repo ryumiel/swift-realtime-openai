@@ -126,7 +126,8 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	func sendSessionConfiguration(_ data: Data) throws
 	func sendProductionCommand(_ command: ProductionCommand) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
-	func disableAudioAndWaitForMediaQuiescence() async
+	func disableAudioForMediaQuiescence() -> UInt64?
+	func waitForMediaQuiescence(through cutoff: UInt64?) async
 	func closeAndSettle() async
 }
 
@@ -346,7 +347,8 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	}
 
 	package func disableAudioAndWaitForMediaQuiescence() async {
-		await backing.disableAudioAndWaitForMediaQuiescence()
+		let cutoff = backing.disableAudioForMediaQuiescence()
+		await backing.waitForMediaQuiescence(through: cutoff)
 	}
 
 	package func closeAndJoin() async { await beginSettlement(failure: nil, origin: .explicitClose) }

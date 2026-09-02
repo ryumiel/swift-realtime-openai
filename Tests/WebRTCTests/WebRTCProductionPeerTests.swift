@@ -37,13 +37,13 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			await peer.disableAudioAndWaitForMediaQuiescence()
 			firstReturned.set()
 		}
-		await backing.waitForMediaQuiescenceStart()
+		await backing.waitForMediaQuiescenceWaiterCount(1)
 		let secondReturned = LockedFlag()
 		let second = Task { @MainActor in
 			await peer.disableAudioAndWaitForMediaQuiescence()
 			secondReturned.set()
 		}
-		await Task.yield()
+		await backing.waitForMediaQuiescenceWaiterCount(2)
 
 		XCTAssertEqual(backing.audioStates, [.disabled], "The public boundary must synchronously disable local media once")
 		XCTAssertEqual(backing.closeCount, 0, "Media quiescence must not close the peer or settle the session")
@@ -56,37 +56,62 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertTrue(firstReturned.value)
 		XCTAssertTrue(secondReturned.value)
 		XCTAssertEqual(backing.closeCount, 0, "Returning from media quiescence leaves the peer open")
+		let lateReturned = LockedFlag()
+		let late = Task { @MainActor in
+			await peer.disableAudioAndWaitForMediaQuiescence()
+			lateReturned.set()
+		}
+		await late.value
+		XCTAssertTrue(lateReturned.value, "A late duplicate waiter observes the released media boundary")
 
 		peer.setLocalAudioState(.enabled)
 		XCTAssertEqual(backing.audioStates, [.disabled, .enabled], "An explicit later enable remains available")
 		await peer.closeAndJoin()
 	}
 
-	@MainActor func testRemoteAudioGateDisablesBeforeWaitingAndRejectsPostDisableAdmission() async throws {
+	@MainActor func testRemoteAudioGateWaitsOnlyForPreDisableAdmissions() async throws {
 		let gate = ProductionRemoteAudioAdmissionGate(initiallyEnabled: true)
-		let frame = ProductionQuiescenceFrame()
-		let admitted = expectation(description: "one admitted callback starts")
-		let delivery = Task.detached {
+		let preDisableFrame = ProductionQuiescenceFrame()
+		let preDisableAdmitted = expectation(description: "pre-disable callback starts")
+		let preDisableDelivery = Task.detached {
 			gate.deliverIfAdmitted {
-				admitted.fulfill()
-				frame.blockUntilReleased()
+				preDisableAdmitted.fulfill()
+				preDisableFrame.blockUntilReleased()
 			}
 		}
-		await fulfillment(of: [admitted], timeout: 1)
+		await fulfillment(of: [preDisableAdmitted], timeout: 1)
 
-		let quiescence = Task { await gate.disableAudioAndWaitForMediaQuiescence() }
+		let quiescenceReturned = LockedFlag()
+		let cutoff = gate.disableAudioForMediaQuiescence()
+		let quiescence = Task {
+			await gate.waitForMediaQuiescence(through: cutoff)
+			quiescenceReturned.set()
+		}
 		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
-		XCTAssertFalse(quiescence.isCancelled, "The public media boundary waits for the admitted callback")
 		gate.deliverIfAdmitted { XCTFail("No callback may be admitted after disable") }
 
-		frame.release()
-		await delivery.value
-		await quiescence.value
-
-		let enabledAdmission = expectation(description: "explicit enable admits later media")
 		gate.setEnabled(true)
-		gate.deliverIfAdmitted { enabledAdmission.fulfill() }
-		await fulfillment(of: [enabledAdmission], timeout: 1)
+		XCTAssertFalse(gate.isMediaDisabledForTesting, "An explicit enable reopens admission without changing the earlier cutoff")
+		let postEnableFrame = ProductionQuiescenceFrame()
+		let postEnableAdmitted = expectation(description: "post-enable callback starts")
+		let postEnableReturned = LockedFlag()
+		let postEnableDelivery = Task.detached {
+			gate.deliverIfAdmitted {
+				postEnableAdmitted.fulfill()
+				postEnableFrame.blockUntilReleased()
+				postEnableReturned.set()
+			}
+		}
+		await fulfillment(of: [postEnableAdmitted], timeout: 1)
+
+		preDisableFrame.release()
+		await preDisableDelivery.value
+		try await waitUntil(timeout: .seconds(1)) { quiescenceReturned.value }
+		XCTAssertFalse(postEnableReturned.value, "The original cutoff must not wait for post-enable media")
+
+		postEnableFrame.release()
+		await postEnableDelivery.value
+		await quiescence.value
 	}
 
 	@MainActor func testRemoteAudioGateCloseRacesMediaQuiescenceWithoutDeadlock() async throws {
@@ -101,7 +126,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 		await fulfillment(of: [admitted], timeout: 1)
 
-		async let quiescence: Void = gate.disableAudioAndWaitForMediaQuiescence()
+		let cutoff = gate.disableAudioForMediaQuiescence()
+		async let quiescence: Void = gate.waitForMediaQuiescence(through: cutoff)
 		async let close: Void = gate.closeAndWaitForMediaQuiescence()
 		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
 		frame.release()
@@ -123,8 +149,9 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await fulfillment(of: [admitted], timeout: 1)
 
 		let returned = LockedFlag()
+		let cutoff = gate.disableAudioForMediaQuiescence()
 		let quiescence = Task {
-			await gate.disableAudioAndWaitForMediaQuiescence()
+			await gate.waitForMediaQuiescence(through: cutoff)
 			returned.set()
 		}
 		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
@@ -1903,8 +1930,9 @@ private actor ProductionDrainGate {
 	private let suspendAnswer: Bool
 	private let suspendClose: Bool
 	private let suspendMediaQuiescence: Bool
-	private var mediaQuiescenceStartWaiter: CheckedContinuation<Void, Never>?
 	private var mediaQuiescenceWaiters: [CheckedContinuation<Void, Never>] = []
+	private var mediaQuiescenceCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+	private var mediaQuiescenceReleased = false
 	private let offerErrorOnClose: Bool
 	private let answerErrorOnClose: Bool
 	private let offerErrorOnCancellation: Bool
@@ -1995,20 +2023,30 @@ private actor ProductionDrainGate {
 		if state == .disabled { disableWaiter?.resume(); disableWaiter = nil }
 		audioStateCallback?(state)
 	}
-	func disableAudioAndWaitForMediaQuiescence() async {
+	func disableAudioForMediaQuiescence() -> UInt64? {
 		if !audioStates.contains(.disabled) { setLocalAudioState(.disabled) }
-		mediaQuiescenceStartWaiter?.resume()
-		mediaQuiescenceStartWaiter = nil
-		guard suspendMediaQuiescence else { return }
-		await withCheckedContinuation { mediaQuiescenceWaiters.append($0) }
+		return 0
 	}
-	func waitForMediaQuiescenceStart() async {
-		await withCheckedContinuation { mediaQuiescenceStartWaiter = $0 }
+	func waitForMediaQuiescence(through _: UInt64?) async {
+		guard suspendMediaQuiescence, !mediaQuiescenceReleased else { return }
+		await withCheckedContinuation {
+			mediaQuiescenceWaiters.append($0)
+			let ready = mediaQuiescenceCountWaiters.filter { $0.0 <= mediaQuiescenceWaiters.count }
+			mediaQuiescenceCountWaiters.removeAll { $0.0 <= mediaQuiescenceWaiters.count }
+			ready.forEach { $0.1.resume() }
+		}
 	}
 	func resumeMediaQuiescence() {
+		mediaQuiescenceReleased = true
 		let waiters = mediaQuiescenceWaiters
 		mediaQuiescenceWaiters.removeAll(keepingCapacity: false)
 		waiters.forEach { $0.resume() }
+	}
+	func waitForMediaQuiescenceWaiterCount(_ count: Int) async {
+		guard mediaQuiescenceWaiters.count >= count else {
+			await withCheckedContinuation { mediaQuiescenceCountWaiters.append((count, $0)) }
+			return
+		}
 	}
 	func clearAudioObservations() { audioStates.removeAll(); operationOrder.removeAll() }
 	func closeAndSettle() async {
