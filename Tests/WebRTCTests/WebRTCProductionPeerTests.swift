@@ -6,6 +6,138 @@ import LiveKitWebRTC
 import XCTest
 
 final class WebRTCProductionPeerTests: XCTestCase {
+	@MainActor func testPublicMediaQuiescenceDisablesWithoutClosingAndJoinsEveryConcurrentWaiter() async throws {
+		let backing = FakeProductionBacking(suspendMediaQuiescence: true)
+		let peer = try WebRTCConnectorPeerFactory(
+			provider: .openAI,
+			initialAudioState: .disabled,
+			makePeer: { backing }
+		).makePeer()
+		var events = peer.events.makeAsyncIterator()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		await backing.emit(.ready)
+		_ = try await events.next()
+		try peer.configure(.openAI(language: "en"))
+		await backing.emit(.rawInbound(
+			Data(#"{"type":"session.created"}"#.utf8),
+			configurationDispatchedAtAcceptance: false
+		))
+		_ = try await events.next()
+		await backing.emit(.rawInbound(
+			Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8),
+			configurationDispatchedAtAcceptance: true
+		))
+		_ = try await events.next()
+		peer.setLocalAudioState(.enabled)
+		backing.clearAudioObservations()
+
+		let firstReturned = LockedFlag()
+		let first = Task { @MainActor in
+			await peer.disableAudioAndWaitForMediaQuiescence()
+			firstReturned.set()
+		}
+		await backing.waitForMediaQuiescenceStart()
+		let secondReturned = LockedFlag()
+		let second = Task { @MainActor in
+			await peer.disableAudioAndWaitForMediaQuiescence()
+			secondReturned.set()
+		}
+		await Task.yield()
+
+		XCTAssertEqual(backing.audioStates, [.disabled], "The public boundary must synchronously disable local media once")
+		XCTAssertEqual(backing.closeCount, 0, "Media quiescence must not close the peer or settle the session")
+		XCTAssertFalse(firstReturned.value, "An admitted media callback keeps the first waiter pending")
+		XCTAssertFalse(secondReturned.value, "Duplicate callers join the same media boundary")
+
+		backing.resumeMediaQuiescence()
+		await first.value
+		await second.value
+		XCTAssertTrue(firstReturned.value)
+		XCTAssertTrue(secondReturned.value)
+		XCTAssertEqual(backing.closeCount, 0, "Returning from media quiescence leaves the peer open")
+
+		peer.setLocalAudioState(.enabled)
+		XCTAssertEqual(backing.audioStates, [.disabled, .enabled], "An explicit later enable remains available")
+		await peer.closeAndJoin()
+	}
+
+	@MainActor func testRemoteAudioGateDisablesBeforeWaitingAndRejectsPostDisableAdmission() async throws {
+		let gate = ProductionRemoteAudioAdmissionGate(initiallyEnabled: true)
+		let frame = ProductionQuiescenceFrame()
+		let admitted = expectation(description: "one admitted callback starts")
+		let delivery = Task.detached {
+			gate.deliverIfAdmitted {
+				admitted.fulfill()
+				frame.blockUntilReleased()
+			}
+		}
+		await fulfillment(of: [admitted], timeout: 1)
+
+		let quiescence = Task { await gate.disableAudioAndWaitForMediaQuiescence() }
+		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
+		XCTAssertFalse(quiescence.isCancelled, "The public media boundary waits for the admitted callback")
+		gate.deliverIfAdmitted { XCTFail("No callback may be admitted after disable") }
+
+		frame.release()
+		await delivery.value
+		await quiescence.value
+
+		let enabledAdmission = expectation(description: "explicit enable admits later media")
+		gate.setEnabled(true)
+		gate.deliverIfAdmitted { enabledAdmission.fulfill() }
+		await fulfillment(of: [enabledAdmission], timeout: 1)
+	}
+
+	@MainActor func testRemoteAudioGateCloseRacesMediaQuiescenceWithoutDeadlock() async throws {
+		let gate = ProductionRemoteAudioAdmissionGate(initiallyEnabled: true)
+		let frame = ProductionQuiescenceFrame()
+		let admitted = expectation(description: "one admitted callback starts")
+		let delivery = Task.detached {
+			gate.deliverIfAdmitted {
+				admitted.fulfill()
+				frame.blockUntilReleased()
+			}
+		}
+		await fulfillment(of: [admitted], timeout: 1)
+
+		async let quiescence: Void = gate.disableAudioAndWaitForMediaQuiescence()
+		async let close: Void = gate.closeAndWaitForMediaQuiescence()
+		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
+		frame.release()
+		await delivery.value
+		await quiescence
+		await close
+	}
+
+	@MainActor func testRemoteAudioGateCallerCancellationStillWaitsForAdmittedMedia() async throws {
+		let gate = ProductionRemoteAudioAdmissionGate(initiallyEnabled: true)
+		let frame = ProductionQuiescenceFrame()
+		let admitted = expectation(description: "one admitted callback starts")
+		let delivery = Task.detached {
+			gate.deliverIfAdmitted {
+				admitted.fulfill()
+				frame.blockUntilReleased()
+			}
+		}
+		await fulfillment(of: [admitted], timeout: 1)
+
+		let returned = LockedFlag()
+		let quiescence = Task {
+			await gate.disableAudioAndWaitForMediaQuiescence()
+			returned.set()
+		}
+		try await waitUntil(timeout: .seconds(1)) { gate.isMediaDisabledForTesting }
+		quiescence.cancel()
+		await Task.yield()
+		XCTAssertFalse(returned.value, "Caller cancellation cannot abandon an admitted media callback")
+
+		frame.release()
+		await delivery.value
+		await quiescence.value
+		XCTAssertTrue(returned.value)
+	}
+
 	@MainActor func testUnifiedPlanReceiverRemovalReleasesTrackForValidReplacement() async throws {
 		let connector = try WebRTCConnector.createProduction(
 			provider: .openAI,
@@ -123,14 +255,39 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 		frames.blockNextFrame()
 		try await waitUntil(timeout: .seconds(2)) { frames.isFrameBlocked }
-		let releaseObserved = LockedFlag()
+		let mediaQuiescenceReturned = LockedFlag()
+		let mediaQuiescence = Task { @MainActor in
+			await peer.disableAudioAndWaitForMediaQuiescence()
+			mediaQuiescenceReturned.set()
+		}
+		let clock = ContinuousClock()
+		let muteDeadline = clock.now.advanced(by: .seconds(2))
+		while !connector.isMuted, clock.now < muteDeadline {
+			try await Task.sleep(for: .milliseconds(10))
+		}
+		XCTAssertTrue(connector.isMuted, "Public media quiescence synchronously disables the local sender")
+		let framesAtDisable = frames.admittedValue
+		try await Task.sleep(for: .milliseconds(50))
+		XCTAssertFalse(mediaQuiescenceReturned.value, "A held admitted callback keeps public media quiescence pending")
+		XCTAssertEqual(frames.admittedValue, framesAtDisable, "No later callback is admitted after public media disable")
 		DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
-			releaseObserved.set()
 			frames.releaseBlockedFrame()
 		}
+		await mediaQuiescence.value
+		XCTAssertTrue(mediaQuiescenceReturned.value, "Public media quiescence returns after the admitted callback releases")
+		peer.setLocalAudioState(.enabled)
+		try await waitUntil(timeout: .seconds(2)) { frames.admittedValue > framesAtDisable }
 
+		frames.blockNextFrame()
+		try await waitUntil(timeout: .seconds(2)) { frames.isFrameBlocked }
+		let terminalReleaseObserved = LockedFlag()
+		DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+			terminalReleaseObserved.set()
+			frames.releaseBlockedFrame()
+		}
 		connector.receiveDataChannelState(isOpen: false, isTerminal: true)
-		XCTAssertTrue(releaseObserved.value, "Terminal selection joins every already-admitted real RTP/frame callback")
+		await peer.closeAndJoin()
+		XCTAssertTrue(terminalReleaseObserved.value, "Terminal selection joins every already-admitted real RTP/frame callback")
 		let framesAtTerminal = frames.admittedValue
 		peer.setLocalAudioState(.enabled)
 		let lateTrack = factory.audioTrack(with: source, trackId: "synthetic-late-remote")
@@ -138,7 +295,6 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		XCTAssertTrue(lateTrackAdded, "The late remote track must reach the closed gate")
 		try await Task.sleep(for: .milliseconds(100))
 		XCTAssertEqual(frames.admittedValue, framesAtTerminal, "Post-invalidation tracks and frames are neither retained nor replayed")
-		await peer.closeAndJoin()
 		remoteConnection.close()
 	}
 
@@ -1657,6 +1813,24 @@ private final class ProductionFrameCounter: @unchecked Sendable {
 	var admittedValue: Int { condition.withLock { admittedCount } }
 }
 
+private final class ProductionQuiescenceFrame: @unchecked Sendable {
+	private let condition = NSCondition()
+	private var released = false
+
+	func blockUntilReleased() {
+		condition.lock()
+		while !released { condition.wait() }
+		condition.unlock()
+	}
+
+	func release() {
+		condition.withLock {
+			released = true
+			condition.broadcast()
+		}
+	}
+}
+
 private final class LockedFlag: @unchecked Sendable {
 	private let lock = NSLock()
 	private var stored = false
@@ -1728,6 +1902,9 @@ private actor ProductionDrainGate {
 	private let suspendOffer: Bool
 	private let suspendAnswer: Bool
 	private let suspendClose: Bool
+	private let suspendMediaQuiescence: Bool
+	private var mediaQuiescenceStartWaiter: CheckedContinuation<Void, Never>?
+	private var mediaQuiescenceWaiters: [CheckedContinuation<Void, Never>] = []
 	private let offerErrorOnClose: Bool
 	private let answerErrorOnClose: Bool
 	private let offerErrorOnCancellation: Bool
@@ -1740,10 +1917,11 @@ private actor ProductionDrainGate {
 
 	struct ArbitraryError: Error {}
 
-	init(suspendOffer: Bool = false, suspendAnswer: Bool = false, suspendClose: Bool = false, offerErrorOnClose: Bool = false, answerErrorOnClose: Bool = false, offerErrorOnCancellation: Bool = false, answerErrorOnCancellation: Bool = false, commandError: (any Error)? = nil) {
+	init(suspendOffer: Bool = false, suspendAnswer: Bool = false, suspendClose: Bool = false, suspendMediaQuiescence: Bool = false, offerErrorOnClose: Bool = false, answerErrorOnClose: Bool = false, offerErrorOnCancellation: Bool = false, answerErrorOnCancellation: Bool = false, commandError: (any Error)? = nil) {
 		self.suspendOffer = suspendOffer
 		self.suspendAnswer = suspendAnswer
 		self.suspendClose = suspendClose
+		self.suspendMediaQuiescence = suspendMediaQuiescence
 		self.offerErrorOnClose = offerErrorOnClose
 		self.answerErrorOnClose = answerErrorOnClose
 		self.offerErrorOnCancellation = offerErrorOnCancellation
@@ -1816,6 +1994,21 @@ private actor ProductionDrainGate {
 		operationOrder.append("audio:\(state == .enabled ? "enabled" : "disabled")")
 		if state == .disabled { disableWaiter?.resume(); disableWaiter = nil }
 		audioStateCallback?(state)
+	}
+	func disableAudioAndWaitForMediaQuiescence() async {
+		if !audioStates.contains(.disabled) { setLocalAudioState(.disabled) }
+		mediaQuiescenceStartWaiter?.resume()
+		mediaQuiescenceStartWaiter = nil
+		guard suspendMediaQuiescence else { return }
+		await withCheckedContinuation { mediaQuiescenceWaiters.append($0) }
+	}
+	func waitForMediaQuiescenceStart() async {
+		await withCheckedContinuation { mediaQuiescenceStartWaiter = $0 }
+	}
+	func resumeMediaQuiescence() {
+		let waiters = mediaQuiescenceWaiters
+		mediaQuiescenceWaiters.removeAll(keepingCapacity: false)
+		waiters.forEach { $0.resume() }
 	}
 	func clearAudioObservations() { audioStates.removeAll(); operationOrder.removeAll() }
 	func closeAndSettle() async {

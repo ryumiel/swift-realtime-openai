@@ -8,11 +8,12 @@ import FoundationNetworking
 
 final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
 	private static let trackCapacity = 1
-	private let condition = NSCondition()
+	private let lock = NSLock()
 	private var enabled: Bool
 	private var closed = false
 	private var tracks: [LKRTCMediaStreamTrack] = []
 	private var admittedCallbacks = 0
+	private var mediaQuiescenceWaiters: [CheckedContinuation<Void, Never>] = []
 	private let attemptedFrame: @Sendable () -> Void
 	private let admittedFrame: @Sendable () -> Void
 
@@ -27,7 +28,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func setEnabled(_ enabled: Bool) {
-		condition.withLock {
+		lock.withLock {
 			guard !closed else { return }
 			self.enabled = enabled
 			tracks.forEach { $0.isEnabled = enabled }
@@ -35,7 +36,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func register(_ candidates: [LKRTCMediaStreamTrack]) {
-		condition.withLock {
+		lock.withLock {
 			if closed {
 				candidates.filter { $0.kind == "audio" }.forEach { $0.isEnabled = false }
 				return
@@ -51,7 +52,7 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func unregister(_ candidates: [LKRTCMediaStreamTrack]) {
-		condition.withLock {
+		lock.withLock {
 			for candidate in candidates where candidate.kind == "audio" {
 				let retained = tracks.filter { $0.isEqual(candidate) }
 				retained.forEach {
@@ -64,17 +65,20 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 	}
 
 	func deliverIfAdmitted(_ delivery: () -> Void) {
-		let admitted = condition.withLock { () -> Bool in
+		let admitted = lock.withLock { () -> Bool in
 			guard !closed, enabled else { return false }
 			admittedCallbacks += 1
 			return true
 		}
 		guard admitted else { return }
 		delivery()
-		condition.withLock {
-			admittedCallbacks = max(0, admittedCallbacks - 1)
-			if admittedCallbacks == 0 { condition.broadcast() }
+		let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+			admittedCallbacks -= 1
+			guard admittedCallbacks == 0 else { return [] }
+			defer { mediaQuiescenceWaiters.removeAll(keepingCapacity: false) }
+			return mediaQuiescenceWaiters
 		}
+		waiters.forEach { $0.resume() }
 	}
 
 	func render(pcmBuffer _: AVAudioPCMBuffer) {
@@ -82,24 +86,54 @@ final class ProductionRemoteAudioAdmissionGate: NSObject, LKRTCAudioRenderer, @u
 		deliverIfAdmitted(admittedFrame)
 	}
 
+	func disableAudioAndWaitForMediaQuiescence() async {
+		disableAudio()
+		await waitForMediaQuiescence()
+	}
+
+	func closeAndWaitForMediaQuiescence() async {
+		close()
+		await waitForMediaQuiescence()
+	}
+
 	func close() {
-		condition.lock()
-		closed = true
-		enabled = false
-		tracks.forEach { $0.isEnabled = false }
-		while admittedCallbacks != 0 { condition.wait() }
-		condition.unlock()
+		lock.withLock {
+			closed = true
+			enabled = false
+			tracks.forEach { $0.isEnabled = false }
+		}
 	}
 
 	func releaseTracks() {
-		condition.withLock {
-			closed = true
-			enabled = false
+		lock.withLock {
 			tracks.forEach {
 				$0.isEnabled = false
 				($0 as? LKRTCAudioTrack)?.remove(self)
 			}
 			tracks.removeAll(keepingCapacity: false)
+		}
+	}
+
+	var isMediaDisabledForTesting: Bool {
+		lock.withLock { !enabled }
+	}
+
+	private func disableAudio() {
+		lock.withLock {
+			guard !closed else { return }
+			enabled = false
+			tracks.forEach { $0.isEnabled = false }
+		}
+	}
+
+	private func waitForMediaQuiescence() async {
+		await withCheckedContinuation { continuation in
+			let shouldResume = lock.withLock { () -> Bool in
+				guard admittedCallbacks != 0 else { return true }
+				mediaQuiescenceWaiters.append(continuation)
+				return false
+			}
+			if shouldResume { continuation.resume() }
 		}
 	}
 }
@@ -125,6 +159,15 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		}
 	}
 
+	func disableAudioAndWaitForMediaQuiescence() async {
+		let gate = lock.withLock { () -> ProductionRemoteAudioAdmissionGate? in
+			localTrack.isEnabled = false
+			remoteGate?.setEnabled(false)
+			return remoteGate
+		}
+		await gate?.disableAudioAndWaitForMediaQuiescence()
+	}
+
 	func close() {
 		let didClose = lock.withLock { () -> Bool in
 			guard !closed else { return false }
@@ -134,6 +177,10 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			return true
 		}
 		if didClose { didDisable() }
+	}
+
+	func waitForMediaQuiescence() async {
+		await remoteGate?.closeAndWaitForMediaQuiescence()
 	}
 
 	func releaseRemoteTracks() { remoteGate?.releaseTracks() }
@@ -479,6 +526,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 				Task { @MainActor [weak connector] in connector?.resumeProductionReadinessForTerminal() }
 				let task = Task { @MainActor [connector, gate] in
 					let selectedFailure = await gate.failureAfterAcceptedIngressDrains()
+					if closesProductionMedia { await connector.waitForProductionMediaQuiescence() }
 					await connector.completeTerminal(selectedFailure)
 				}
 				install(task)
@@ -798,6 +846,10 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		productionMediaCloser.set(state)
 	}
 
+	package func disableAudioAndWaitForMediaQuiescence() async {
+		await productionMediaCloser.disableAudioAndWaitForMediaQuiescence()
+	}
+
 	@_spi(AirbridgeQualification) public func sendSessionUpdate(
 		voice: String,
 		language: String
@@ -841,8 +893,9 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		terminalObserver.closeData()
 		connection.close()
 		terminalObserver.closePeer()
-		productionMediaCloser.releaseRemoteTracks()
 		productionMediaCloser.close()
+		await productionMediaCloser.waitForMediaQuiescence()
+		productionMediaCloser.releaseRemoteTracks()
 		Self.deactivateAudioSession()
 		preReadyInboundEvents.removeAll()
 		productionReadinessWaiter?.resume()
@@ -877,6 +930,10 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		guard productionSession == .openAI else { return false }
 		productionMediaCloser.close()
 		return true
+	}
+
+	nonisolated private func waitForProductionMediaQuiescence() async {
+		await productionMediaCloser.waitForMediaQuiescence()
 	}
 
 	nonisolated private var requiresSynchronousProductionMediaClosure: Bool {

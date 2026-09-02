@@ -644,6 +644,9 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 		if commandSendFails { throw SyntheticError() }
 	}
 	func setLocalAudioState(_ state: WebRTCLocalAudioState) { audioStates.append(state) }
+	func disableAudioAndWaitForMediaQuiescence() async {
+		if !audioStates.contains(.disabled) { audioStates.append(.disabled) }
+	}
 	func closeAndSettle() async { closeCount += 1 }
 	func emit(_ event: WebRTCConnectorPeerBackingEvent) { sink?(.success(event)) }
 	func emitRaw(_ json: String) {

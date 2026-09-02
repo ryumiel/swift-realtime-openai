@@ -72,6 +72,10 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	func clearOutputAudio() throws
 	func settleCancelledResponse() throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
+	/// Disables local audio and OpenAI remote-media admission, then waits for
+	/// already-admitted remote media callbacks to return. This does not close or
+	/// settle the peer; a later explicit `.enabled` state may admit media again.
+	func disableAudioAndWaitForMediaQuiescence() async
 	func closeAndJoin() async
 }
 
@@ -122,6 +126,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	func sendSessionConfiguration(_ data: Data) throws
 	func sendProductionCommand(_ command: ProductionCommand) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
+	func disableAudioAndWaitForMediaQuiescence() async
 	func closeAndSettle() async
 }
 
@@ -338,6 +343,10 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
 		guard !terminal, !settlementStarting, state == .disabled || connected else { return }
 		backing.setLocalAudioState(state)
+	}
+
+	package func disableAudioAndWaitForMediaQuiescence() async {
+		await backing.disableAudioAndWaitForMediaQuiescence()
 	}
 
 	package func closeAndJoin() async { await beginSettlement(failure: nil, origin: .explicitClose) }

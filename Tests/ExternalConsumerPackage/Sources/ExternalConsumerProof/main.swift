@@ -14,6 +14,7 @@ func exercise(_ peer: any WebRTCConnectorPeer, configuration: WebRTCSessionConfi
 	try peer.settleCancelledResponse()
 	peer.setLocalAudioState(.enabled)
 	peer.setLocalAudioState(.disabled)
+	await peer.disableAudioAndWaitForMediaQuiescence()
 	await peer.closeAndJoin()
 }
 
