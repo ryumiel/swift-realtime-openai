@@ -159,6 +159,12 @@ To manually send an event to the API, use the `send(event: RealtimeAPI.ClientEve
 
 Regular imports use `WebRTCConnectorPeerFactory` for the production WebRTC boundary. Provider identity and initial audio state are bound before any peer or media resource is created. LocalAI starts enabled; OpenAI starts disabled until its exact session acknowledgement has been received.
 
+For OpenAI, `.openAISessionCreated` means the creation event was accepted and
+the initial session configuration send returned successfully. Send failure,
+cancellation, or termination winning before event admission suppresses that
+milestone. `.openAISessionConfigured` remains the exact acknowledgement
+required before enabling media.
+
 ```swift
 import WebRTC
 

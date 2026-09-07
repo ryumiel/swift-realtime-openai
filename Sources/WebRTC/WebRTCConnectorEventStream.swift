@@ -127,6 +127,10 @@ extension WebRTCConnectorEventStream {
 		private var ownerProvider: (@Sendable () -> AnyObject?)?
 		private var suspendedOwner: AnyObject?
 
+		/// Cancellation closes admission before its settlement handler reaches
+		/// the peer. Observe that selection without changing mailbox policy.
+		var iteratorCancellationSelected: Bool { lock.withLock { iteratorCancelled } }
+
 		func installCancellationHandler(
 			owner: @escaping @Sendable () -> AnyObject?,
 			_ handler: @escaping @Sendable () -> Task<Void, Never>

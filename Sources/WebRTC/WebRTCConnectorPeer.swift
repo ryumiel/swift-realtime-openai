@@ -50,6 +50,7 @@ public struct WebRTCSessionConfiguration: Sendable, Equatable {
 public enum WebRTCConnectorEvent: Sendable, Equatable {
 	case ready
 	case localAISessionConfigured(voice: String, language: String)
+	/// Creation accepted and initial session configuration dispatched successfully.
 	case openAISessionCreated
 	case openAISessionConfigured(language: String)
 	case connected
@@ -428,8 +429,15 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			guard let event = try openAIState?.consume(data) else { return }
 			switch event {
 			case .sessionCreated:
+				guard !eventStorage.iteratorCancellationSelected else { throw WebRTCTransportFailure.cancelled }
+				do { try backing.sendSessionConfiguration(configuration.encoded()) }
+				catch {
+					// A reentrant backing terminal already owns settlement.
+					guard !terminal, !settlementStarting else { return }
+					throw error
+				}
+				guard !terminal, !settlementStarting else { return }
 				guard yield(.openAISessionCreated) else { return }
-				try backing.sendSessionConfiguration(configuration.encoded())
 			case .sessionAcknowledged:
 				guard yield(.openAISessionConfigured(language: configuration.language)) else { return }
 				connected = true
@@ -478,7 +486,10 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 
 	private func beginSettlement(failure: WebRTCTransportFailure?, origin: SettlementOrigin) async { await startSettlement(failure: failure, origin: origin).value }
 	@discardableResult private func startSettlement(failure: WebRTCTransportFailure?, origin: SettlementOrigin) -> Task<Void, Never> {
-		let failure = terminalSelection.failureForSettlement(failure)
+		// OpenAI dispatch can race mailbox cancellation before its settlement
+		// handler reaches this actor, including a rejected post-send offer.
+		let cancellationSelected = productionSession == .openAI && eventStorage.iteratorCancellationSelected
+		let failure = terminalSelection.failureForSettlement(cancellationSelected ? .cancelled : failure)
 		if let settlementTask {
 			if terminalFailure == nil, let failure, origin == .backing { terminalFailure = failure }
 			return settlementTask
