@@ -137,6 +137,89 @@ final class WebRTCSessionDispatchMilestoneTests: XCTestCase {
 		}
 	}
 
+	@MainActor func testTerminalBoundaryRejectsConcurrentCancellationAfterSnapshotAndAfterSelection() async throws {
+		for pauseAfterSelection in [false, true] {
+			for terminalFailure: WebRTCTransportFailure? in [nil, .providerError] {
+				let (peer, backing) = try await makePendingPeer()
+				var iterator = peer.events.makeAsyncIterator()
+				let ready = try await iterator.next()
+				XCTAssertTrue(ready == .ready)
+				let storage = peer.events.storage
+				let attempted = DispatchSemaphore(value: 0)
+				let returned = DispatchSemaphore(value: 0)
+				let contender: @Sendable () -> Void = {
+					DispatchQueue.global().async {
+						attempted.signal()
+						storage.cancelIterator()
+						returned.signal()
+					}
+					XCTAssertTrue(attempted.wait(timeout: .now() + 2) == .success)
+					// Both former gaps must retain the same storage lock. A
+					// cancellation contender cannot return until admission closes.
+					XCTAssertTrue(returned.wait(timeout: .now() + 0.05) == .timedOut)
+				}
+				storage.installTerminalSelectionHooks(
+					afterCancellationSnapshot: pauseAfterSelection ? nil : contender,
+					afterFailureSelection: pauseAfterSelection ? contender : nil
+				)
+				backing.duringSend = { backing.emitTerminal(terminalFailure) }
+				backing.emitCreation()
+				XCTAssertTrue(returned.wait(timeout: .now() + 2) == .success)
+				XCTAssertFalse(storage.iteratorCancellationSelected)
+				if let terminalFailure {
+					do {
+						_ = try await iterator.next()
+						XCTFail("Expected the terminal that won the atomic boundary")
+					} catch {
+						let matches = (error as? WebRTCTransportFailure) == terminalFailure
+						XCTAssertTrue(matches, "Late cancellation must retain the selected failure category")
+					}
+				} else {
+					let terminal = try await iterator.next()
+					XCTAssertTrue(terminal == .closed)
+				}
+				let end = try await iterator.next()
+				XCTAssertTrue(end == nil)
+				await peer.closeAndJoin()
+				XCTAssertTrue(backing.closeCount == 1)
+			}
+		}
+	}
+
+	@MainActor func testCancellationWinningAtomicBoundarySelectsSameFailureBeforeHandlerPublication() async throws {
+		for competingFailure: WebRTCTransportFailure? in [nil, .providerError] {
+			let storage = WebRTCConnectorEventStream.Storage()
+			let selection = ProductionTerminalSelection()
+			let stream = WebRTCConnectorEventStream(storage: storage)
+			let selected = DispatchSemaphore(value: 0)
+			let release = DispatchSemaphore(value: 0)
+			storage.installCancellationSelectionHook {
+				selected.signal()
+				release.wait()
+			}
+			let cancellation = Task.detached { storage.cancelIterator() }
+			XCTAssertTrue(selected.wait(timeout: .now() + 2) == .success)
+			// Cancellation owns storage before the terminal contender enters.
+			// The result must agree even before cancellation publishes its handler.
+			let failure = storage.beginTerminalSelection(using: selection, failure: competingFailure)
+			XCTAssertTrue(failure == .cancelled)
+			XCTAssertTrue(selection.cancellationWins())
+			XCTAssertTrue(storage.iteratorCancellationSelected)
+			XCTAssertFalse(storage.offer(.openAISessionCreated))
+			release.signal()
+			await cancellation.value
+			storage.finish(failure: failure)
+			var iterator = stream.makeAsyncIterator()
+			do {
+				_ = try await iterator.next()
+				XCTFail("Cancellation must own both the mailbox and terminal result")
+			} catch {
+				let matches = (error as? WebRTCTransportFailure) == .cancelled
+				XCTAssertTrue(matches)
+			}
+		}
+	}
+
 	@MainActor func testCancellationSelectedDuringSendBeforeHandlerPublicationSuppressesCreation() async throws {
 		for failSend in [false, true] {
 			for reentrantTerminal in [false, true] {

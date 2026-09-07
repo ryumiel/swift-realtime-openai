@@ -83,7 +83,7 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 /// Synchronously records whether caller cancellation beat terminal selection.
 /// Normal close remains a normal close, but a cancellation selected before any
 /// actor hop is preserved until settlement installs its public terminal.
-private final class ProductionTerminalSelection: @unchecked Sendable {
+final class ProductionTerminalSelection: @unchecked Sendable {
 	private enum State { case open, cancellation, selected }
 	private let lock = NSLock()
 	private var state: State = .open
@@ -486,10 +486,9 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 
 	private func beginSettlement(failure: WebRTCTransportFailure?, origin: SettlementOrigin) async { await startSettlement(failure: failure, origin: origin).value }
 	@discardableResult private func startSettlement(failure: WebRTCTransportFailure?, origin: SettlementOrigin) -> Task<Void, Never> {
-		// OpenAI dispatch can race mailbox cancellation before its settlement
-		// handler reaches this actor, including a rejected post-send offer.
-		let cancellationSelected = productionSession == .openAI && eventStorage.iteratorCancellationSelected
-		let failure = terminalSelection.failureForSettlement(cancellationSelected ? .cancelled : failure)
+		let failure = productionSession == .openAI
+			? eventStorage.beginTerminalSelection(using: terminalSelection, failure: failure)
+			: terminalSelection.failureForSettlement(failure)
 		if let settlementTask {
 			if terminalFailure == nil, let failure, origin == .backing { terminalFailure = failure }
 			return settlementTask

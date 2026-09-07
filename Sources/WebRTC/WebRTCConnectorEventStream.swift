@@ -124,6 +124,8 @@ extension WebRTCConnectorEventStream {
 		private var cancellationHandler: (@Sendable () -> Task<Void, Never>)?
 		private var cancellationSelectionHook: (@Sendable () -> Void)?
 		private var cancellationPublicationWaiterInstalledHook: (@Sendable () -> Void)?
+		private var terminalCancellationSnapshotHook: (@Sendable () -> Void)?
+		private var terminalFailureSelectionHook: (@Sendable () -> Void)?
 		private var ownerProvider: (@Sendable () -> AnyObject?)?
 		private var suspendedOwner: AnyObject?
 
@@ -147,6 +149,17 @@ extension WebRTCConnectorEventStream {
 
 		func installCancellationPublicationWaiterInstalledHook(_ hook: @escaping @Sendable () -> Void) {
 			lock.withLock { cancellationPublicationWaiterInstalledHook = hook }
+		}
+
+		/// One-shot, content-free hooks for deterministic critical-section tests.
+		func installTerminalSelectionHooks(
+			afterCancellationSnapshot: (@Sendable () -> Void)? = nil,
+			afterFailureSelection: (@Sendable () -> Void)? = nil
+		) {
+			lock.withLock {
+				terminalCancellationSnapshotHook = afterCancellationSnapshot
+				terminalFailureSelectionHook = afterFailureSelection
+			}
 		}
 
 		func claimIterator() -> Bool {
@@ -180,6 +193,31 @@ extension WebRTCConnectorEventStream {
 				guard case .open = phase else { return }
 				phase = .closing
 				pending.removeAll(keepingCapacity: false)
+			}
+		}
+
+		/// OpenAI terminal selection and iterator cancellation share this lock.
+		/// Hold it through both peer arbitration and admission closure so neither
+		/// owner can select a different winner in between. The nested lock order
+		/// is storage then terminal selection; terminal selection never calls storage.
+		func beginTerminalSelection(
+			using selection: ProductionTerminalSelection,
+			failure: WebRTCTransportFailure?
+		) -> WebRTCTransportFailure? {
+			lock.withLock {
+				let cancellationSelected = iteratorCancelled
+				let snapshotHook = terminalCancellationSnapshotHook
+				let selectionHook = terminalFailureSelectionHook
+				terminalCancellationSnapshotHook = nil
+				terminalFailureSelectionHook = nil
+				snapshotHook?()
+				let failure = selection.failureForSettlement(cancellationSelected ? .cancelled : failure)
+				selectionHook?()
+				if case .open = phase {
+					phase = .closing
+					pending.removeAll(keepingCapacity: false)
+				}
+				return failure
 			}
 		}
 
