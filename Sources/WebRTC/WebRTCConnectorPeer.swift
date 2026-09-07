@@ -125,6 +125,9 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	func makeOffer() async throws -> String
 	func apply(answer: String) async throws
 	func sendSessionConfiguration(_ data: Data) throws
+	/// Nil leaves a previously selected backing terminal in charge of notification.
+	/// False means semantic admission rejected the successfully dispatched milestone.
+	func dispatchOpenAIConfiguration(_ data: Data, offeringCreationTo storage: WebRTCConnectorEventStream.Storage) throws -> Bool?
 	func sendProductionCommand(_ command: ProductionCommand) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
 	func disableAudioForMediaQuiescence() -> UInt64?
@@ -134,6 +137,10 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 
 @MainActor package extension WebRTCConnectorPeerBacking {
 	func installProductionConfiguration() {}
+	func dispatchOpenAIConfiguration(_ data: Data, offeringCreationTo storage: WebRTCConnectorEventStream.Storage) throws -> Bool? {
+		try sendSessionConfiguration(data)
+		return storage.offer(.openAISessionCreated)
+	}
 }
 
 @MainActor public struct WebRTCConnectorPeerFactory: Sendable {
@@ -430,14 +437,18 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 			switch event {
 			case .sessionCreated:
 				guard !eventStorage.iteratorCancellationSelected else { throw WebRTCTransportFailure.cancelled }
-				do { try backing.sendSessionConfiguration(configuration.encoded()) }
+				let admitted: Bool?
+				do { admitted = try backing.dispatchOpenAIConfiguration(configuration.encoded(), offeringCreationTo: eventStorage) }
 				catch {
 					// A reentrant backing terminal already owns settlement.
 					guard !terminal, !settlementStarting else { return }
 					throw error
 				}
-				guard !terminal, !settlementStarting else { return }
-				guard yield(.openAISessionCreated) else { return }
+				guard !terminal, !settlementStarting, let admitted else { return }
+				guard admitted else {
+					startSettlement(failure: .ingressOverloaded, origin: .backing)
+					return
+				}
 			case .sessionAcknowledged:
 				guard yield(.openAISessionConfigured(language: configuration.language)) else { return }
 				connected = true

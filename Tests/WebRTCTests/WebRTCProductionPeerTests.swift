@@ -397,6 +397,139 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await connector.closeAndSettle()
 	}
 
+	@MainActor func testProductionBackingTerminalDuringConfigurationSendSuppressesCreationUntilIngressRetires() async throws {
+		for selectFailure in [false, true] {
+			for throwAfterSelection in [false, true] {
+				let retired = expectation(description: "creation ingress retires before terminal notification")
+				var semanticStorage: WebRTCConnectorEventStream.Storage?
+				var ingressRetired = false
+				let setup = try await makeRealProductionPeer(
+					provider: .openAI,
+					didRetireAcceptedIngress: {
+						ingressRetired = true
+						// No iterator is waiting yet. Both semantic slots must remain
+						// free until this accepted ingress retires. A premature creation
+						// would occupy one even if later terminal cleanup purges it.
+						if let semanticStorage {
+							XCTAssertTrue(semanticStorage.offer(.ready))
+							XCTAssertTrue(semanticStorage.offer(.ready), "Backing terminal loss must suppress creation admission")
+						} else { XCTFail("Expected the peer semantic storage") }
+						retired.fulfill()
+					}
+				)
+				var events = setup.eventStream.makeAsyncIterator()
+				let ready = try await events.next()
+				assertEventKind(.ready, ready)
+				semanticStorage = setup.eventStream.storage
+				try setup.peer.configure(.openAI(language: "en"))
+				var nativeSendSucceeded = false
+				setup.connector.installOpenAIConfigurationSendHookForTesting {
+					nativeSendSucceeded = true
+					XCTAssertFalse(ingressRetired)
+					if selectFailure {
+						setup.connector.receiveInbound(Data(repeating: 0, count: WebRTCTransportLimits.maximumPayloadBytes + 1))
+					} else {
+						setup.connector.receiveDataChannelState(isOpen: false, isTerminal: true)
+					}
+					XCTAssertTrue(setup.closes.dataCount == 0, "The accepted creation ingress still delays terminal notification")
+					XCTAssertFalse(ingressRetired)
+					if throwAfterSelection { throw FakeProductionBacking.ArbitraryError() }
+				}
+				setup.connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+				await fulfillment(of: [retired], timeout: 2)
+				XCTAssertTrue(nativeSendSucceeded)
+				// Join the already-selected backing terminal before reading so
+				// its notification has purged our capacity-probe markers.
+				await setup.connector.closeAndSettle()
+				if selectFailure {
+					do {
+						_ = try await events.next()
+						XCTFail("The selected backing failure must be the only published terminal")
+					} catch {
+						let matches = (error as? WebRTCTransportFailure) == .responseTooLarge
+						XCTAssertTrue(matches, "A later dispatch error cannot replace the backing failure")
+					}
+				} else {
+					let terminal = try await events.next()
+					assertEventKind(.closed, terminal)
+				}
+				let end = try await events.next()
+				assertNoEvent(end)
+				await setup.peer.closeAndJoin()
+				XCTAssertTrue(setup.closes.dataCount == 1)
+				XCTAssertTrue(setup.closes.peerCount == 1)
+				setup.remoteConnection.close()
+			}
+		}
+	}
+
+	@MainActor func testProductionBackingConfigurationDispatchFailureWithoutTerminalRemainsContentFree() async throws {
+		let setup = try await makeRealProductionPeer(provider: .openAI)
+		var events = setup.eventStream.makeAsyncIterator()
+		let ready = try await events.next()
+		assertEventKind(.ready, ready)
+		try setup.peer.configure(.openAI(language: "en"))
+		var nativeSendSucceeded = false
+		setup.connector.installOpenAIConfigurationSendHookForTesting {
+			nativeSendSucceeded = true
+			throw FakeProductionBacking.ArbitraryError()
+		}
+		setup.connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+		do {
+			_ = try await events.next()
+			XCTFail("Failed dispatch must suppress creation")
+		} catch {
+			let matches = (error as? WebRTCTransportFailure) == .requestFailed
+			XCTAssertTrue(matches, "An ordinary send failure retains its content-free category")
+		}
+		XCTAssertTrue(nativeSendSucceeded)
+		let end = try await events.next()
+		assertNoEvent(end)
+		await setup.peer.closeAndJoin()
+		XCTAssertTrue(setup.closes.dataCount == 1)
+		XCTAssertTrue(setup.closes.peerCount == 1)
+		setup.remoteConnection.close()
+	}
+
+	@MainActor func testProductionBackingCreationMailboxRejectionPreservesCancellationAndOverflow() async throws {
+		for cancelIterator in [false, true] {
+			let retired = expectation(description: "rejected creation ingress retires")
+			let setup = try await makeRealProductionPeer(
+				provider: .openAI,
+				didRetireAcceptedIngress: { retired.fulfill() }
+			)
+			var events = setup.eventStream.makeAsyncIterator()
+			let ready = try await events.next()
+			assertEventKind(.ready, ready)
+			try setup.peer.configure(.openAI(language: "en"))
+			let storage = setup.eventStream.storage
+			var nativeSendSucceeded = false
+			setup.connector.installOpenAIConfigurationSendHookForTesting {
+				nativeSendSucceeded = true
+				if cancelIterator { storage.cancelIterator() }
+				else {
+					XCTAssertTrue(storage.offer(.ready))
+					XCTAssertTrue(storage.offer(.ready))
+				}
+			}
+			setup.connector.receiveInbound(Data(#"{"type":"session.created"}"#.utf8))
+			await fulfillment(of: [retired], timeout: 2)
+			do {
+				_ = try await events.next()
+				XCTFail("Rejected creation admission must settle with its existing category")
+			} catch {
+				let expected: WebRTCTransportFailure = cancelIterator ? .cancelled : .ingressOverloaded
+				let matches = (error as? WebRTCTransportFailure) == expected
+				XCTAssertTrue(matches)
+			}
+			XCTAssertTrue(nativeSendSucceeded)
+			await setup.peer.closeAndJoin()
+			XCTAssertTrue(setup.closes.dataCount == 1)
+			XCTAssertTrue(setup.closes.peerCount == 1)
+			setup.remoteConnection.close()
+		}
+	}
+
 	@MainActor func testRealLocalAIConnectorPreservesConfigurationDispatchCausality() async throws {
 		let exact = Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Ono_Anna"}}}}"#.utf8)
 		let mismatch = Data(#"{"type":"session.updated","session":{"type":"realtime","audio":{"input":{"transcription":{"language":"ja"}},"output":{"voice":"Other"}}}}"#.utf8)
@@ -404,7 +537,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 
 		for payload in [exact, mismatch, malformed] {
 			let drained = expectation(description: "pre-dispatch acknowledgement entered the authoritative mailbox")
-			let setup = try await makeRealLocalAIPeer(didDrainInbound: { drained.fulfill() })
+			let setup = try await makeRealProductionPeer(didDrainInbound: { drained.fulfill() })
 			var events = setup.eventStream.makeAsyncIterator()
 			let ready = try await events.next()
 			assertEventKind(.ready, ready)
@@ -426,7 +559,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 
 		do {
-			let setup = try await makeRealLocalAIPeer()
+			let setup = try await makeRealProductionPeer()
 			var events = setup.eventStream.makeAsyncIterator()
 			let ready = try await events.next()
 			assertEventKind(.ready, ready)
@@ -444,7 +577,7 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 
 		do {
-			let setup = try await makeRealLocalAIPeer()
+			let setup = try await makeRealProductionPeer()
 			var events = setup.eventStream.makeAsyncIterator()
 			let ready = try await events.next()
 			assertEventKind(.ready, ready)
@@ -1719,8 +1852,10 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		return (peer, backing)
 	}
 
-	@MainActor private func makeRealLocalAIPeer(
-		didDrainInbound: @escaping () -> Void = {}
+	@MainActor private func makeRealProductionPeer(
+		provider: WebRTCSessionProvider = .localAI,
+		didDrainInbound: @escaping () -> Void = {},
+		didRetireAcceptedIngress: @escaping () -> Void = {}
 	) async throws -> (
 		connector: WebRTCConnector,
 		peer: any WebRTCConnectorPeer,
@@ -1730,8 +1865,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 	) {
 		let closes = ProductionCloseCounter()
 		let connector = try WebRTCConnector.createProduction(
-			provider: .localAI,
-			initialAudioState: .enabled,
+			provider: provider,
+			initialAudioState: provider == .openAI ? .disabled : .enabled,
 			session: ProductionStubSession(),
 			terminalObserver: .init(
 				cancelSignaling: {},
@@ -1739,7 +1874,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 				closePeer: { closes.recordPeer() },
 				disableAudio: {},
 				recordPermissionGranted: { true },
-				didDrainInbound: didDrainInbound
+				didDrainInbound: didDrainInbound,
+				didRetireAcceptedIngress: didRetireAcceptedIngress
 			)
 		)
 		let factory = LKRTCPeerConnectionFactory()
@@ -1749,8 +1885,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 			delegate: nil
 		))
 		let peer = try WebRTCConnectorPeerFactory(
-			provider: .localAI,
-			initialAudioState: .enabled,
+			provider: provider,
+			initialAudioState: provider == .openAI ? .disabled : .enabled,
 			makePeer: { connector }
 		).makePeer()
 		let offer = try await peer.makeOffer()

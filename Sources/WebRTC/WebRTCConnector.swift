@@ -347,6 +347,22 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 			}
 		}
 
+		/// Dispatch completion and creation admission are ordered against backing
+		/// terminal selection. Refusal preserves the original terminal and its
+		/// accepted-ingress drain; it must not become a new peer failure.
+		func completeOpenAIConfigurationDispatch(
+			_ dispatch: Result<Void, any Error>,
+			offeringCreationTo storage: WebRTCConnectorEventStream.Storage
+		) throws -> Bool? {
+			try lock.withLock {
+				guard case .open = state else { return nil }
+				try dispatch.get()
+				// Lock order: backing terminal gate, then semantic storage.
+				// Storage never synchronously calls the backing gate.
+				return storage.offer(.openAISessionCreated)
+			}
+		}
+
 		func request(_ failure: WebRTCTransportFailure?, connector: WebRTCConnector) -> Task<Void, Never>? {
 			let closesProductionMedia = connector.requiresSynchronousProductionMediaClosure
 			let reservation = lock.withLock {
@@ -681,6 +697,7 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 	private var productionReadinessWaiter: CheckedContinuation<Void, Never>?
 	private var productionConfigurationWaiter: CheckedContinuation<Void, Never>?
 	private var productionConfigurationInstalled = false
+	private var openAIConfigurationSendHook: (() throws -> Void)?
 	private var productionDeliveryCancelled = false
 	package static let inboundMailboxCapacity = 32
 	private enum PreReadyInboundEvent {
@@ -835,6 +852,21 @@ private final class ProductionMediaCloser: @unchecked Sendable {
 		guard dataChannel.sendData(LKRTCDataBuffer(data: data, isBinary: false)) else {
 			throw WebRTCTransportFailure.requestFailed
 		}
+		if productionSession == .openAI {
+			let hook = openAIConfigurationSendHook
+			openAIConfigurationSendHook = nil
+			try hook?()
+		}
+	}
+
+	/// One-shot content-free hook after native send success, before dispatch returns.
+	package func installOpenAIConfigurationSendHookForTesting(_ hook: @escaping () throws -> Void) {
+		openAIConfigurationSendHook = hook
+	}
+
+	package func dispatchOpenAIConfiguration(_ data: Data, offeringCreationTo storage: WebRTCConnectorEventStream.Storage) throws -> Bool? {
+		let dispatch = Result { try sendSessionConfiguration(data) }
+		return try terminalGate.completeOpenAIConfigurationDispatch(dispatch, offeringCreationTo: storage)
 	}
 
 	package func installProductionEventSink(_ sink: @escaping @MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void) {
