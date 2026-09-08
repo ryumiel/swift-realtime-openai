@@ -21,6 +21,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 		var terminalObserved: Bool
 		var disposition: WebRTCOpenAICancelDisposition?
 		var outputCleared: Bool
+		let preservesPendingCreate: Bool
 	}
 	package enum CancellationDecision: Sendable, Equatable { case send(String), sent, alreadyCompleted }
 	private enum Epoch: Sendable {
@@ -99,12 +100,15 @@ package struct OpenAIProductionStateMachine: Sendable {
 		guard phase == .active else { throw WebRTCTransportFailure.invalidRequest }
 		switch epoch {
 		case let .active(response) where response.token == token:
-			epoch = .reserved(Reservation(response: response, terminalObserved: false, disposition: nil, outputCleared: false))
-		case .none where mostRecentCompleted?.token == token,
-			.creating where mostRecentCompleted?.token == token:
+			epoch = .reserved(Reservation(response: response, terminalObserved: false, disposition: nil, outputCleared: false, preservesPendingCreate: false))
+		case .none where mostRecentCompleted?.token == token:
 			guard let response = mostRecentCompleted else { throw WebRTCTransportFailure.invalidRequest }
 			mostRecentCompleted = nil
-			epoch = .reserved(Reservation(response: response, terminalObserved: true, disposition: nil, outputCleared: false))
+			epoch = .reserved(Reservation(response: response, terminalObserved: true, disposition: nil, outputCleared: false, preservesPendingCreate: false))
+		case .creating where mostRecentCompleted?.token == token:
+			guard let response = mostRecentCompleted else { throw WebRTCTransportFailure.invalidRequest }
+			mostRecentCompleted = nil
+			epoch = .reserved(Reservation(response: response, terminalObserved: true, disposition: nil, outputCleared: false, preservesPendingCreate: true))
 		default: throw WebRTCTransportFailure.invalidRequest
 		}
 	}
@@ -137,7 +141,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 		guard case let .reserved(reservation) = epoch, reservation.response.token == token,
 			let disposition = reservation.disposition, reservation.outputCleared
 		else { throw WebRTCTransportFailure.invalidRequest }
-		epoch = .none
+		epoch = reservation.preservesPendingCreate ? .creating : .none
 		return disposition
 	}
 

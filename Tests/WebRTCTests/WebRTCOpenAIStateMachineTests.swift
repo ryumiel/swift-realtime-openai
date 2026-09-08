@@ -538,6 +538,9 @@ struct WebRTCOpenAIStateMachineTests {
 		#expect(try machine.shouldDispatchOutputClear(for: token))
 		try machine.recordOutputClear(for: token)
 		#expect(try machine.settleReservation(for: token) == .alreadyCompleted)
+		assertFailure(.invalidRequest) { try machine.prepareCreateResponse() }
+		let successor = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r2"}}"#.utf8))
+		#expect(try stateMachineResponseToken(successor) != token)
 	}
 
 	@Test("reservation targets the active response once and records media-wait completion")
