@@ -5,19 +5,31 @@ package enum OpenAIProductionEvent: Sendable, Equatable {
 	case sessionAcknowledged
 	case userTranscript(String)
 	case assistantTranscript(String)
-	case responseStarted
-	case responseFinished
-	case cancellationTerminalObserved
+	case openAIResponse(WebRTCOpenAIResponseEvent)
 }
 
 /// Peer-local, content-discarding OpenAI event policy. Operation deadlines and
 /// predecessor-output quiescence deliberately remain caller-owned.
 package struct OpenAIProductionStateMachine: Sendable {
 	private enum Phase: Sendable { case awaitingCreation, awaitingAcknowledgement, active, invalidated }
-	private enum Epoch: Sendable { case none, creating, active(String), cancelling(String, terminalObserved: Bool) }
+	private struct Response: Sendable {
+		let token: WebRTCOpenAIResponseToken
+		let wireID: String
+	}
+	private struct Reservation: Sendable {
+		let response: Response
+		var terminalObserved: Bool
+		var disposition: WebRTCOpenAICancelDisposition?
+		var outputCleared: Bool
+	}
+	package enum CancellationDecision: Sendable, Equatable { case send(String), sent, alreadyCompleted }
+	private enum Epoch: Sendable {
+		case none, creating, active(Response), legacyCancelling(Response, terminalObserved: Bool), reserved(Reservation)
+	}
 	private let language: String
 	private var phase: Phase = .awaitingCreation
 	private var epoch: Epoch = .none
+	private var mostRecentCompleted: Response?
 	private var eventCount = 0
 	private var aggregateBytes = 0
 	private var seenResponseIDs: Set<String> = []
@@ -32,6 +44,7 @@ package struct OpenAIProductionStateMachine: Sendable {
 	package mutating func invalidate() {
 		phase = .invalidated
 		epoch = .none
+		mostRecentCompleted = nil
 		seenResponseIDs.removeAll(keepingCapacity: false)
 	}
 
@@ -73,13 +86,58 @@ package struct OpenAIProductionStateMachine: Sendable {
 	}
 
 	package mutating func prepareCancelResponse() throws {
-		guard phase == .active, case let .active(id) = epoch else { throw WebRTCTransportFailure.invalidRequest }
-		epoch = .cancelling(id, terminalObserved: false)
+		guard phase == .active, case let .active(response) = epoch else { throw WebRTCTransportFailure.invalidRequest }
+		epoch = .legacyCancelling(response, terminalObserved: false)
 	}
 
 	package mutating func settleCancelledResponse() throws {
-		guard phase == .active, case .cancelling = epoch else { throw WebRTCTransportFailure.invalidRequest }
+		guard phase == .active, case .legacyCancelling = epoch else { throw WebRTCTransportFailure.invalidRequest }
 		epoch = .none
+	}
+
+	package mutating func reserveCancellation(for token: WebRTCOpenAIResponseToken) throws {
+		guard phase == .active else { throw WebRTCTransportFailure.invalidRequest }
+		switch epoch {
+		case let .active(response) where response.token == token:
+			epoch = .reserved(Reservation(response: response, terminalObserved: false, disposition: nil, outputCleared: false))
+		case .none where mostRecentCompleted?.token == token:
+			guard let response = mostRecentCompleted else { throw WebRTCTransportFailure.invalidRequest }
+			mostRecentCompleted = nil
+			epoch = .reserved(Reservation(response: response, terminalObserved: true, disposition: nil, outputCleared: false))
+		default: throw WebRTCTransportFailure.invalidRequest
+		}
+	}
+
+	package func cancellationDecision(for token: WebRTCOpenAIResponseToken) throws -> CancellationDecision {
+		guard case let .reserved(reservation) = epoch, reservation.response.token == token else { throw WebRTCTransportFailure.invalidRequest }
+		if let disposition = reservation.disposition { return disposition == .sent ? .sent : .alreadyCompleted }
+		return reservation.terminalObserved ? .alreadyCompleted : .send(reservation.response.wireID)
+	}
+
+	package mutating func recordCancellationDisposition(_ disposition: WebRTCOpenAICancelDisposition, for token: WebRTCOpenAIResponseToken) throws {
+		guard case var .reserved(reservation) = epoch, reservation.response.token == token else { throw WebRTCTransportFailure.invalidRequest }
+		guard reservation.disposition == nil || reservation.disposition == disposition else { throw WebRTCTransportFailure.invalidRequest }
+		reservation.disposition = disposition
+		epoch = .reserved(reservation)
+	}
+
+	package func shouldDispatchOutputClear(for token: WebRTCOpenAIResponseToken) throws -> Bool {
+		guard case let .reserved(reservation) = epoch, reservation.response.token == token, reservation.disposition != nil else { throw WebRTCTransportFailure.invalidRequest }
+		return !reservation.outputCleared
+	}
+
+	package mutating func recordOutputClear(for token: WebRTCOpenAIResponseToken) throws {
+		guard case var .reserved(reservation) = epoch, reservation.response.token == token, reservation.disposition != nil else { throw WebRTCTransportFailure.invalidRequest }
+		reservation.outputCleared = true
+		epoch = .reserved(reservation)
+	}
+
+	package mutating func settleReservation(for token: WebRTCOpenAIResponseToken) throws -> WebRTCOpenAICancelDisposition {
+		guard case let .reserved(reservation) = epoch, reservation.response.token == token,
+			let disposition = reservation.disposition, reservation.outputCleared
+		else { throw WebRTCTransportFailure.invalidRequest }
+		epoch = .none
+		return disposition
 	}
 
 	private func phaseFailure(for type: String) -> WebRTCTransportFailure {
@@ -110,12 +168,14 @@ package struct OpenAIProductionStateMachine: Sendable {
 			let response = try root.requiredObject("response")
 			let id = try response.requiredIdentifier("id")
 			let mayOpen: Bool
-			switch epoch { case .none, .creating: mayOpen = true; case .active, .cancelling: mayOpen = false }
+			switch epoch { case .none, .creating: mayOpen = true; case .active, .legacyCancelling, .reserved: mayOpen = false }
 			guard mayOpen, !seenResponseIDs.contains(id) else { throw WebRTCTransportFailure.providerError }
 			guard seenResponseIDs.count < 4_096 else { throw WebRTCTransportFailure.responseTooLarge }
 			seenResponseIDs.insert(id)
-			epoch = .active(id)
-			return .responseStarted
+			mostRecentCompleted = nil
+			let openedResponse = Response(token: WebRTCOpenAIResponseToken(), wireID: id)
+			epoch = .active(openedResponse)
+			return .openAIResponse(.started(openedResponse.token))
 		case "response.output_item.added", "response.output_item.done":
 			let id = try root.requiredIdentifier("response_id")
 			_ = try requireCorrelated(id)
@@ -149,7 +209,10 @@ package struct OpenAIProductionStateMachine: Sendable {
 			_ = try root.requiredNonnegativeInteger("output_index")
 			_ = try root.requiredNonnegativeInteger("content_index")
 			let transcript = try root.requiredString("transcript", maximumBytes: 8 * 1024, nonempty: false)
-			return disposition == .deliver ? .assistantTranscript(transcript) : nil
+			switch disposition {
+			case let .deliver(token): return .openAIResponse(.assistantTranscript(token, transcript))
+			case .suppress: return nil
+			}
 		case "rate_limits.updated":
 			try validateRateLimits(root)
 			return nil
@@ -160,12 +223,13 @@ package struct OpenAIProductionStateMachine: Sendable {
 		}
 	}
 
-	private enum CorrelationDisposition { case deliver, suppress }
+	private enum CorrelationDisposition { case deliver(WebRTCOpenAIResponseToken), suppress }
 
 	private func requireCorrelated(_ id: String) throws -> CorrelationDisposition {
 		switch epoch {
-		case let .active(active) where active == id: return .deliver
-		case let .cancelling(active, _) where active == id: return .suppress
+		case let .active(active) where active.wireID == id: return .deliver(active.token)
+		case let .legacyCancelling(active, _) where active.wireID == id: return .suppress
+		case let .reserved(reservation) where reservation.response.wireID == id: return .suppress
 		default: throw WebRTCTransportFailure.providerError
 		}
 	}
@@ -184,15 +248,22 @@ package struct OpenAIProductionStateMachine: Sendable {
 			throw WebRTCTransportFailure.malformedEvent
 		}
 		switch epoch {
-		case let .active(active) where active == id:
+		case let .active(active) where active.wireID == id:
 			if status == "failed" || status == "incomplete" { throw WebRTCTransportFailure.providerError }
 			epoch = .none
-			return .responseFinished
-		case let .cancelling(active, terminalObserved) where active == id:
+			mostRecentCompleted = active
+			return .openAIResponse(.finished(active.token))
+		case let .legacyCancelling(active, terminalObserved) where active.wireID == id:
 			guard !terminalObserved else { throw WebRTCTransportFailure.providerError }
 			if status == "failed" || status == "incomplete" { throw WebRTCTransportFailure.providerError }
-			epoch = .cancelling(active, terminalObserved: true)
-			return .cancellationTerminalObserved
+			epoch = .legacyCancelling(active, terminalObserved: true)
+			return .openAIResponse(.cancellationTerminalObserved(active.token))
+		case var .reserved(reservation) where reservation.response.wireID == id:
+			guard !reservation.terminalObserved else { throw WebRTCTransportFailure.providerError }
+			if status == "failed" || status == "incomplete" { throw WebRTCTransportFailure.providerError }
+			reservation.terminalObserved = true
+			epoch = .reserved(reservation)
+			return .openAIResponse(.cancellationTerminalObserved(reservation.response.token))
 		default:
 			throw WebRTCTransportFailure.providerError
 		}

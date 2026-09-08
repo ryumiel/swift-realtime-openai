@@ -203,15 +203,18 @@ func runOpenAISession() async throws {
 }
 ```
 
-To cancel a response, first await
-`disableAudioAndWaitForMediaQuiescence()`: it synchronously disables audio and
-awaits fork-owned media quiescence. This does not close the peer and is distinct
-from peer-wide settlement. Next call `cancelResponse()`, then
-`clearOutputAudio()` in that order. Establish or join the caller-owned bounded
-predecessor semantic-delivery rendezvous, then call
-`settleCancelledResponse()` before admitting a successor response.
-`.responseCancellationTerminalObserved` is an optional correlated signal; by
-itself it is neither necessary nor sufficient for that rendezvous. The legacy
+OpenAI response lifecycle now arrives as `.openAIResponse(...)` with an opaque
+`WebRTCOpenAIResponseToken`. To cancel, reserve that exact token before awaiting
+`disableAudioAndWaitForMediaQuiescence()`: reservation is local-only and
+prevents a newer response from being substituted. After media quiescence, call
+`cancelResponse(reservation:)`, then `clearOutputAudio(reservation:)`; the
+former may report `.alreadyCompleted` when the reserved response completed
+during the wait. Establish or join the caller-owned bounded predecessor
+semantic-delivery rendezvous, then call `settleCancelledResponse(reservation:)`
+before admitting a successor response. The output clear remains a shared
+provider command and has no response selector. These added enum cases require
+exhaustive event switches to handle `.openAIResponse`; LocalAI event behavior
+is unchanged. The legacy
 `RealtimeAPI.webRTC` credential and signaling helpers are qualification-only
 SPI and are unavailable to ordinary imports. WebSocket sources are retained
 outside the package's published product graph and are not part of this

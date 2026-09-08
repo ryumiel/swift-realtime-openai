@@ -8,12 +8,23 @@ final class ExternalProductionImportProof: XCTestCase {
 		let configuration = try WebRTCSessionConfiguration.localAI(voice: "Ono_Anna", language: "ja")
 		let openAIConfiguration = try WebRTCSessionConfiguration.openAI(language: "en")
 		let _: WebRTCConnectorEvent = .ready
+		let _: WebRTCOpenAIResponseEvent? = nil
+		let _: WebRTCOpenAIResponseToken? = nil
+		let _: WebRTCOpenAICancellationReservation? = nil
+		let _: WebRTCOpenAICancelDisposition = .sent
 		let _: WebRTCLocalAudioState = .enabled
 		let _: WebRTCSessionProvider = .openAI
 		_ = factory
 		_ = openAIFactory
 		_ = configuration
 		_ = openAIConfiguration
+	}
+
+	@MainActor func exerciseReservation(_ peer: any WebRTCConnectorPeer, token: WebRTCOpenAIResponseToken) throws {
+		let reservation = try peer.reserveCancellation(for: token)
+		_ = try peer.cancelResponse(reservation: reservation)
+		try peer.clearOutputAudio(reservation: reservation)
+		try peer.settleCancelledResponse(reservation: reservation)
 	}
 
 	@MainActor func exercise(_ peer: any WebRTCConnectorPeer, configuration: WebRTCSessionConfiguration) async throws {

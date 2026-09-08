@@ -23,6 +23,14 @@ func exerciseOpenAI(_ peer: any WebRTCConnectorPeer) async throws {
 	try await exercise(peer, configuration: .openAI(language: "en"))
 }
 
+@MainActor
+func exerciseReservation(_ peer: any WebRTCConnectorPeer, token: WebRTCOpenAIResponseToken) throws {
+	let reservation = try peer.reserveCancellation(for: token)
+	_ = try peer.cancelResponse(reservation: reservation)
+	try peer.clearOutputAudio(reservation: reservation)
+	try peer.settleCancelledResponse(reservation: reservation)
+}
+
 @main struct ExternalConsumerProof {
 	static func main() async throws {
 		let _: WebRTCSessionProvider = .localAI

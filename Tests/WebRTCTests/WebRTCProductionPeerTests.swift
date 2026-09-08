@@ -6,6 +6,14 @@ import LiveKitWebRTC
 import XCTest
 
 final class WebRTCProductionPeerTests: XCTestCase {
+	func testTargetedOpenAICancelEncodingCarriesOnlyTheInternalResponseSelector() throws {
+		let data = try ProductionCommand.cancelResponseTargeted("response-e").encoded()
+		let command = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+		XCTAssertEqual(command["type"] as? String, "response.cancel")
+		XCTAssertEqual(command["response_id"] as? String, "response-e")
+		XCTAssertEqual(command.count, 2)
+	}
+
 	@MainActor func testPublicMediaQuiescenceDisablesWithoutClosingAndJoinsEveryConcurrentWaiter() async throws {
 		let backing = FakeProductionBacking(suspendMediaQuiescence: true)
 		let peer = try WebRTCConnectorPeerFactory(
