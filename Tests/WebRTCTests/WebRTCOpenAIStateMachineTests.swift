@@ -322,6 +322,7 @@ struct WebRTCOpenAIStateMachineTests {
 		try machine.prepareCreateResponse()
 		let startedEvent = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8))
 		assertEventKind(.responseStarted, startedEvent)
+		let startedToken = try stateMachineResponseToken(startedEvent)
 		let addedEvent = try machine.consume(Data(#"{"type":"response.output_item.added","response_id":"r1","output_index":0,"item":{"id":"a","type":"message","role":"assistant","status":"in_progress","content":[]}}"#.utf8))
 		assertNoEvent(addedEvent)
 		let contentEvent = try machine.consume(Data(#"{"type":"response.content_part.added","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"part":{"type":"audio"}}"#.utf8))
@@ -340,11 +341,17 @@ struct WebRTCOpenAIStateMachineTests {
 		assertNoEvent(itemDoneEvent)
 		let transcriptDoneEvent = try machine.consume(Data(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"answer"}"#.utf8))
 		assertEventKind(.assistantTranscript, transcriptDoneEvent)
+		guard case let .openAIResponse(.assistantTranscript(transcriptToken, _)) = transcriptDoneEvent else {
+			Issue.record("Transcript must remain response-scoped")
+			return
+		}
+		#expect(transcriptToken == startedToken)
 		try machine.prepareCancelResponse()
 		let suppressedEvent = try machine.consume(Data(#"{"type":"response.output_audio_transcript.done","response_id":"r1","item_id":"a","output_index":0,"content_index":0,"transcript":"suppressed"}"#.utf8))
 		assertNoEvent(suppressedEvent)
 		let cancellationEvent = try machine.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"cancelled"}}"#.utf8))
 		assertEventKind(.cancellationTerminalObserved, cancellationEvent)
+		#expect(try stateMachineResponseToken(cancellationEvent) == startedToken)
 		#expect(throws: WebRTCTransportFailure.invalidRequest) { try machine.prepareCreateResponse() }
 		try machine.settleCancelledResponse()
 		try machine.prepareCreateResponse()
@@ -416,6 +423,24 @@ struct WebRTCOpenAIStateMachineTests {
 		#expect(backing.commandTypes == ["output_audio_buffer.clear"])
 	}
 
+	@Test("completed response remains reservable while a create command awaits its next accepted start")
+	func completedResponseReservationSurvivesPendingCreate() throws {
+		var machine = try activeMachine()
+		try machine.prepareCreateResponse()
+		let started = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8))
+		let token = try stateMachineResponseToken(started)
+		let finished = try machine.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"completed"}}"#.utf8))
+		#expect(try stateMachineResponseToken(finished) == token)
+
+		try machine.prepareCreateResponse()
+		try machine.reserveCancellation(for: token)
+		#expect(try machine.cancellationDecision(for: token) == .alreadyCompleted)
+		try machine.recordCancellationDisposition(.alreadyCompleted, for: token)
+		#expect(try machine.shouldDispatchOutputClear(for: token))
+		try machine.recordOutputClear(for: token)
+		#expect(try machine.settleReservation(for: token) == .alreadyCompleted)
+	}
+
 	@Test("reservation targets the active response once and records media-wait completion")
 	func reservationTargetsExactResponseAndObservesCompletionDuringMediaWait() async throws {
 		let backing = OpenAIBacking(suspendMediaQuiescence: true)
@@ -445,6 +470,7 @@ struct WebRTCOpenAIStateMachineTests {
 		backing.emitRaw(#"{"type":"response.created","response":{"id":"r2"}}"#)
 		let activeToken = try responseToken(try await events.next())
 		let activeReservation = try peer.reserveCancellation(for: activeToken)
+		assertFailure(.invalidRequest) { _ = try peer.reserveCancellation(for: WebRTCOpenAIResponseToken()) }
 		assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: activeReservation) }
 		#expect(backing.commandTypes == ["output_audio_buffer.clear"])
 		#expect(try peer.cancelResponse(reservation: activeReservation) == .sent)
@@ -452,7 +478,8 @@ struct WebRTCOpenAIStateMachineTests {
 		try peer.clearOutputAudio(reservation: activeReservation)
 		try peer.settleCancelledResponse(reservation: activeReservation)
 		#expect(backing.commandTypes == ["output_audio_buffer.clear", "response.cancel", "output_audio_buffer.clear"])
-		#expect(backing.commandResponseIDs == ["r2"])
+		let targetedExactlyOnce = backing.commandResponseIDs.count == 1 && backing.commandResponseIDs.first == "r2"
+		#expect(targetedExactlyOnce)
 	}
 
 	@Test("all OpenAI command send failures settle content free")
@@ -479,6 +506,31 @@ struct WebRTCOpenAIStateMachineTests {
 		}
 	}
 
+	@Test("reservation-specific cancellation and clear send failures settle content free")
+	func reservationCommandFailuresSettle() async throws {
+		for failingCommand in ["response.cancel", "output_audio_buffer.clear"] {
+			let backing = OpenAIBacking(failingCommandTypes: [failingCommand])
+			let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
+			var events = peer.events.makeAsyncIterator()
+			_ = try await peer.makeOffer()
+			try await peer.apply(remoteAnswer: "answer")
+			backing.emit(.ready); _ = try await events.next()
+			try peer.configure(.openAI(language: "en"))
+			backing.emitRaw(#"{"type":"session.created"}"#); _ = try await events.next()
+			backing.emitRaw(Self.acknowledgement(language: "en")); _ = try await events.next()
+			backing.emitRaw(#"{"type":"response.created","response":{"id":"r"}}"#)
+			let reservation = try peer.reserveCancellation(for: responseToken(try await events.next()))
+			if failingCommand == "response.cancel" {
+				assertFailure(.requestFailed) { _ = try peer.cancelResponse(reservation: reservation) }
+			} else {
+				_ = try peer.cancelResponse(reservation: reservation)
+				assertFailure(.requestFailed) { try peer.clearOutputAudio(reservation: reservation) }
+			}
+			await peer.closeAndJoin()
+			#expect(backing.closeCount == 1)
+		}
+	}
+
 	@Test("server VAD may open a response without an explicit create command")
 	func serverVADOpensResponseEpoch() throws {
 		var machine = try activeMachine()
@@ -486,6 +538,43 @@ struct WebRTCOpenAIStateMachineTests {
 		assertEventKind(.responseStarted, startedEvent)
 		let finishedEvent = try machine.consume(Data(#"{"type":"response.done","response":{"id":"server-vad","status":"completed"}}"#.utf8))
 		assertEventKind(.responseFinished, finishedEvent)
+		#expect(try stateMachineResponseToken(startedEvent) == stateMachineResponseToken(finishedEvent))
+	}
+
+	@Test("newer accepted response invalidates a completed token before its first reservation")
+	func newerResponseMakesCompletedTokenStaleBeforeReservation() throws {
+		var machine = try activeMachine()
+		try machine.prepareCreateResponse()
+		let first = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8))
+		let firstToken = try stateMachineResponseToken(first)
+		_ = try machine.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"completed"}}"#.utf8))
+		let second = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r2"}}"#.utf8))
+		let secondToken = try stateMachineResponseToken(second)
+		#expect(secondToken != firstToken)
+		assertFailure(.invalidRequest) { try machine.reserveCancellation(for: firstToken) }
+	}
+
+	@Test("reservation rejects an unsealed failure before a cancellation dispatch")
+	func reservationFailureBeforeDispatchRemainsTerminal() throws {
+		var machine = try activeMachine()
+		try machine.prepareCreateResponse()
+		let token = try stateMachineResponseToken(try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8)))
+		try machine.reserveCancellation(for: token)
+		assertFailure(.providerError) {
+			_ = try machine.consume(Data(#"{"type":"response.done","response":{"id":"r1","status":"failed","status_details":{"error":{"code":"bounded"}}}}"#.utf8))
+		}
+		assertFailure(.invalidRequest) { _ = try machine.cancellationDecision(for: token) }
+	}
+
+	@Test("successor ingress after reservation remains a strict terminal overlap")
+	func successorIngressAfterReservationFailsClosed() throws {
+		var machine = try activeMachine()
+		try machine.prepareCreateResponse()
+		let token = try stateMachineResponseToken(try machine.consume(Data(#"{"type":"response.created","response":{"id":"r1"}}"#.utf8)))
+		try machine.reserveCancellation(for: token)
+		assertFailure(.providerError) {
+			_ = try machine.consume(Data(#"{"type":"response.created","response":{"id":"r2"}}"#.utf8))
+		}
 	}
 
 	@Test("malformed oversized and correlation failures remain distinct")
@@ -668,6 +757,14 @@ struct WebRTCOpenAIStateMachineTests {
 		return token
 	}
 
+	private func stateMachineResponseToken(_ event: OpenAIProductionEvent?) throws -> WebRTCOpenAIResponseToken {
+		switch event {
+		case let .openAIResponse(.started(token)), let .openAIResponse(.finished(token)), let .openAIResponse(.cancellationTerminalObserved(token)):
+			return token
+		default: throw WebRTCTransportFailure.malformedEvent
+		}
+	}
+
 	private func activeMachine() throws -> OpenAIProductionStateMachine {
 		var machine = try OpenAIProductionStateMachine(language: "en")
 		_ = try machine.consume(Data(#"{"type":"session.created"}"#.utf8))
@@ -705,6 +802,7 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	private var sink: (@MainActor @Sendable (Result<WebRTCConnectorPeerBackingEvent, any Error>) -> Void)?
 	private let configurationSendFails: Bool
 	private let commandSendFails: Bool
+	private let failingCommandTypes: Set<String>
 	private let suspendMediaQuiescence: Bool
 	private var mediaQuiescenceReached = false
 	private var mediaQuiescenceReleased = false
@@ -715,9 +813,10 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	var commandResponseIDs: [String] = []
 	var audioStates: [WebRTCLocalAudioState] = []
 	var closeCount = 0
-	init(configurationSendFails: Bool = false, commandSendFails: Bool = false, suspendMediaQuiescence: Bool = false) {
+	init(configurationSendFails: Bool = false, commandSendFails: Bool = false, failingCommandTypes: Set<String> = [], suspendMediaQuiescence: Bool = false) {
 		self.configurationSendFails = configurationSendFails
 		self.commandSendFails = commandSendFails
+		self.failingCommandTypes = failingCommandTypes
 		self.suspendMediaQuiescence = suspendMediaQuiescence
 	}
 
@@ -732,7 +831,7 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 		let root = try JSONSerialization.jsonObject(with: command.encoded()) as? [String: Any]
 		commandTypes.append(root?["type"] as? String ?? "")
 		if let responseID = root?["response_id"] as? String { commandResponseIDs.append(responseID) }
-		if commandSendFails { throw SyntheticError() }
+		if commandSendFails || failingCommandTypes.contains(root?["type"] as? String ?? "") { throw SyntheticError() }
 	}
 	func setLocalAudioState(_ state: WebRTCLocalAudioState) { audioStates.append(state) }
 	func disableAudioForMediaQuiescence() -> UInt64? {

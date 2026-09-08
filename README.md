@@ -209,12 +209,15 @@ OpenAI response lifecycle now arrives as `.openAIResponse(...)` with an opaque
 prevents a newer response from being substituted. After media quiescence, call
 `cancelResponse(reservation:)`, then `clearOutputAudio(reservation:)`; the
 former may report `.alreadyCompleted` when the reserved response completed
-during the wait. Establish or join the caller-owned bounded predecessor
+during the wait or before reservation while no newer response has been accepted.
+Establish or join the caller-owned bounded predecessor
 semantic-delivery rendezvous, then call `settleCancelledResponse(reservation:)`
 before admitting a successor response. The output clear remains a shared
 provider command and has no response selector. These added enum cases require
 exhaustive event switches to handle `.openAIResponse`; LocalAI event behavior
-is unchanged. The legacy
+is unchanged. The added reservation requirements have non-mutating unsupported
+defaults for other peer conformers; legacy no-argument cancellation methods
+remain source-compatible but cannot bypass a pending reservation. The legacy
 `RealtimeAPI.webRTC` credential and signaling helpers are qualification-only
 SPI and are unavailable to ordinary imports. WebSocket sources are retained
 outside the package's published product graph and are not part of this

@@ -10,7 +10,8 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		let data = try ProductionCommand.cancelResponseTargeted("response-e").encoded()
 		let command = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 		XCTAssertEqual(command["type"] as? String, "response.cancel")
-		XCTAssertEqual(command["response_id"] as? String, "response-e")
+		let hasExpectedResponseSelector = command["response_id"] as? String == "response-e"
+		XCTAssertTrue(hasExpectedResponseSelector)
 		XCTAssertEqual(command.count, 2)
 	}
 
@@ -281,6 +282,12 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		try await waitUntil(timeout: .seconds(2)) {
 			frames.attemptedValue > preackAttempts && frames.admittedValue > 0
 		}
+		connector.receiveInbound(Data(#"{"type":"response.created","response":{"id":"r"}}"#.utf8))
+		guard case let .openAIResponse(.started(token)) = try await events.next() else {
+			XCTFail("OpenAI response start must remain scoped")
+			return
+		}
+		let reservation = try peer.reserveCancellation(for: token)
 		frames.blockNextFrame()
 		try await waitUntil(timeout: .seconds(2)) { frames.isFrameBlocked }
 		let mediaQuiescenceReturned = LockedFlag()
@@ -303,6 +310,10 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 		await mediaQuiescence.value
 		XCTAssertTrue(mediaQuiescenceReturned.value, "Public media quiescence returns after the admitted callback releases")
+		let disposition = try peer.cancelResponse(reservation: reservation)
+		XCTAssertEqual(disposition, .sent)
+		try peer.clearOutputAudio(reservation: reservation)
+		try peer.settleCancelledResponse(reservation: reservation)
 		peer.setLocalAudioState(.enabled)
 		try await waitUntil(timeout: .seconds(2)) { frames.admittedValue > framesAtDisable }
 
@@ -1233,6 +1244,49 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		await peer.closeAndJoin()
 		XCTAssertEqual(backing.closeCount, 1)
 		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
+	}
+
+	@MainActor func testIteratorCancellationSelectionRejectsReservedPhasesBeforeItsSettlementHop() async throws {
+		let backing = FakeProductionBacking()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		let stream = peer.events
+		let storage = stream.storage
+		var iterator = stream.makeAsyncIterator()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		await backing.emit(.ready); _ = try await iterator.next()
+		try peer.configure(.openAI(language: "en"))
+		await backing.emit(.rawInbound(Data(#"{"type":"session.created"}"#.utf8), configurationDispatchedAtAcceptance: false)); _ = try await iterator.next()
+		await backing.emit(.rawInbound(Data(#"{"type":"session.updated","session":{"type":"realtime","model":"gpt-realtime-2.1","audio":{"input":{"transcription":{"model":"gpt-4o-mini-transcribe","language":"en"},"turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500,"create_response":true,"interrupt_response":true}},"output":{"voice":"marin"}}}}"#.utf8), configurationDispatchedAtAcceptance: false)); _ = try await iterator.next()
+		await backing.emit(.rawInbound(Data(#"{"type":"response.created","response":{"id":"r"}}"#.utf8), configurationDispatchedAtAcceptance: false))
+		guard case let .openAIResponse(.started(token)) = try await iterator.next() else { XCTFail("Expected a scoped response start"); return }
+		let reservation = try peer.reserveCancellation(for: token)
+
+		let gate = ProductionSynchronousGate()
+		storage.installCancellationSelectionHook { gate.hold() }
+		let selection = Task.detached { storage.cancelIterator() }
+		XCTAssertTrue(gate.waitUntilHeld(), "The test must stop after iterator selection and before the peer settlement hop")
+
+		let phases: [() throws -> Void] = [
+			{ _ = try peer.cancelResponse(reservation: reservation) },
+			{ try peer.clearOutputAudio(reservation: reservation) },
+			{ try peer.settleCancelledResponse(reservation: reservation) }
+		]
+		for phase in phases {
+			XCTAssertThrowsError(try phase()) { error in
+				XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+			}
+		}
+		peer.setLocalAudioState(.enabled)
+		XCTAssertFalse(backing.audioStates.contains(.enabled), "Selected iterator cancellation must suppress a later enable")
+		XCTAssertTrue(backing.commandTypes.isEmpty, "Selected iterator cancellation must suppress reservation commands")
+
+		gate.resume()
+		await peer.closeAndJoin()
+		await selection.value
+		XCTAssertThrowsError(try peer.cancelResponse(reservation: reservation)) { error in
+			XCTAssertEqual(error as? WebRTCTransportFailure, .cancelled)
+		}
 	}
 
 	@MainActor func testIteratorCancellationRetainsPeerUntilJoinedSettlementCompletes() async throws {

@@ -100,7 +100,8 @@ package struct OpenAIProductionStateMachine: Sendable {
 		switch epoch {
 		case let .active(response) where response.token == token:
 			epoch = .reserved(Reservation(response: response, terminalObserved: false, disposition: nil, outputCleared: false))
-		case .none where mostRecentCompleted?.token == token:
+		case .none where mostRecentCompleted?.token == token,
+			.creating where mostRecentCompleted?.token == token:
 			guard let response = mostRecentCompleted else { throw WebRTCTransportFailure.invalidRequest }
 			mostRecentCompleted = nil
 			epoch = .reserved(Reservation(response: response, terminalObserved: true, disposition: nil, outputCleared: false))
@@ -249,18 +250,27 @@ package struct OpenAIProductionStateMachine: Sendable {
 		}
 		switch epoch {
 		case let .active(active) where active.wireID == id:
-			if status == "failed" || status == "incomplete" { throw WebRTCTransportFailure.providerError }
+			if status == "failed" || status == "incomplete" {
+				invalidate()
+				throw WebRTCTransportFailure.providerError
+			}
 			epoch = .none
 			mostRecentCompleted = active
 			return .openAIResponse(.finished(active.token))
 		case let .legacyCancelling(active, terminalObserved) where active.wireID == id:
 			guard !terminalObserved else { throw WebRTCTransportFailure.providerError }
-			if status == "failed" || status == "incomplete" { throw WebRTCTransportFailure.providerError }
+			if status == "failed" || status == "incomplete" {
+				invalidate()
+				throw WebRTCTransportFailure.providerError
+			}
 			epoch = .legacyCancelling(active, terminalObserved: true)
 			return .openAIResponse(.cancellationTerminalObserved(active.token))
 		case var .reserved(reservation) where reservation.response.wireID == id:
 			guard !reservation.terminalObserved else { throw WebRTCTransportFailure.providerError }
-			if status == "failed" || status == "incomplete" { throw WebRTCTransportFailure.providerError }
+			if status == "failed" || status == "incomplete" {
+				invalidate()
+				throw WebRTCTransportFailure.providerError
+			}
 			reservation.terminalObserved = true
 			epoch = .reserved(reservation)
 			return .openAIResponse(.cancellationTerminalObserved(reservation.response.token))

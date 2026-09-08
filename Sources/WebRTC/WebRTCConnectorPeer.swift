@@ -47,8 +47,9 @@ public struct WebRTCSessionConfiguration: Sendable, Equatable {
 	}
 }
 
-/// Opaque identity for one accepted OpenAI response in one peer generation.
-/// It intentionally exposes neither a provider identifier nor construction API.
+/// Opaque identity minted exactly once for an accepted OpenAI `response.created`
+/// event in one peer generation. It intentionally exposes neither a provider
+/// identifier nor construction API.
 public struct WebRTCOpenAIResponseToken: Hashable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
 	fileprivate let identity = UUID()
 	package init() {}
@@ -57,8 +58,9 @@ public struct WebRTCOpenAIResponseToken: Hashable, Sendable, CustomStringConvert
 	public var customMirror: Mirror { Mirror(self, children: EmptyCollection<(label: String?, value: Any)>()) }
 }
 
-/// Correlated OpenAI response lifecycle output. Tokens prevent one response's
-/// queued semantic output from being applied to a later response.
+/// Correlated OpenAI response lifecycle output. Every response-scoped event
+/// carries the same token, preventing one response's queued semantic output
+/// from being applied to a later response.
 public enum WebRTCOpenAIResponseEvent: Sendable, Equatable {
 	case started(WebRTCOpenAIResponseToken)
 	case assistantTranscript(WebRTCOpenAIResponseToken, String)
@@ -66,8 +68,9 @@ public enum WebRTCOpenAIResponseEvent: Sendable, Equatable {
 	case cancellationTerminalObserved(WebRTCOpenAIResponseToken)
 }
 
-/// Opaque, peer-scoped permission for the ordered cancellation phases.
-/// It contains no provider identifier and has no public construction API.
+/// Opaque, peer-scoped permission for the ordered cancellation phases. Repeating
+/// reservation for the same pending token returns the same value. It contains no
+/// provider identifier and has no public construction API.
 public struct WebRTCOpenAICancellationReservation: Hashable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
 	fileprivate let peerIdentity: UUID
 	fileprivate let token: WebRTCOpenAIResponseToken
@@ -80,7 +83,10 @@ public struct WebRTCOpenAICancellationReservation: Hashable, Sendable, CustomStr
 	public var customMirror: Mirror { Mirror(self, children: EmptyCollection<(label: String?, value: Any)>()) }
 }
 
-/// The local result of a targeted OpenAI cancellation dispatch decision.
+/// The local result of a targeted OpenAI cancellation dispatch decision. `.sent`
+/// means the targeted wire command dispatched successfully; it is not a server
+/// acknowledgement. `.alreadyCompleted` means the exact reserved response had
+/// already completed or cancelled locally.
 public enum WebRTCOpenAICancelDisposition: Sendable, Equatable { case sent, alreadyCompleted }
 
 public enum WebRTCConnectorEvent: Sendable, Equatable {
@@ -112,14 +118,23 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	/// Reserves exactly one current or most-recently completed OpenAI response.
 	/// Reservation is local-only: it sends no command and prevents a successor
 	/// response from replacing the selected response before ordered settlement.
+	/// A foreign, stale, or different pending token is rejected without mutation.
 	func reserveCancellation(for token: WebRTCOpenAIResponseToken) throws -> WebRTCOpenAICancellationReservation
 	/// Dispatches at most one cancel for a valid reservation. A matching terminal
 	/// observed before this phase reports `.alreadyCompleted` without a wire send.
+	/// Replaying this live or most-recent settled phase returns its recorded result.
+	/// Calling it with a foreign, stale, or out-of-order reservation is non-mutating.
 	func cancelResponse(reservation: WebRTCOpenAICancellationReservation) throws -> WebRTCOpenAICancelDisposition
 	/// Clears the provider's shared output buffer once after a successful exact
-	/// disposition. The shared command has no response selector.
+	/// disposition. The shared command has no response selector. Replaying a live
+	/// or most-recent settled clear sends nothing; clear before disposition rejects
+	/// without mutation.
 	func clearOutputAudio(reservation: WebRTCOpenAICancellationReservation) throws
 	/// Releases a reservation after the caller's separate semantic rendezvous.
+	/// Settlement requires a disposition then clear, and records one receipt for
+	/// replay. A newer accepted response invalidates that receipt. Caller
+	/// cancellation, terminal selection, and close invalidate both handles and
+	/// receipts; foreign, stale, and out-of-order settlement rejects without mutation.
 	func settleCancelledResponse(reservation: WebRTCOpenAICancellationReservation) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
 	/// Disables local audio and OpenAI remote-media admission, then waits for
@@ -130,6 +145,9 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 }
 
 @MainActor public extension WebRTCConnectorPeer {
+	/// Other conformers, including LocalAI, reject OpenAI-only reservations without
+	/// issuing a command. Legacy no-argument methods remain strict and source
+	/// compatible; a pending reservation cannot use them to bypass ordered phases.
 	func reserveCancellation(for _: WebRTCOpenAIResponseToken) throws -> WebRTCOpenAICancellationReservation { throw WebRTCTransportFailure.invalidRequest }
 	func cancelResponse(reservation _: WebRTCOpenAICancellationReservation) throws -> WebRTCOpenAICancelDisposition { throw WebRTCTransportFailure.invalidRequest }
 	func clearOutputAudio(reservation _: WebRTCOpenAICancellationReservation) throws { throw WebRTCTransportFailure.invalidRequest }
@@ -411,6 +429,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		catch { try rejectCommand() }
 	}
 	package func reserveCancellation(for token: WebRTCOpenAIResponseToken) throws -> WebRTCOpenAICancellationReservation {
+		try rejectSelectedIteratorCancellation()
 		guard isConnected, openAIState != nil else { throw WebRTCTransportFailure.invalidRequest }
 		if let pendingCancellationReservation {
 			guard pendingCancellationReservation.token == token else { throw WebRTCTransportFailure.invalidRequest }
@@ -424,6 +443,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		return reservation
 	}
 	package func cancelResponse(reservation: WebRTCOpenAICancellationReservation) throws -> WebRTCOpenAICancelDisposition {
+		try rejectSelectedIteratorCancellation()
 		if let settledCancellationReservation, settledCancellationReservation.reservation == reservation { return settledCancellationReservation.disposition }
 		guard pendingCancellationReservation == reservation, reservation.peerIdentity == reservationPeerIdentity, !terminal else { throw WebRTCTransportFailure.invalidRequest }
 		do {
@@ -444,6 +464,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		catch { throw WebRTCTransportFailure.invalidRequest }
 	}
 	package func clearOutputAudio(reservation: WebRTCOpenAICancellationReservation) throws {
+		try rejectSelectedIteratorCancellation()
 		if let settledCancellationReservation, settledCancellationReservation.reservation == reservation { return }
 		guard pendingCancellationReservation == reservation, reservation.peerIdentity == reservationPeerIdentity, !terminal else { throw WebRTCTransportFailure.invalidRequest }
 		do {
@@ -454,6 +475,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 		catch { throw WebRTCTransportFailure.invalidRequest }
 	}
 	package func settleCancelledResponse(reservation: WebRTCOpenAICancellationReservation) throws {
+		try rejectSelectedIteratorCancellation()
 		if let settledCancellationReservation, settledCancellationReservation.reservation == reservation { return }
 		guard pendingCancellationReservation == reservation, reservation.peerIdentity == reservationPeerIdentity, !terminal else { throw WebRTCTransportFailure.invalidRequest }
 		do {
@@ -465,6 +487,10 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	}
 
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
+		guard !eventStorage.iteratorCancellationSelected else {
+			startSettlement(failure: .cancelled, origin: .caller)
+			return
+		}
 		guard !terminal, !settlementStarting, state == .disabled || connected else { return }
 		backing.setLocalAudioState(state)
 	}
@@ -612,6 +638,11 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	private func rejectCommand() throws -> Never {
 		startSettlement(failure: .invalidRequest, origin: .caller)
 		throw WebRTCTransportFailure.invalidRequest
+	}
+	private func rejectSelectedIteratorCancellation() throws {
+		guard eventStorage.iteratorCancellationSelected else { return }
+		startSettlement(failure: .cancelled, origin: .caller)
+		throw WebRTCTransportFailure.cancelled
 	}
 
 	private func beginSettlement(failure: WebRTCTransportFailure?, origin: SettlementOrigin) async { await startSettlement(failure: failure, origin: origin).value }
