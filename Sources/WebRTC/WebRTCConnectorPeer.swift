@@ -118,6 +118,9 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	/// Reserves exactly one current or most-recently completed OpenAI response.
 	/// Reservation is local-only: it sends no command and prevents a successor
 	/// response from replacing the selected response before ordered settlement.
+	/// The caller must reserve the exact response, await
+	/// `disableAudioAndWaitForMediaQuiescence()`, dispatch a disposition, clear
+	/// output, complete its semantic rendezvous, and then settle this handle.
 	/// A foreign, stale, or different pending token is rejected without mutation.
 	func reserveCancellation(for token: WebRTCOpenAIResponseToken) throws -> WebRTCOpenAICancellationReservation
 	/// Dispatches at most one cancel for a valid reservation. A matching terminal
@@ -131,10 +134,11 @@ public enum WebRTCConnectorEvent: Sendable, Equatable {
 	/// without mutation.
 	func clearOutputAudio(reservation: WebRTCOpenAICancellationReservation) throws
 	/// Releases a reservation after the caller's separate semantic rendezvous.
-	/// Settlement requires a disposition then clear, and records one receipt for
-	/// replay. A newer accepted response invalidates that receipt. Caller
-	/// cancellation, terminal selection, and close invalidate both handles and
-	/// receipts; foreign, stale, and out-of-order settlement rejects without mutation.
+	/// Settlement is the final phase after media quiescence, disposition, clear,
+	/// and that caller-owned rendezvous. It records one receipt for replay. A
+	/// newer accepted response invalidates that receipt. Caller cancellation,
+	/// terminal selection, and close invalidate both handles and receipts;
+	/// foreign, stale, and out-of-order settlement rejects without mutation.
 	func settleCancelledResponse(reservation: WebRTCOpenAICancellationReservation) throws
 	func setLocalAudioState(_ state: WebRTCLocalAudioState)
 	/// Disables local audio and OpenAI remote-media admission, then waits for

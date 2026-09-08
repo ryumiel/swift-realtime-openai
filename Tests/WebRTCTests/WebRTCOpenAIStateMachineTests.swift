@@ -418,9 +418,100 @@ struct WebRTCOpenAIStateMachineTests {
 		#expect(backing.commandTypes == ["output_audio_buffer.clear"])
 
 		backing.emitRaw(#"{"type":"response.created","response":{"id":"r2"}}"#)
-		_ = try responseToken(try await events.next())
-		assertFailure(.invalidRequest) { _ = try peer.reserveCancellation(for: token) }
+		let successorToken = try responseToken(try await events.next())
+		assertFailure(.invalidRequest) { _ = try peer.cancelResponse(reservation: reservation) }
+		assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: reservation) }
+		assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: reservation) }
 		#expect(backing.commandTypes == ["output_audio_buffer.clear"])
+		let successorReservation = try peer.reserveCancellation(for: successorToken)
+		#expect(try peer.cancelResponse(reservation: successorReservation) == .sent)
+		try peer.clearOutputAudio(reservation: successorReservation)
+		try peer.settleCancelledResponse(reservation: successorReservation)
+		#expect(backing.commandTypes == ["output_audio_buffer.clear", "response.cancel", "output_audio_buffer.clear"])
+	}
+
+	@Test("foreign reservations cannot retarget a connected peer")
+	func foreignReservationRejectsWithoutMutatingItsPeer() async throws {
+		let firstBacking = OpenAIBacking()
+		let firstPeer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { firstBacking }).makePeer()
+		var firstEvents = firstPeer.events.makeAsyncIterator()
+		_ = try await firstPeer.makeOffer()
+		try await firstPeer.apply(remoteAnswer: "answer")
+		firstBacking.emit(.ready); _ = try await firstEvents.next()
+		try firstPeer.configure(.openAI(language: "en"))
+		firstBacking.emitRaw(#"{"type":"session.created"}"#); _ = try await firstEvents.next()
+		firstBacking.emitRaw(Self.acknowledgement(language: "en")); _ = try await firstEvents.next()
+		firstBacking.emitRaw(#"{"type":"response.created","response":{"id":"first"}}"#)
+		let firstReservation = try firstPeer.reserveCancellation(for: responseToken(try await firstEvents.next()))
+
+		let secondBacking = OpenAIBacking()
+		let secondPeer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { secondBacking }).makePeer()
+		var secondEvents = secondPeer.events.makeAsyncIterator()
+		_ = try await secondPeer.makeOffer()
+		try await secondPeer.apply(remoteAnswer: "answer")
+		secondBacking.emit(.ready); _ = try await secondEvents.next()
+		try secondPeer.configure(.openAI(language: "en"))
+		secondBacking.emitRaw(#"{"type":"session.created"}"#); _ = try await secondEvents.next()
+		secondBacking.emitRaw(Self.acknowledgement(language: "en")); _ = try await secondEvents.next()
+		secondBacking.emitRaw(#"{"type":"response.created","response":{"id":"second"}}"#)
+		let secondReservation = try secondPeer.reserveCancellation(for: responseToken(try await secondEvents.next()))
+
+		assertFailure(.invalidRequest) { _ = try secondPeer.cancelResponse(reservation: firstReservation) }
+		assertFailure(.invalidRequest) { try secondPeer.clearOutputAudio(reservation: firstReservation) }
+		assertFailure(.invalidRequest) { try secondPeer.settleCancelledResponse(reservation: firstReservation) }
+		#expect(secondBacking.commandTypes.isEmpty)
+		#expect(try secondPeer.cancelResponse(reservation: secondReservation) == .sent)
+		try secondPeer.clearOutputAudio(reservation: secondReservation)
+		try secondPeer.settleCancelledResponse(reservation: secondReservation)
+		#expect(secondBacking.commandTypes == ["response.cancel", "output_audio_buffer.clear"])
+		await firstPeer.closeAndJoin()
+		await secondPeer.closeAndJoin()
+	}
+
+	@Test("joined close and backing terminal invalidate pending and settled reservations")
+	func terminalSettlementInvalidatesReservationHandles() async throws {
+		for terminal in [false, true] {
+			let backing = OpenAIBacking()
+			let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
+			var events = peer.events.makeAsyncIterator()
+			_ = try await peer.makeOffer()
+			try await peer.apply(remoteAnswer: "answer")
+			backing.emit(.ready); _ = try await events.next()
+			try peer.configure(.openAI(language: "en"))
+			backing.emitRaw(#"{"type":"session.created"}"#); _ = try await events.next()
+			backing.emitRaw(Self.acknowledgement(language: "en")); _ = try await events.next()
+			backing.emitRaw(#"{"type":"response.created","response":{"id":"pending"}}"#)
+			let pending = try peer.reserveCancellation(for: responseToken(try await events.next()))
+
+			if terminal { backing.finishEvents() }
+			await peer.closeAndJoin()
+			assertFailure(.invalidRequest) { _ = try peer.cancelResponse(reservation: pending) }
+			assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: pending) }
+			assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: pending) }
+			#expect(backing.commandTypes.isEmpty)
+			#expect(backing.closeCount == 1)
+		}
+
+		let backing = OpenAIBacking()
+		let peer = try WebRTCConnectorPeerFactory(provider: .openAI, initialAudioState: .disabled, makePeer: { backing }).makePeer()
+		var events = peer.events.makeAsyncIterator()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		backing.emit(.ready); _ = try await events.next()
+		try peer.configure(.openAI(language: "en"))
+		backing.emitRaw(#"{"type":"session.created"}"#); _ = try await events.next()
+		backing.emitRaw(Self.acknowledgement(language: "en")); _ = try await events.next()
+		backing.emitRaw(#"{"type":"response.created","response":{"id":"settled"}}"#)
+		let settled = try peer.reserveCancellation(for: responseToken(try await events.next()))
+		#expect(try peer.cancelResponse(reservation: settled) == .sent)
+		try peer.clearOutputAudio(reservation: settled)
+		try peer.settleCancelledResponse(reservation: settled)
+		await peer.closeAndJoin()
+		assertFailure(.invalidRequest) { _ = try peer.cancelResponse(reservation: settled) }
+		assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: settled) }
+		assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: settled) }
+		#expect(backing.commandTypes == ["response.cancel", "output_audio_buffer.clear"])
+		#expect(backing.closeCount == 1)
 	}
 
 	@Test("completed response remains reservable while a create command awaits its next accepted start")
@@ -471,9 +562,11 @@ struct WebRTCOpenAIStateMachineTests {
 		let activeToken = try responseToken(try await events.next())
 		let activeReservation = try peer.reserveCancellation(for: activeToken)
 		assertFailure(.invalidRequest) { _ = try peer.reserveCancellation(for: WebRTCOpenAIResponseToken()) }
+		assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: activeReservation) }
 		assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: activeReservation) }
 		#expect(backing.commandTypes == ["output_audio_buffer.clear"])
 		#expect(try peer.cancelResponse(reservation: activeReservation) == .sent)
+		assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: activeReservation) }
 		#expect(try peer.cancelResponse(reservation: activeReservation) == .sent)
 		try peer.clearOutputAudio(reservation: activeReservation)
 		try peer.settleCancelledResponse(reservation: activeReservation)
@@ -856,6 +949,7 @@ private final class OpenAIBacking: WebRTCConnectorPeerBacking, @unchecked Sendab
 	}
 	func closeAndSettle() async { closeCount += 1 }
 	func emit(_ event: WebRTCConnectorPeerBackingEvent) { sink?(.success(event)) }
+	func finishEvents() { sink?(.success(.terminal(nil))) }
 	func emitRaw(_ json: String) {
 		emit(.rawInbound(Data(json.utf8), configurationDispatchedAtAcceptance: false))
 	}
