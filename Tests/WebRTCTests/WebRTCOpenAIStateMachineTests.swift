@@ -483,11 +483,19 @@ struct WebRTCOpenAIStateMachineTests {
 			backing.emitRaw(#"{"type":"response.created","response":{"id":"pending"}}"#)
 			let pending = try peer.reserveCancellation(for: responseToken(try await events.next()))
 
-			if terminal { backing.finishEvents() }
+			if terminal {
+				backing.finishEvents()
+				assertFailure(.invalidRequest) { _ = try peer.cancelResponse(reservation: pending) }
+				assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: pending) }
+				assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: pending) }
+				#expect(backing.commandTypes.isEmpty)
+			}
 			await peer.closeAndJoin()
-			assertFailure(.invalidRequest) { _ = try peer.cancelResponse(reservation: pending) }
-			assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: pending) }
-			assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: pending) }
+			if !terminal {
+				assertFailure(.invalidRequest) { _ = try peer.cancelResponse(reservation: pending) }
+				assertFailure(.invalidRequest) { try peer.clearOutputAudio(reservation: pending) }
+				assertFailure(.invalidRequest) { try peer.settleCancelledResponse(reservation: pending) }
+			}
 			#expect(backing.commandTypes.isEmpty)
 			#expect(backing.closeCount == 1)
 		}
