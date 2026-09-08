@@ -1289,6 +1289,38 @@ final class WebRTCProductionPeerTests: XCTestCase {
 		}
 	}
 
+	@MainActor func testIteratorCancellationSelectionPreservesConnectedLocalAIAudioBeforeItsSettlementHop() async throws {
+		let backing = FakeProductionBacking()
+		let peer = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()
+		let stream = peer.events
+		let storage = stream.storage
+		var iterator = stream.makeAsyncIterator()
+		_ = try await peer.makeOffer()
+		try await peer.apply(remoteAnswer: "answer")
+		await backing.emit(.ready); _ = try await iterator.next()
+		try peer.configure(.localAI(voice: "Ono_Anna", language: "ja"))
+		await backing.emit(.inbound(.sessionUpdated(voice: "Ono_Anna", language: "ja")))
+		_ = try await iterator.next(); _ = try await iterator.next()
+
+		let gate = ProductionSynchronousGate()
+		storage.installCancellationSelectionHook { gate.hold() }
+		let selection = Task.detached { storage.cancelIterator() }
+		XCTAssertTrue(gate.waitUntilHeld(), "The test must stop after iterator selection and before the peer settlement hop")
+
+		let audioStateCount = backing.audioStates.count
+		peer.setLocalAudioState(.enabled)
+		XCTAssertEqual(backing.audioStates.count, audioStateCount + 1, "LocalAI audio mutation must retain task-base behavior before settlement")
+		XCTAssertEqual(backing.audioStates.last, .enabled)
+		XCTAssertEqual(backing.closeCount, 0, "LocalAI audio mutation must not start settlement before the hop")
+
+		gate.resume()
+		await selection.value
+		await backing.waitForClose()
+		await peer.closeAndJoin()
+		XCTAssertEqual(backing.closeCount, 1)
+		XCTAssertEqual(backing.operationOrder.suffix(2), ["audio:disabled", "close"])
+	}
+
 	@MainActor func testIteratorCancellationRetainsPeerUntilJoinedSettlementCompletes() async throws {
 		let backing = FakeProductionBacking(suspendClose: true)
 		var peer: (any WebRTCConnectorPeer)? = try WebRTCConnectorPeerFactory(provider: .localAI, initialAudioState: .enabled, makePeer: { backing }).makePeer()

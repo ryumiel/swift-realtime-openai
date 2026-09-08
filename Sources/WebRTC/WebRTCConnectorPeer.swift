@@ -491,7 +491,7 @@ package enum WebRTCConnectorPeerBackingEvent: Sendable, Equatable {
 	}
 
 	package func setLocalAudioState(_ state: WebRTCLocalAudioState) {
-		guard !eventStorage.iteratorCancellationSelected else {
+		guard productionSession != .openAI || !eventStorage.iteratorCancellationSelected else {
 			startSettlement(failure: .cancelled, origin: .caller)
 			return
 		}
